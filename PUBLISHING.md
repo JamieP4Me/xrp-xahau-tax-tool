@@ -32,7 +32,7 @@ copy**, where you may have pasted a list back in at some point.
 
 ```
 cd ~/Projects-xrp-xahau
-./scripts/verify-clean.sh
+node scripts/verify-clean.js
 ```
 
 It must print **"Clean. Safe to publish."** If it fails it names the file and
@@ -121,7 +121,7 @@ otherwise say so plainly in the release notes so nobody thinks it is a virus.
 | `LICENSE` | MIT, plus a not-tax-advice disclaimer |
 | `.gitignore` | node_modules, builds, **and every export filename the app produces** |
 | `SECURITY.md` | where data lives, how to report a vulnerability |
-| `scripts/verify-clean.sh` | the privacy gate |
+| `scripts/verify-clean.js` | the privacy gate |
 | `.github/workflows/ci.yml` | runs the gate, then both test suites, on every push |
 | `README.md` | the engineering documentation |
 
@@ -137,7 +137,7 @@ checking first. Start from a verified-clean tree:
 
 ```
 cd ~/Projects-xrp-xahau
-./scripts/verify-clean.sh || echo "STOP — fix before continuing"
+node scripts/verify-clean.js || echo "STOP — fix before continuing"
 ```
 
 Then:

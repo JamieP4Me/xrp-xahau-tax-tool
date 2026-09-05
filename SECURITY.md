@@ -21,7 +21,7 @@ run, and CoinGecko price data is embedded rather than fetched.
 Run:
 
 ```
-./scripts/verify-clean.sh
+node scripts/verify-clean.js
 ```
 
 It fails if a wallet list, a Payment-Claim, personal identifiers, or exported

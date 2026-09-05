@@ -13,12 +13,12 @@
     "test:e2e": "playwright test test/*.spec.js --reporter=line",
     "test": "npm run test:db && npm run test:e2e",
     "pack": "electron-builder --dir",
-    "dist": "./scripts/verify-clean.sh && electron-builder",
-    "dist:linux": "./scripts/verify-clean.sh && electron-builder --linux AppImage",
-    "dist:mac": "./scripts/verify-clean.sh && electron-builder --mac dmg",
-    "dist:win": "./scripts/verify-clean.sh && electron-builder --win nsis",
+    "dist": "node scripts/verify-clean.js && electron-builder",
+    "dist:linux": "node scripts/verify-clean.js && electron-builder --linux AppImage",
+    "dist:mac": "node scripts/verify-clean.js && electron-builder --mac dmg",
+    "dist:win": "node scripts/verify-clean.js && electron-builder --win nsis",
     "rebuild": "electron-rebuild -f -w better-sqlite3",
-    "verify:clean": "./scripts/verify-clean.sh"
+    "verify:clean": "node scripts/verify-clean.js"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.1",

@@ -9,15 +9,15 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '20'
 
       # The privacy gate runs first: nothing else matters if the tree carries
       # somebody's wallet list.
       - name: Verify the tree carries no personal data
-        run: ./scripts/verify-clean.sh
+        run: node scripts/verify-clean.js
 
       - run: npm ci
 
@@ -65,7 +65,7 @@ jobs:
       # carries the actual traces, so keep it when something breaks.
       - name: Upload Playwright report on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: playwright-report
           path: |
