@@ -35,7 +35,7 @@ test('Koinly/CoinLedger export keeps only tax-relevant rows and drops internal t
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xrp-xahau-taxexport-e2e-'));
 
   const app = await electron.launch({
-    args: [APP_DIR],
+    args: [APP_DIR, '--user-data-dir=' + path.join(userDataDir, 'electron-profile')],
     cwd: APP_DIR,
     env: { ...process.env, HOME: userDataDir },
   });
@@ -194,7 +194,7 @@ test('a gift is exported tagged, so Koinly and CoinLedger do not re-create the p
   // disposal at market value. An untagged gift row reproduces the exact
   // overstatement in the other tool.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'xrp-xahau-giftexport-'));
-  const app = await electron.launch({ args: [APP_DIR], cwd: APP_DIR, env: { ...process.env, HOME: home } });
+  const app = await electron.launch({ args: [APP_DIR, '--user-data-dir=' + path.join(home, 'electron-profile')], cwd: APP_DIR, env: { ...process.env, HOME: home } });
   try {
     const win = await app.firstWindow();
     await win.waitForLoadState('domcontentloaded');
@@ -252,7 +252,7 @@ test('drainage from a lost wallet is exported as non-taxable in both tools', asy
   // the ledger applies. Without them, the involuntary drainage from these
   // accounts becomes a taxable sale on import, every year, until they empty.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'xrp-xahau-lostexport-'));
-  const app = await electron.launch({ args: [APP_DIR], cwd: APP_DIR, env: { ...process.env, HOME: home } });
+  const app = await electron.launch({ args: [APP_DIR, '--user-data-dir=' + path.join(home, 'electron-profile')], cwd: APP_DIR, env: { ...process.env, HOME: home } });
   try {
     const win = await app.firstWindow();
     await win.waitForLoadState('domcontentloaded');

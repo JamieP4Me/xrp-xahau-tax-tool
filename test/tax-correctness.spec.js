@@ -19,9 +19,17 @@ const os = require('os');
 const APP_DIR = path.join(__dirname, '..');
 
 async function launch(env = {}) {
+  // Isolate the profile EXPLICITLY, not via HOME.
+  //
+  // Setting HOME is not enough: on Linux, Electron resolves userData from
+  // XDG_CONFIG_HOME when that is set, and GitHub's runners set it. Every test
+  // then shared one SQLite database, so a suite that passed locally failed in
+  // CI with counts like 126,886 rows where the fixture had inserted 10 — one
+  // test reading another's data. --user-data-dir is Chromium's own switch and
+  // takes precedence over all of it, on every platform.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'xrp-xahau-taxcorrect-'));
   const app = await electron.launch({
-    args: [APP_DIR],
+    args: [APP_DIR, '--user-data-dir=' + path.join(home, 'electron-profile')],
     cwd: APP_DIR,
     env: { ...process.env, HOME: home, ...env },
   });

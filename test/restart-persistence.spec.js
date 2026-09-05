@@ -38,10 +38,14 @@ const APP_DIR = path.join(__dirname, '..');
 test('after a real restart: cached data shows in Form 8949 with no fetch, and localStorage survives', async () => {
   const sharedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'xrp-xahau-restart-e2e-'));
   const env = { ...process.env, HOME: sharedHome };
+  // Both launches must land on the SAME profile — that is the whole point
+  // of this test — so the directory is fixed once here. See the note in
+  // tax-correctness.spec.js for why HOME alone does not isolate it.
+  const profileArgs = [APP_DIR, '--user-data-dir=' + path.join(sharedHome, 'electron-profile')];
 
   // ── Launch 1: seed the local cache directly (as if a real fetch had
   // already happened) and customize localStorage-backed settings. ─────────
-  const app1 = await electron.launch({ args: [APP_DIR], cwd: APP_DIR, env });
+  const app1 = await electron.launch({ args: profileArgs, cwd: APP_DIR, env });
   try {
     const win1 = await app1.firstWindow();
     await win1.waitForLoadState('domcontentloaded');
@@ -86,7 +90,7 @@ test('after a real restart: cached data shows in Form 8949 with no fetch, and lo
 
   // ── Launch 2: a genuinely separate process, same profile dir — a real
   // "quit and reopen", not a page reload. ─────────────────────────────────
-  const app2 = await electron.launch({ args: [APP_DIR], cwd: APP_DIR, env });
+  const app2 = await electron.launch({ args: profileArgs, cwd: APP_DIR, env });
   try {
     const win2 = await app2.firstWindow();
     await win2.waitForLoadState('domcontentloaded');

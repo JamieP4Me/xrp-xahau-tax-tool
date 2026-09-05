@@ -39,7 +39,7 @@ test('cache rebuild does not accumulate the full transaction history in memory',
   test.setTimeout(180000);
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'xrp-xahau-mem-'));
   const app = await electron.launch({
-    args: [APP_DIR],
+    args: [APP_DIR, '--user-data-dir=' + path.join(home, 'electron-profile')],
     cwd: APP_DIR,
     env: { ...process.env, HOME: home },
   });

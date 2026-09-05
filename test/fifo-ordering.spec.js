@@ -46,7 +46,7 @@ test('cross-wallet FIFO lot ordering: merged chronological processing fixes the 
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xrp-xahau-fifo-e2e-'));
 
   const app = await electron.launch({
-    args: [APP_DIR],
+    args: [APP_DIR, '--user-data-dir=' + path.join(userDataDir, 'electron-profile')],
     cwd: APP_DIR,
     env: { ...process.env, HOME: userDataDir },
   });

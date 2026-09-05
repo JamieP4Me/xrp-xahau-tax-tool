@@ -33,7 +33,7 @@ test('Electron app launches, has no menu bar, and the local DB round-trips throu
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xrp-xahau-e2e-'));
 
   const app = await electron.launch({
-    args: [APP_DIR],
+    args: [APP_DIR, '--user-data-dir=' + path.join(userDataDir, 'electron-profile')],
     cwd: APP_DIR,
     env: { ...process.env, HOME: userDataDir },
   });
