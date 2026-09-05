@@ -26,7 +26,50 @@ jobs:
       - name: Unit tests (plain Node ABI)
         run: npm rebuild better-sqlite3 && npm run test:db
 
+      # Electron will not start on a bare Ubuntu 24.04 runner. Two separate
+      # reasons, and both have to be dealt with or every test fails with the
+      # unhelpful "Process failed to launch!" before a line of app code runs:
+      #
+      #   1. Missing shared libraries. The runner image has no reason to carry
+      #      GTK/NSS/GBM, and Electron links against them.
+      #
+      #   2. Ubuntu 24.04 added an AppArmor policy that forbids unprivileged
+      #      user namespaces, which is exactly the mechanism Chromium's sandbox
+      #      uses to isolate the renderer. On 22.04 this worked out of the box;
+      #      on 24.04 it does not.
+      #
+      # The sysctl is the honest fix — it re-enables the namespaces so the
+      # sandbox runs as it does on a real machine. It is kept non-fatal
+      # (`|| true`) because a future runner image may not expose that knob, and
+      # ELECTRON_DISABLE_SANDBOX on the test step is the fallback that keeps CI
+      # meaningful if so. That fallback trades away sandbox coverage, which is
+      # an acceptable loss here: these tests exercise tax arithmetic, not
+      # process isolation, and the shipped app is never run this way.
+      - name: Prepare the runner for Electron
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libnss3 libgbm1 libgtk-3-0 libatk-bridge2.0-0 libasound2t64 || \
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libnss3 libgbm1 libgtk-3-0 libatk-bridge2.0-0 libasound2
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: App tests (Electron ABI)
+        env:
+          ELECTRON_DISABLE_SANDBOX: '1'
         run: |
           npm run rebuild
           xvfb-run -a npx playwright test
+
+      # A failed Electron run says almost nothing in the step log. The report
+      # carries the actual traces, so keep it when something breaks.
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore
