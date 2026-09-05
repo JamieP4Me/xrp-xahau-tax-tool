@@ -1,0 +1,30 @@
+node_modules/
+dist-installers/
+test-results/
+playwright-report/
+.DS_Store
+*.log
+
+# Anything that could carry personal data out of a working copy.
+# The app writes its cache to the OS app-data directory, not here, but a
+# working copy accumulates exports — and every one of them contains wallet
+# addresses, balances and cost basis.
+*.sqlite
+*.sqlite3
+*.db
+Holdings-*.csv
+Holdings-*.pdf
+Form-8949*.csv
+Form-8949*.pdf
+Schedule-D*.pdf
+Disposal-Destinations-*.csv
+Wallet-Activity-*.csv
+Wallet-Config-*.csv
+Basis-Ledger-*.csv
+Gift-Log-*.csv
+Lost-Wallet-Basis-Report-*.csv
+Exchange-Cost-Basis-Handoff-*.csv
+Income-Report-*.csv
+All-Transactions-*.csv
+Koinly-Import-*.csv
+CoinLedger-Import-*.csv

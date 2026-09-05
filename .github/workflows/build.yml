@@ -1,0 +1,75 @@
+name: Build desktop installers
+
+# Builds real, native installers for all three platforms. GitHub Actions
+# runs each OS's job on an actual machine of that OS — this is the only
+# honest way to produce a signed-shape .dmg and .exe; you cannot
+# cross-compile Electron's native modules (better-sqlite3) or macOS/Windows
+# packaging metadata from Linux.
+#
+# Trigger manually from the Actions tab ("Run workflow"), or push a tag
+# like "v1.0.1" to build automatically. Nothing is code-signed by default
+# (see the comments in the mac/win steps below) — unsigned builds work
+# fine for personal/local use, but macOS Gatekeeper and Windows
+# SmartScreen will show an "unidentified developer" warning until you add
+# real certificates as repo secrets.
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            script: dist:mac
+            artifact-glob: dist-installers/*.dmg
+            artifact-name: macOS-dmg
+          - os: windows-latest
+            script: dist:win
+            artifact-glob: dist-installers/*.exe
+            artifact-name: windows-exe
+          - os: ubuntu-latest
+            script: dist:linux
+            artifact-glob: dist-installers/*.AppImage
+            artifact-name: linux-appimage
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests (db.js, no Electron needed)
+        run: npm run test:db
+
+      # electron-builder rebuilds better-sqlite3's native binding against
+      # Electron's own ABI as part of `dist`/`pack` automatically, so no
+      # separate `npm run rebuild` step is needed here.
+
+      - name: Build installer
+        run: npm run ${{ matrix.script }}
+        env:
+          # No code-signing identity is configured. To sign macOS builds,
+          # add CSC_LINK / CSC_KEY_PASSWORD secrets (a base64 .p12 cert) and
+          # they'll be picked up automatically by electron-builder. To sign
+          # Windows builds, add CSC_LINK / CSC_KEY_PASSWORD for a code-signing
+          # cert the same way. Until then these are unsigned builds.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: ${{ matrix.artifact-glob }}
+          if-no-files-found: error

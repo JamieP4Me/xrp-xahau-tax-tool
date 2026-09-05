@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # The privacy gate runs first: nothing else matters if the tree carries
+      # somebody's wallet list.
+      - name: Verify the tree carries no personal data
+        run: ./scripts/verify-clean.sh
+
+      - run: npm ci
+
+      # better-sqlite3 has to be built against two different ABIs, and the two
+      # suites cannot share one. See playwright.config.js.
+      - name: Unit tests (plain Node ABI)
+        run: npm rebuild better-sqlite3 && npm run test:db
+
+      - name: App tests (Electron ABI)
+        run: |
+          npm run rebuild
+          xvfb-run -a npx playwright test

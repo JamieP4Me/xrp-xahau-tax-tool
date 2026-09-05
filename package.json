@@ -1,0 +1,92 @@
+{
+  "name": "xrp-xahau-tax-tool",
+  "productName": "XRP & Xahau Tax Tool",
+  "version": "1.0.0",
+  "description": "Local desktop app for full XRP/Xahau transaction history and Form 8949/Schedule D generation, backed by a local SQLite cache with incremental sync.",
+  "main": "main.js",
+  "author": "XRP & Xahau Tax Tool contributors",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test:db": "node test/db.test.js",
+    "test:e2e": "playwright test test/*.spec.js --reporter=line",
+    "test": "npm run test:db && npm run test:e2e",
+    "pack": "electron-builder --dir",
+    "dist": "./scripts/verify-clean.sh && electron-builder",
+    "dist:linux": "./scripts/verify-clean.sh && electron-builder --linux AppImage",
+    "dist:mac": "./scripts/verify-clean.sh && electron-builder --mac dmg",
+    "dist:win": "./scripts/verify-clean.sh && electron-builder --win nsis",
+    "rebuild": "electron-rebuild -f -w better-sqlite3",
+    "verify:clean": "./scripts/verify-clean.sh"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.1",
+    "@playwright/test": "^1.56.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8",
+    "playwright": "^1.56.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0"
+  },
+  "build": {
+    "appId": "io.github.xrpxahautaxtool",
+    "productName": "XRP & Xahau Tax Tool",
+    "asar": true,
+    "publish": null,
+    "files": [
+      "main.js",
+      "preload.js",
+      "db.js",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "buildResources": "build",
+      "output": "dist-installers"
+    },
+    "mac": {
+      "category": "public.app-category.finance",
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "category": "Office",
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
+  }
+}
