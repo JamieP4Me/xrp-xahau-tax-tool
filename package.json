@@ -87,6 +87,7 @@
           ]
         }
       ]
-    }
+    },
+    "afterPack": "scripts/adhoc-sign.js"
   }
 }

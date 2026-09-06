@@ -97,18 +97,39 @@ clean-profile test and is not one.
 Afterwards, `rm -rf /tmp/xrp-fresh-profile` — it is a real profile directory,
 just an empty one.
 
-### Note on Gatekeeper
+### Note on Gatekeeper — and why "damaged" is not the same as "unverified"
 
-The DMG is unsigned, so anyone you send it to will get *"Apple could not verify
-… it may contain malware"*. They open it with **right-click → Open**, or:
+There are two different macOS refusals, and they need different advice.
+
+**"Apple could not verify …"** is the ordinary unsigned-app prompt.
+Right-click → **Open** gets past it.
+
+**"… is damaged and can't be opened. You should move it to the Trash."** is
+what you get when a downloaded app has *no signature at all*. Right-click →
+Open does **not** bypass this one, so a user following the usual advice is
+stuck and reasonably concludes the download is broken. It is not.
+
+You will never see this locally, because quarantine is only applied to
+downloaded files — which is exactly why it surfaces the first time someone
+else tries your release.
+
+The build now ad-hoc signs the app (`scripts/adhoc-sign.js`, wired in as
+electron-builder's `afterPack` hook). Ad-hoc signing does not make the app
+*trusted* — only a paid Developer ID plus notarisation does that — but it
+gives the bundle a valid signature, so macOS shows the truthful "unidentified
+developer" message and right-click → Open works as documented. On Apple
+Silicon it is close to mandatory anyway: arm64 requires every binary to carry
+at least an ad-hoc signature to execute.
+
+Either way, this always works:
 
 ```
 xattr -dr com.apple.quarantine "/Applications/XRP & Xahau Tax Tool.app"
 ```
 
-Signing and notarising needs a paid Apple Developer account ($99/yr) and an
-`electron-builder` signing config. Worth it if you expect non-technical users;
-otherwise say so plainly in the release notes so nobody thinks it is a virus.
+Full signing and notarising needs a paid Apple Developer account ($99/yr).
+Worth it if you expect non-technical users; otherwise say so plainly in the
+release notes so nobody thinks it is a virus.
 
 ---
 
@@ -191,7 +212,7 @@ history and in every fork and clone. The only real remedies:
   force-push, then delete and recreate the repo if it was public for more than
   a moment. Assume anything that was public for even a minute was scraped.
 
-The `verify-clean.sh` gate exists so this never comes up.
+The `verify-clean.js` gate exists so this never comes up.
 
 ### Cutting a release with the DMG
 
