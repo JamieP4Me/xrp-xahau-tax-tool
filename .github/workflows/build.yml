@@ -47,6 +47,22 @@ jobs:
         with:
           node-version: 20
 
+      # A tag of v1.0.1 against a package.json still saying 1.0.0 builds three
+      # installers all named 1.0.0 and publishes them under a 1.0.1 release —
+      # which is how you end up unable to tell which binary anyone is running.
+      # Fail before spending build minutes on it.
+      - name: Tag must match package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "package.json: $PKG   tag: $TAG"
+          if [ "$PKG" != "$TAG" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG. Bump the version, commit, then re-tag."
+            exit 1
+          fi
+
       - name: Install dependencies
         run: npm ci
 
@@ -96,7 +112,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          find artifacts -type f | sort
+          # Filenames contain spaces ("XRP & Xahau Tax Tool-1.0.1-universal.dmg").
+          # An earlier version of this step passed them as
+          # $(find artifacts -type f | tr '\n' ' '), which word-splits on those
+          # spaces and hands gh a list of fragments — "artifacts/windows-exe/XRP",
+          # "&", "Xahau"... mapfile reads whole lines into an array instead, and
+          # "${FILES[@]}" expands to one argument per element.
+          mapfile -t FILES < <(find artifacts -type f | sort)
+          printf '  %s\n' "${FILES[@]}"
           cat > notes.md <<'NOTES'
           Offline IRS Form 8949 / Schedule D generator for the XRP Ledger and Xahau.
 
@@ -143,4 +166,4 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --notes-file notes.md \
-            $(find artifacts -type f | tr '\n' ' ')
+            "${FILES[@]}"

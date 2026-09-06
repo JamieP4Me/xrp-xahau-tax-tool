@@ -1,7 +1,7 @@
 {
   "name": "xrp-xahau-tax-tool",
   "productName": "XRP & Xahau Tax Tool",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Local desktop app for full XRP/Xahau transaction history and Form 8949/Schedule D generation, backed by a local SQLite cache with incremental sync.",
   "main": "main.js",
   "author": "XRP & Xahau Tax Tool contributors",
@@ -14,9 +14,9 @@
     "test": "npm run test:db && npm run test:e2e",
     "pack": "electron-builder --dir",
     "dist": "node scripts/verify-clean.js && electron-builder",
-    "dist:linux": "node scripts/verify-clean.js && electron-builder --linux AppImage",
-    "dist:mac": "node scripts/verify-clean.js && electron-builder --mac dmg",
-    "dist:win": "node scripts/verify-clean.js && electron-builder --win nsis",
+    "dist:linux": "node scripts/verify-clean.js && electron-builder --linux",
+    "dist:mac": "node scripts/verify-clean.js && electron-builder --mac",
+    "dist:win": "node scripts/verify-clean.js && electron-builder --win",
     "rebuild": "electron-rebuild -f -w better-sqlite3",
     "verify:clean": "node scripts/verify-clean.js"
   },
