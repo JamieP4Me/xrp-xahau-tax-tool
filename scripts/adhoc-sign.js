@@ -36,6 +36,29 @@ const { execFileSync } = require('child_process');
 exports.default = async function adhocSign(context) {
   if (context.electronPlatformName !== 'darwin') return;
 
+  // Skip the per-architecture staging directories of a universal build.
+  //
+  // electron-builder packs x64 and arm64 into mac-universal-x64-temp and
+  // mac-universal-arm64-temp, calls this hook for EACH, then merges them with
+  // @electron/universal. That merge requires every non-binary file to be
+  // byte-identical between the two halves — and signing produces a different
+  // _CodeSignature/CodeResources in each, so signing the halves broke the
+  // merge outright:
+  //
+  //   ⨯ Expected all non-binary files to have identical SHAs when creating a
+  //     universal build but "Contents/Frameworks/Electron Framework.framework/
+  //     Versions/A/_CodeSignature/CodeResources" did not
+  //
+  // The merged bundle gets its own afterPack call afterwards — see
+  // app-builder-lib/out/macPackager.js, "Give users a final opportunity to
+  // perform things on the combined universal package before signing" — so
+  // bailing out here still leaves the shipped artifact signed, and signed
+  // once, covering both architectures.
+  if (/-temp$/.test(context.appOutDir)) {
+    console.log(`  • skipping ad-hoc signing of ${path.basename(context.appOutDir)} (universal staging dir)`);
+    return;
+  }
+
   const appName = context.packager.appInfo.productFilename;
   const appPath = path.join(context.appOutDir, `${appName}.app`);
 
