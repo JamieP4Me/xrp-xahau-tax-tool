@@ -293,6 +293,14 @@ app.on('will-quit', () => {
 
 // ── IPC surface exposed to the renderer via preload.js's contextBridge ─────
 function registerIpcHandlers(db, dbPath) {
+  // The version comes from the main process rather than being written into
+  // the HTML, so it cannot go stale: app.getVersion() reads the packaged
+  // package.json, which electron-builder stamps from the one real source. A
+  // number typed into the page would have to be remembered at every release,
+  // and the first release someone forgot would leave the app confidently
+  // reporting the wrong version — worse than showing none.
+  ipcMain.handle('app:getVersion', () => app.getVersion());
+
   ipcMain.handle('db:getSyncState', (_evt, wallet, chain) => db.getSyncState(wallet, chain));
 
   ipcMain.handle('db:insertRows', (_evt, wallet, chain, rows) => db.insertRows(wallet, chain, rows));

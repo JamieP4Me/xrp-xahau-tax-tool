@@ -1,13 +1,17 @@
 {
   "name": "xrp-xahau-tax-tool",
   "productName": "XRP & Xahau Tax Tool",
-  "version": "1.0.1",
+  "version": "1.0.4",
   "description": "Local desktop app for full XRP/Xahau transaction history and Form 8949/Schedule D generation, backed by a local SQLite cache with incremental sync.",
   "main": "main.js",
   "author": "XRP & Xahau Tax Tool contributors",
   "license": "MIT",
   "private": true,
+  "engines": {
+    "node": "20.x || 22.x"
+  },
   "scripts": {
+    "preinstall": "node scripts/check-node.js",
     "start": "electron .",
     "test:db": "node test/db.test.js",
     "test:e2e": "playwright test test/*.spec.js --reporter=line",
@@ -25,6 +29,7 @@
     "@playwright/test": "^1.56.0",
     "electron": "^33.0.0",
     "electron-builder": "^25.1.8",
+    "jspdf": "^4.2.1",
     "playwright": "^1.56.0"
   },
   "dependencies": {

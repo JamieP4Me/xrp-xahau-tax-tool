@@ -77,6 +77,8 @@ test/restart-persistence.spec.js  Playwright test proving a real quit-and-reopen
 test/tax-software-export.spec.js  Playwright test for the Koinly/CoinLedger CSV export's row filtering
 test/tax-correctness.spec.js      Playwright tests for the tax-math fixes from the code review
 test/memory-scale.spec.js         Playwright test bounding renderer memory during a cache rebuild
+test/price-history.spec.js        Playwright test for the per-asset Price History page and its spread maths
+scripts/check-node.js             preinstall guard: refuses to build on a Node version better-sqlite3 cannot compile against
 (Holdings tab: renderHoldings/computeHoldings/computeDisposalDestinations in renderer/index.html)
 .github/workflows/build.yml   CI: builds .dmg / .exe / .AppImage on their native OS
 ```
@@ -182,11 +184,66 @@ app bundle, so reinstalling or updating the app never touches it.
   spotting tax-loss-harvesting opportunities — well before year-end. It
   appears first in every tax-year dropdown (Setup, Form 8949, Schedule D);
   2025 remains the default selection.
-- **Price History has a PDF export.** The Price History tab's "Download PDF"
-  button (`exportPriceHistoryPDF()`) generates a paginated PDF of the
-  monthly high/low prices embedded in the app for XRP and XAH, grouped by
-  year, using the same jsPDF-based table renderer already used for the
-  Form 8949 PDF export — no network call, no new dependency.
+- **Price History is one asset at a time, with spread.** The tab has three
+  sub-tabs — XRP, XAH and EVR (`showPriceAsset()` / `priceAssetTab`) — each
+  showing Month, Low, High, Spread ($) and Spread (%), with a bold full-year
+  row per year. Splitting it was not cosmetic: the three series begin in 2013,
+  2023 and 2024 respectively, so a combined table was mostly em-dashes, and
+  they differ by two orders of magnitude, so a shared column of decimals
+  rounded XAH's real movement to `$0.0000`. XAH and EVR are therefore shown to
+  six decimal places and XRP to four. The year row aggregates one level up —
+  the year's high is the highest month's high, never a sum or a mean.
+
+  EVR gets a tab because `EVR_PRICES` is an independent series with its own
+  highs and lows, contradicting a stale comment in the renderer that claimed
+  EVR had no market of its own.
+
+- **Volume, market and personal.** Four further columns: Market Vol ($),
+  Market Vol (units, est.), and — once a report has been built — Your Vol
+  (units) and Your Vol ($ est.).
+
+  *Market volume* is embedded in `MARKET_VOLUME_USD`, monthly, as
+  `[totalUsd, daysObserved]`, from the same CoinGecko source as the prices
+  (`coins/<id>/market_chart`, `total_volumes`). Monthly rather than daily
+  because monthly is the only granularity the page shows: ~8 KB instead of
+  ~140 KB. It is **not** sourced from an XRPL explorer and could not be — the
+  XRPL DEX order book runs on the order of 3.6M XRP/day against a market of
+  roughly $2.5bn/day, so Bithomp, XRPScan or anything else reading the chain
+  sees about 0.2% of the volume. Market volume lives on centralised exchanges,
+  which never touch the ledger.
+
+  *Your volume* (`myVolumeByMonth` / `recordMyVolume()`) is accumulated during
+  the ledger build. A payment counts when coins crossed the boundary of the
+  wallets this tool fetches: transfers between two of your own fetched wallets
+  are excluded — nothing changed hands, and the cache holds them twice, once
+  per wallet perspective — while sends to an exchange address marked `mine`,
+  to a gift address, or out of a lost-key wallet do count. It is throughput,
+  not net movement, so it is comparable with the market figure beside it.
+
+  **Which figures are estimates matters, and the page says so.** Market Vol ($)
+  is reported. Market Vol (units) is derived by dividing by the month's
+  midpoint price. Your Vol in units is exact, off the ledger; its dollar value
+  is estimated at each day's midpoint, because the ledger records no price. A
+  `†` marks any period the data does not fully cover. Months before volume
+  reporting began (XRP, Aug–Nov 2013) are **absent rather than zero** and
+  render as an em-dash. None of it enters cost basis, proceeds or gains.
+
+  **Prices aggregate by extreme, volumes by sum.** A year's high is its highest
+  month's high; a year's volume is the total of its months. Applying one rule
+  to both is the easy mistake, and `test/price-history.spec.js` checks each.
+
+- **Price History has a PDF export.** The "Download PDF" button
+  (`exportPriceHistoryPDF()`) exports *the asset currently selected*, in
+  landscape — nine columns of currency do not fit across letter-portrait.
+  Screen and print are generated from one `priceHistoryModel()`, because the
+  two were previously written separately and drifted: the page gained spread
+  and per-asset tabs while the PDF was still emitting a combined XRP+XAH table
+  with neither.
+
+  `jspdf` is now a devDependency pinned to the same version as the cdnjs URL
+  in `renderer/index.html`, so the tests can inject it when the CDN is
+  unreachable and actually exercise the export instead of skipping it. A test
+  asserts the two versions still agree.
 
 ## Koinly / CoinLedger CSV export
 

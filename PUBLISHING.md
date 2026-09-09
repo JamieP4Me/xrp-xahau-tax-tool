@@ -43,10 +43,25 @@ Then:
 
 ```
 export PATH="/opt/homebrew/opt/node@20/bin:$PATH"
+node -v            # must print v20.x
 npm ci
 npm run rebuild
 npm run dist:mac
 ```
+
+**That export lasts only for the terminal window you type it in.** Open a new
+window and you are back on whatever Homebrew has made the default `node`,
+which moves forward without asking. Put the line in `~/.zshrc` and stop
+thinking about it:
+
+```
+echo 'export PATH="/opt/homebrew/opt/node@20/bin:$PATH"' >> ~/.zshrc
+```
+
+If you skip it, `npm ci` now stops immediately with a one-line explanation
+(`scripts/check-node.js`, wired in as `preinstall`) instead of several hundred
+lines of C++ errors from better-sqlite3 failing to compile against a Node
+whose V8 has dropped the APIs it uses.
 
 The DMG lands in `dist-installers/`. Note that `npm ci` (not `install`)
 installs exactly what the lockfile says, which is what you want for something

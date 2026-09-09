@@ -55,4 +55,7 @@ contextBridge.exposeInMainWorld('taxDB', {
 contextBridge.exposeInMainWorld('appInfo', {
   isElectron: true,
   platform: process.platform,
+  // Resolved from the main process's app.getVersion() — see the note on the
+  // 'app:getVersion' handler in main.js.
+  getVersion: () => ipcRenderer.invoke('app:getVersion'),
 });
