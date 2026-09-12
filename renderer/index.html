@@ -5597,16 +5597,23 @@ function renderTreatmentCompare(before, after) {
     </table>
     <div style="font-size:10.5px;color:#333;margin-top:8px;line-height:1.6">
       ${curedLine
-        ? `<b>Zero-basis disposals cured: ${curedLine}</b> &mdash; about <b>$${fmt(curedUsd)}</b> of
-           overstated gain at today's prices, across ${(before.shortRows - after.shortRows).toLocaleString()}
-           of ${before.shortRows.toLocaleString()} such disposals.
-           Those were reporting 100% of proceeds as gain, and as short-term, because a missing
-           acquisition date cannot establish a holding period.
-           <br><span style="color:#8b0000"><b>${after.shortRows.toLocaleString()} zero-basis disposals remain</b>
-           (${Object.entries(after.zero.byTicker).sort((a,b)=>b[1]-a[1])
-              .map(([t,q]) => `${q.toLocaleString(undefined,{maximumFractionDigits:2})} ${t}`).join(' · ')}
-           &mdash; about $${fmt(after.zero.usd)}). Treatment A only cures what the AMM caused;
-           the rest has other causes and is a separate problem.</span><br>`
+        ? `<b>Zero-basis disposals cured: ${curedLine}</b>, across
+           ${(before.shortRows - after.shortRows).toLocaleString()} of ${before.shortRows.toLocaleString()}
+           such disposals. Those were reporting 100% of proceeds as gain, and as short-term, because a
+           missing acquisition date cannot establish a holding period.
+           <br><span style="color:#8b0000"><b>${after.shortRows.toLocaleString()} zero-basis disposals remain:</b>
+           ${Object.entries(after.zero.byTicker).sort((a,b)=>b[1]-a[1])
+              .map(([t,q]) => `${q.toLocaleString(undefined,{maximumFractionDigits:2})} ${t}`).join(' · ')}.</span>
+           <br>
+           <span style="font-size:10px;color:#555">Sizing only, NOT a tax figure: those quantities are worth about
+           <b>$${fmt(curedUsd)}</b> cured and <b>$${fmt(after.zero.usd)}</b> remaining <i>at today's prices</i>.
+           The disposals happened at 2024&ndash;2026 prices, so this is a measure of how much coin is affected,
+           not of tax. The tax effect is the year-by-year table above &mdash; and the two must never be added
+           together or compared.
+           ${after.shortRows > 100 && after.zero.usd / after.shortRows < 10
+             ? `<br>The remainder averages $${(after.zero.usd / after.shortRows).toFixed(2)} per disposal:
+                mostly dust, and a large COUNT of tiny disposals is not the same as a large problem.`
+             : ''}</span><br>`
         : ''}
       ${after.booked ? `${after.booked.toLocaleString()} AMM transaction(s) booked. ` : ''}
       ${after.skipped

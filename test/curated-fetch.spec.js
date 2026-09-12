@@ -1879,7 +1879,13 @@ test.describe('the treatment comparison', () => {
     // The change in gain, not just the two totals.
     expect(html).toMatch(/\+\$10,556\.83/);
     expect(html).toMatch(/10,010 XRP/);
-    expect(html, 'the dollar figure, not a bare quantity').toMatch(/\$13,613\.60/);
+    expect(html, 'the dollar figure is present as sizing').toMatch(/\$13,613\.60/);
+    // ...but explicitly NOT as a tax figure. A quantity priced today and a
+    // change in reported gain measure different things; the panel said
+    // "$18,908.93 of overstated gain" on a real run, which invites adding it
+    // to the +$3,005.73 in the table above. They must never be combined.
+    expect(html, 'must disclaim itself as sizing, not tax').toMatch(/NOT a tax figure/);
+    expect(html).toMatch(/at today.s prices/);
     expect(html).toMatch(/5 skipped/);
     expect(html).toMatch(/A rise in reported gain is the expected direction/);
     // The decision it hands back rather than makes.
