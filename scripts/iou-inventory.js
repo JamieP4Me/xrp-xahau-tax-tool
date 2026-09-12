@@ -201,9 +201,17 @@ function main() {
         // permanently, since OBBBA made the section 67(g) repeal permanent.
         // A destination equal to the ISSUER is the signature of a burn.
         const dest = raw.Destination || '';
+        // The counterparty, and the single most diagnostic field here. A token
+        // arriving from ONE address on a 24-hour cadence is a scheduled
+        // distribution -- a reward, ordinary income at FMV on receipt. The
+        // same token arriving from many addresses at random is something else.
+        // Measured on a real cache: nine of the top fourteen assets arrive on
+        // a median gap of exactly 24.0 hours, up to 99% of gaps clustered
+        // there. That is not a purchase pattern and it is not spam.
+        const src = raw.Account || '';
         rows.push({ chain, wallet: r.wallet, timestamp: r.timestamp, type: raw.TransactionType,
                     role: leg.role, dir, currency: leg.currency, issuer: leg.issuer, qty: leg.qty,
-                    destination: dest,
+                    source: src, destination: dest,
                     disposal: dir === 'out'
                       ? (raw.TransactionType === 'OfferCreate' ? 'sale (DEX)'
                          : dest && leg.issuer && dest === leg.issuer ? 'sent to ISSUER (burn?)'
@@ -276,6 +284,49 @@ function main() {
     console.log('  ever recognised on it, has none, and produces no loss however it leaves.');
   }
 
+  // Arrival cadence, because it answers the question that decides the tax
+  // treatment: was this bought, or was it paid to you?
+  const arrivals = new Map();
+  for (const r of rows) {
+    if (r.dir !== 'in') continue;
+    const k = r.chain + '|' + r.currency;
+    if (!arrivals.has(k)) arrivals.set(k, { currency: r.currency, times: [], senders: new Set() });
+    const e = arrivals.get(k);
+    e.times.push(Date.parse(String(r.timestamp).slice(0, 19).replace(' ', 'T') + 'Z'));
+    e.senders.add(r.source);
+  }
+  const scheduled = [];
+  for (const e of arrivals.values()) {
+    if (e.times.length < 20) continue;
+    const t2 = e.times.slice().sort((a, b) => a - b);
+    const gaps = [];
+    for (let i = 1; i < t2.length; i++) gaps.push(t2[i] - t2[i - 1]);
+    const sorted = gaps.slice().sort((a, b) => a - b);
+    const med = sorted[Math.floor(sorted.length / 2)];
+    if (!med) continue;
+    const near = gaps.filter(g => g >= 0.5 * med && g <= 1.5 * med).length / gaps.length;
+    if (near > 0.6) scheduled.push({ currency: e.currency, n: e.times.length,
+                                     hours: med / 3600000, near, senders: e.senders.size });
+  }
+  if (scheduled.length) {
+    scheduled.sort((a, b) => b.n - a.n);
+    console.log('');
+    console.log('ARRIVING ON A SCHEDULE — these look like REWARDS, not purchases');
+    console.log('-'.repeat(78));
+    for (const s of scheduled.slice(0, 20)) {
+      console.log(`  ${s.currency.slice(0, 14).padEnd(15)}${String(s.n).padStart(6)} receipts, ` +
+                  `every ${s.hours.toFixed(1)}h (${(s.near * 100).toFixed(0)}% regular), ` +
+                  `${s.senders} sender(s)`);
+    }
+    if (scheduled.length > 20) console.log(`  ...and ${scheduled.length - 20} more.`);
+    console.log('');
+    console.log('  A token paid to you on a fixed cadence is a reward or distribution, and a');
+    console.log('  reward is ORDINARY INCOME at fair market value on the date you received it');
+    console.log('  -- not a purchase, and not a tax-free airdrop. That income also becomes');
+    console.log('  your BASIS, so the later disposal produces a real gain or loss rather than');
+    console.log('  a zero-basis one. Both halves have to be reported, or neither is coherent.');
+  }
+
   console.log('');
   console.log('WHAT THIS DOES AND DOES NOT TELL YOU');
   console.log('-'.repeat(78));
@@ -311,10 +362,10 @@ function main() {
       const s = v == null ? '' : String(v);
       return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
-    const lines = ['Chain,Wallet,Timestamp,Type,Role,Direction,Asset,Issuer,Quantity,Destination,Disposal Route',
+    const lines = ['Chain,Wallet,Timestamp,Type,Role,Direction,Asset,Issuer,Quantity,Source,Destination,Disposal Route',
       ...rows.map(r => [r.chain, r.wallet, r.timestamp, r.type, r.role, r.dir,
                         r.currency, r.issuer, r.qty == null ? '' : r.qty,
-                        r.destination, r.disposal].map(cell).join(','))];
+                        r.source, r.destination, r.disposal].map(cell).join(','))];
     fs.writeFileSync(args.csv, lines.join('\n'));
     console.log('');
     console.log(`Wrote ${rows.length.toLocaleString()} row(s) to ${args.csv}`);
