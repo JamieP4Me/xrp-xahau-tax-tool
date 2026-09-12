@@ -11,7 +11,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { createDb } = require('../db');
-const { decodeCurrency, nonNativeLegs, BOOKED,
+const { decodeCurrency, nonNativeLegs, BOOKED, NON_DELIVERY,
         directionOf, classifyRoutes } = require('../scripts/iou-inventory');
 
 let failures = 0;
@@ -348,6 +348,56 @@ test('the own-wallet rule outranks every issuer rule, in both orders', () => {
 test('a genuine third party is unaffected by the own-wallet rule', () => {
   const r = classifyRoutes(out({ destination: LPISS }), ctxOf([LPISS], [ISSUER, LPISS], [W]));
   assert.match(r.disposal, /protocol/);
+});
+
+
+// ── locked, not delivered ─────────────────────────────────────────────────
+test('REGRESSION: an EscrowCreate naming you delivers NOTHING', () => {
+  // Four EscrowCreates naming this taxpayer as destination were reported as
+  // $14,401 of arriving stablecoins. Nothing arrived -- which is exactly why
+  // the account has no USDT trustline and never needed one. An escrow locks
+  // the SENDER'S funds; the destination is paid only on EscrowFinish.
+  const legs = nonNativeLegs({
+    TransactionType: 'EscrowCreate', Account: 'rSENDER', Destination: W,
+    Amount_currency: 'USDT', Amount_issuer: 'rISS', Amount_value: '3377',
+    delivered_amount_value: '0',
+  });
+  assert.strictEqual(legs.length, 1, 'it is still reported — silence is the bug this tool exists to break');
+  assert.strictEqual(legs[0].pending, true, 'but flagged as undelivered');
+  const r = classifyRoutes({ dir: 'in', wallet: W, type: 'EscrowCreate', pending: true }, ctxOf());
+  assert.match(r.acquisition, /NOT received/);
+  assert.strictEqual(r.disposal, '');
+});
+
+test('an escrow YOU create is not a disposal yet either', () => {
+  const r = classifyRoutes({ dir: 'out', wallet: W, type: 'EscrowCreate', pending: true,
+                             destination: 'rSOMEONE' }, ctxOf());
+  assert.match(r.disposal, /NOT yet disposed/);
+  assert.strictEqual(r.acquisition, '');
+});
+
+test('payment channels lock value the same way', () => {
+  assert.ok(NON_DELIVERY.has('PaymentChannelCreate'));
+  assert.ok(NON_DELIVERY.has('PaymentChannelFund'));
+  for (const t of ['PaymentChannelCreate', 'PaymentChannelFund']) {
+    const legs = nonNativeLegs({ TransactionType: t, Amount_currency: 'USDT', Amount_value: '5' });
+    assert.strictEqual(legs[0].pending, true, t + ' must not count as delivered');
+  }
+});
+
+test('a real Payment is NOT flagged pending — the guard must not overreach', () => {
+  const legs = nonNativeLegs({
+    TransactionType: 'Payment', Amount_currency: 'CX1', Amount_value: '100' });
+  assert.strictEqual(legs[0].pending, false);
+  const r = classifyRoutes({ dir: 'in', wallet: W, type: 'Payment', pending: false }, ctxOf());
+  assert.strictEqual(r.acquisition, 'received');
+});
+
+test('pending outranks the own-wallet and issuer rules', () => {
+  const r = classifyRoutes({ dir: 'out', wallet: W, type: 'EscrowCreate', pending: true,
+                             destination: ISSUER, issuer: ISSUER }, ctxOf([], [ISSUER], [W]));
+  assert.match(r.disposal, /NOT yet disposed/);
+  assert.doesNotMatch(r.disposal, /burn/);
 });
 
 console.log('');

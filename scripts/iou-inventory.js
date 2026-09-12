@@ -80,6 +80,22 @@ function openCache(dbPath) {
 // The three the engine actually books. Everything else is what this reports.
 const BOOKED = new Set(['XRP', 'XAH', 'EVR']);
 
+// Transactions that name a Destination and carry an Amount, but DELIVER
+// NOTHING to it.
+//
+// An EscrowCreate locks the sender's funds in an escrow object. The named
+// destination receives them only when somebody later submits an EscrowFinish;
+// until then the destination's balance is untouched and no trustline is even
+// required. A payment channel is the same shape: Create and Fund lock value
+// that is claimed later, or clawed back.
+//
+// Reading the Amount on one of these as "received" invents money. Measured on
+// a real cache: four EscrowCreates naming this taxpayer as destination were
+// reported as $14,401 of arriving stablecoins. Nothing arrived -- which is
+// exactly why the account has no USDT trustline and never did. Every one of
+// them also carried delivered_amount_value: 0, which is the ledger saying so.
+const NON_DELIVERY = new Set(['EscrowCreate', 'PaymentChannelCreate', 'PaymentChannelFund']);
+
 function defaultDbPath() {
   const name = 'XRP & Xahau Tax Tool';
   if (process.platform === 'darwin') {
@@ -133,11 +149,13 @@ function parseArgs(argv) {
 // fields would miss the entire transaction.
 function nonNativeLegs(raw) {
   const legs = [];
+  const pending = NON_DELIVERY.has(raw.TransactionType);
   const add = (cur, iss, val, role) => {
     const c = decodeCurrency(cur);
     if (!c || BOOKED.has(c.toUpperCase())) return;
     const v = parseFloat(val);
-    legs.push({ currency: c, issuer: String(iss || '').trim(), qty: Number.isFinite(v) ? v : null, role });
+    legs.push({ currency: c, issuer: String(iss || '').trim(), qty: Number.isFinite(v) ? v : null,
+                role, pending });
   };
   // `??` falls back only on null/undefined, and WinDB stores EMPTY STRINGS.
   // So `delivered_amount_currency ?? Amount_currency` keeps the empty string
@@ -214,6 +232,15 @@ function classifyRoutes(row, ctx) {
   const issuers = (ctx && ctx.issuers) || new Set();
   const own = (ctx && ctx.ownWallets) || new Set();
 
+  // Locked, not delivered. Neither side has anything to report yet: the
+  // sender still owns it, the destination has not received it.
+  if (row.pending) {
+    const what = row.type === 'EscrowCreate' ? 'escrow' : 'payment channel';
+    if (row.dir === 'in') out.acquisition = 'named in a ' + what + ' \u2014 NOT received';
+    else out.disposal = 'locked in a ' + what + ' \u2014 NOT yet disposed of';
+    return out;
+  }
+
   if (row.dir === 'in') {
     out.acquisition = own.has(row.source || '') ? 'moved in from your own wallet (NOT an acquisition)'
       : row.selfPay ? 'bought (cross-currency payment)'
@@ -269,7 +296,7 @@ function main() {
   const chains = args.chain ? [args.chain] : ['XRPL', 'Xahau'];
   const rows = [];
   const byAsset = new Map();
-  let scanned = 0, failedSkipped = 0;
+  let scanned = 0, failedSkipped = 0, pendingRows = 0;
   const inboundFrom = new Set();   // wallet|counterparty that ever PAID us
   const issuers = new Set();       // every issuing address seen anywhere
   const ownWallets = new Set();    // every wallet in the cache is one of ours
@@ -317,7 +344,8 @@ function main() {
         e.years.add(String(r.timestamp).slice(0, 4));
         if (r.timestamp < e.first) e.first = r.timestamp;
         if (r.timestamp > e.last) e.last = r.timestamp;
-        if (leg.qty == null) e.noQty++;
+        if (leg.pending) { e.pending = (e.pending || 0) + 1; pendingRows++; }
+        else if (leg.qty == null) e.noQty++;
         else if (dir === 'in') e.qtyIn += leg.qty;
         else if (dir === 'out') e.qtyOut += leg.qty;
         const dest = raw.Destination || '';
@@ -333,7 +361,8 @@ function main() {
         // is a burn sink or a counterparty depends on transactions that may
         // not have been read yet.
         rows.push({ chain, wallet: r.wallet, timestamp: r.timestamp, type: raw.TransactionType,
-                    role: leg.role, dir, selfPay, currency: leg.currency, issuer: leg.issuer,
+                    role: leg.role, dir, selfPay, pending: !!leg.pending,
+                    currency: leg.currency, issuer: leg.issuer,
                     qty: leg.qty, source: src, destination: dest,
                     disposal: '', acquisition: '' });
       }
@@ -393,6 +422,28 @@ function main() {
     if (a.noQty) {
       console.log(pad('', 29) + `${a.noQty} row(s) carry no quantity`);
     }
+  }
+
+  if (pendingRows) {
+    const pend = rows.filter(r => r.pending);
+    console.log('');
+    console.log('LOCKED, NOT DELIVERED \u2014 these moved NOTHING');
+    console.log('-'.repeat(78));
+    for (const r of pend) {
+      const q = r.qty == null ? '?' : r.qty.toLocaleString(undefined, { maximumFractionDigits: 6 });
+      console.log(`  ${String(r.timestamp).slice(0, 19)}  ${r.type}  ${q} ${r.currency}` +
+                  `  ${r.dir === 'in' ? 'naming you' : 'created by you'}`);
+    }
+    console.log('');
+    console.log('  An EscrowCreate LOCKS the sender\'s funds. The named destination gets');
+    console.log('  them only when an EscrowFinish is later submitted \u2014 until then the');
+    console.log('  balance is untouched and no trustline is even needed. A payment channel');
+    console.log('  works the same way. These are excluded from Received and Sent above.');
+    console.log('');
+    console.log('  BE CAREFUL with an inbound one you do not recognise. Creating an escrow');
+    console.log('  that names a stranger as destination costs the sender almost nothing and');
+    console.log('  makes fake tokens appear in their wallet as pending value. It is a known');
+    console.log('  lure. Never connect a wallet to a site offering to help you "claim" one.');
   }
 
   // The split that decides whether a loss is usable at all.
@@ -516,5 +567,5 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { decodeCurrency, nonNativeLegs, BOOKED, parseArgs, openCache,
+module.exports = { decodeCurrency, nonNativeLegs, BOOKED, NON_DELIVERY, parseArgs, openCache,
                    directionOf, classifyRoutes };

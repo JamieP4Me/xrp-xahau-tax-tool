@@ -39,6 +39,7 @@ for (let i = 0; i < process.argv.length; i++) {
   argv.push(process.argv[i]);
 }
 const args = parseArgs(argv);
+const CHAIN = args.chain || 'Xahau';
 
 const db = openCache(args.db);
 console.log('cache: ' + args.db + '\n');
@@ -60,7 +61,7 @@ const dirCount = new Map();
 const wallets = new Set();
 let xahRows = 0;
 for (const r of db.prepare(
-  'SELECT wallet, raw_json FROM raw_transactions WHERE chain = ?').iterate('Xahau')) {
+  'SELECT wallet, raw_json FROM raw_transactions WHERE chain = ?').iterate(CHAIN)) {
   xahRows++;
   let raw; try { raw = JSON.parse(r.raw_json); } catch (e) { continue; }
   const t = raw.TransactionType || '(none)';
@@ -72,17 +73,17 @@ for (const r of db.prepare(
 for (const e of [...types].sort(function (a, b) { return b[1] - a[1]; })) {
   console.log('  ' + String(e[1]).padStart(9) + '  ' + e[0]);
 }
-console.log('  ' + xahRows + ' Xahau rows across ' + wallets.size + ' wallet(s)');
+console.log('  ' + xahRows + ' ' + CHAIN + ' rows across ' + wallets.size + ' wallet(s)');
 console.log('  direction: ' + [...dirCount].map(function (e) { return e[0] + '=' + e[1]; }).join('  '));
 
 // -- 3. EVERY key that ever carries a currency or a value on Xahau --------
 // This is the parser-gap test. The XRPL rows use Amount_currency /
 // Amount_value / delivered_amount_*. If Xahau uses anything else, it shows
 // up here and nowhere in nonNativeLegs().
-console.log('\n=== Xahau: keys resembling an amount, and how often they are non-empty ===');
+console.log('\n=== ' + CHAIN + ': keys resembling an amount, and how often they are non-empty ===');
 const keyHits = new Map();
 const currencyValues = new Map();
-for (const r of db.prepare('SELECT raw_json FROM raw_transactions WHERE chain = ?').iterate('Xahau')) {
+for (const r of db.prepare('SELECT raw_json FROM raw_transactions WHERE chain = ?').iterate(CHAIN)) {
   let raw; try { raw = JSON.parse(r.raw_json); } catch (e) { continue; }
   for (const k of Object.keys(raw)) {
     if (!/amount|currency|issuer|value|taker|balance|delivered/i.test(k)) continue;
@@ -98,7 +99,7 @@ for (const r of db.prepare('SELECT raw_json FROM raw_transactions WHERE chain = 
 for (const e of [...keyHits].sort(function (a, b) { return b[1] - a[1]; })) {
   console.log('  ' + String(e[1]).padStart(9) + '  ' + e[0]);
 }
-console.log('\n=== Xahau: every non-native currency seen in ANY currency-ish key ===');
+console.log('\n=== ' + CHAIN + ': every non-native currency seen in ANY currency-ish key ===');
 if (currencyValues.size === 0) console.log('  (none)');
 for (const e of [...currencyValues].sort(function (a, b) { return b[1] - a[1]; })) {
   console.log('  ' + String(e[1]).padStart(9) + '  ' + e[0]);
@@ -107,10 +108,10 @@ for (const e of [...currencyValues].sort(function (a, b) { return b[1] - a[1]; }
 // -- 4. the specific asset, in full ---------------------------------------
 // Dump whole rows so the field shape is visible rather than inferred.
 if (asset) {
-  console.log('\n=== every Xahau row mentioning ' + asset + ' (raw JSON) ===');
+  console.log('\n=== every ' + CHAIN + ' row mentioning ' + asset + ' (raw JSON) ===');
   let shown = 0, matched = 0;
   for (const r of db.prepare(
-    'SELECT wallet, timestamp, raw_json FROM raw_transactions WHERE chain = ? ORDER BY timestamp').iterate('Xahau')) {
+    'SELECT wallet, timestamp, raw_json FROM raw_transactions WHERE chain = ? ORDER BY timestamp').iterate(CHAIN)) {
     let raw; try { raw = JSON.parse(r.raw_json); } catch (e) { continue; }
     let hit = false;
     for (const k of Object.keys(raw)) {
@@ -119,7 +120,7 @@ if (asset) {
     }
     if (!hit) continue;
     matched++;
-    if (shown++ >= 6) continue;
+    if (shown++ >= 12) continue;
     const dir = raw.Destination === r.wallet ? 'IN ' : raw.Account === r.wallet ? 'OUT' : '?? ';
     console.log('\n  --- ' + String(r.timestamp).slice(0, 19) + '  ' + dir + '  ' + raw.TransactionType + ' ---');
     for (const k of Object.keys(raw)) {
@@ -128,7 +129,7 @@ if (asset) {
       console.log('      ' + k + ': ' + (s.length > 90 ? s.slice(0, 90) + '...' : s));
     }
   }
-  console.log('\n  ' + matched + ' row(s) mention ' + asset + '; showed ' + Math.min(shown, 6) + '.');
+  console.log('\n  ' + matched + ' row(s) mention ' + asset + '; showed ' + Math.min(shown, 12) + '.');
   if (matched === 0) console.log('  => FETCH GAP: the cache has no row for this asset at all.');
 }
 
@@ -142,7 +143,7 @@ if (wantType) {
   let n = 0, shown = 0, withAmount = 0;
   const dests = new Map();
   for (const r of db.prepare(
-    'SELECT wallet, timestamp, raw_json FROM raw_transactions WHERE chain = ? ORDER BY timestamp').iterate('Xahau')) {
+    'SELECT wallet, timestamp, raw_json FROM raw_transactions WHERE chain = ? ORDER BY timestamp').iterate(CHAIN)) {
     let raw; try { raw = JSON.parse(r.raw_json); } catch (e) { continue; }
     if ((raw.TransactionType || '') !== wantType) continue;
     n++;
