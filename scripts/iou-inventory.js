@@ -139,11 +139,18 @@ function nonNativeLegs(raw) {
     const v = parseFloat(val);
     legs.push({ currency: c, issuer: String(iss || '').trim(), qty: Number.isFinite(v) ? v : null, role });
   };
+  // `??` falls back only on null/undefined, and WinDB stores EMPTY STRINGS.
+  // So `delivered_amount_currency ?? Amount_currency` keeps the empty string
+  // and never reaches the fallback -- decodeCurrency('') returns '', and the
+  // whole leg is silently discarded. This is the same bug shape as the
+  // engine's own `delivered_amount_XRP ?? Amount_XRP`, copied here by
+  // reflex. `pick` treats empty as absent, which is what was meant.
+  const pick = (...v) => { for (const x of v) { const s = String(x ?? '').trim(); if (s) return s; } return ''; };
   const t = raw.TransactionType;
   if (t === 'Payment') {
-    add(raw.delivered_amount_currency ?? raw.Amount_currency,
-        raw.delivered_amount_issuer ?? raw.Amount_issuer,
-        raw.delivered_amount_value ?? raw.Amount_value, 'payment');
+    add(pick(raw.delivered_amount_currency, raw.Amount_currency),
+        pick(raw.delivered_amount_issuer, raw.Amount_issuer),
+        pick(raw.delivered_amount_value, raw.Amount_value), 'payment');
   } else if (t === 'OfferCreate') {
     add(raw.TakerGets_currency, raw.TakerGets_issuer, raw.TakerGets_value, 'sold (TakerGets)');
     add(raw.TakerPays_currency, raw.TakerPays_issuer, raw.TakerPays_value, 'bought (TakerPays)');
@@ -178,7 +185,19 @@ function main() {
       // reconciler now use — see the tesSUCCESS note in verify-xrpl.js.
       if (raw.TransactionResult && raw.TransactionResult !== 'tesSUCCESS') { failedSkipped++; continue; }
       for (const leg of nonNativeLegs(raw)) {
-        const dir = raw.Account === r.wallet ? 'out' : (raw.Destination === r.wallet ? 'in' : '—');
+        // A cross-currency Payment to YOURSELF is how a token is bought with
+        // XRP without placing a DEX offer: SendMax is XRP, Amount is the
+        // token, Account === Destination === your own wallet. Testing Account
+        // first labelled every one of those a DISPOSAL when it is an
+        // ACQUISITION -- wrong sign, and wrong by twice the amount in any net.
+        //
+        // It also explains a finding that should have looked suspicious on its
+        // face: "zero of 20,818 acquisitions were purchases". Purchases made
+        // this way were in the data all along, filed under the wrong heading.
+        const selfPay = raw.Account === r.wallet && raw.Destination === r.wallet;
+        const dir = selfPay ? 'in'
+                  : raw.Account === r.wallet ? 'out'
+                  : (raw.Destination === r.wallet ? 'in' : '—');
         const key = `${chain}|${leg.currency}|${leg.issuer}`;
         let e = byAsset.get(key);
         if (!e) {
@@ -216,7 +235,9 @@ function main() {
                       ? (raw.TransactionType === 'OfferCreate' ? 'sale (DEX)'
                          : dest && leg.issuer && dest === leg.issuer ? 'sent to ISSUER (burn?)'
                          : dest ? 'sent to another address' : '')
-                      : '' });
+                      : '',
+                    acquisition: dir === 'in'
+                      ? (selfPay ? 'bought (cross-currency payment)' : 'received') : '' });
       }
     }
   }
@@ -362,10 +383,10 @@ function main() {
       const s = v == null ? '' : String(v);
       return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
-    const lines = ['Chain,Wallet,Timestamp,Type,Role,Direction,Asset,Issuer,Quantity,Source,Destination,Disposal Route',
+    const lines = ['Chain,Wallet,Timestamp,Type,Role,Direction,Asset,Issuer,Quantity,Source,Destination,Disposal Route,Acquisition Route',
       ...rows.map(r => [r.chain, r.wallet, r.timestamp, r.type, r.role, r.dir,
                         r.currency, r.issuer, r.qty == null ? '' : r.qty,
-                        r.source, r.destination, r.disposal].map(cell).join(','))];
+                        r.source, r.destination, r.disposal, r.acquisition].map(cell).join(','))];
     fs.writeFileSync(args.csv, lines.join('\n'));
     console.log('');
     console.log(`Wrote ${rows.length.toLocaleString()} row(s) to ${args.csv}`);

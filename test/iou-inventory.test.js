@@ -188,6 +188,45 @@ test('END-TO-END: a synthetic cache is inventoried correctly', () => {
   assert.strictEqual(cx1.out, 974.1);
 });
 
+// ── the two bugs a real wallet balance exposed ────────────────────────────
+test('REGRESSION: an empty delivered_amount falls back to Amount, not to nothing', () => {
+  // `??` returns the empty string rather than falling through, so the leg was
+  // discarded entirely. Found by reconciling a cache against a wallet balance:
+  // 3,935.94 RPR held, 1,013.85 net in the inventory.
+  const legs = nonNativeLegs({
+    TransactionType: 'Payment',
+    delivered_amount_currency: '', delivered_amount_value: '', delivered_amount_issuer: '',
+    Amount_currency: 'RPR', Amount_value: '1.28', Amount_issuer: 'rISS',
+  });
+  assert.strictEqual(legs.length, 1, 'the leg must not be discarded');
+  assert.strictEqual(legs[0].currency, 'RPR');
+  assert.strictEqual(legs[0].qty, 1.28);
+  assert.strictEqual(legs[0].issuer, 'rISS');
+});
+
+test('delivered_amount still WINS when it is actually populated', () => {
+  const legs = nonNativeLegs({
+    TransactionType: 'Payment',
+    delivered_amount_currency: 'RPR', delivered_amount_value: '0.97',
+    Amount_currency: 'RPR', Amount_value: '1.28',
+  });
+  assert.strictEqual(legs[0].qty, 0.97, 'delivered is what arrived');
+});
+
+test('REGRESSION: a cross-currency payment to YOURSELF is an acquisition', () => {
+  // Account === Destination === your wallet is how a token is bought with XRP
+  // without a DEX offer. Testing Account first called every one a disposal.
+  const dir = (raw, wallet) => {
+    const selfPay = raw.Account === wallet && raw.Destination === wallet;
+    return selfPay ? 'in' : raw.Account === wallet ? 'out'
+         : (raw.Destination === wallet ? 'in' : '—');
+  };
+  const W = 'rTESTwa11etXRPL1111111111111111111';
+  assert.strictEqual(dir({ Account: W, Destination: W }, W), 'in', 'self-payment = purchase');
+  assert.strictEqual(dir({ Account: W, Destination: 'rOTHER' }, W), 'out', 'sent away = disposal');
+  assert.strictEqual(dir({ Account: 'rOTHER', Destination: W }, W), 'in', 'received = acquisition');
+});
+
 console.log('');
 if (failures > 0) {
   console.log(`${failures} test(s) FAILED`);
