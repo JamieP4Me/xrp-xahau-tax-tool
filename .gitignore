@@ -28,3 +28,17 @@ Income-Report-*.csv
 All-Transactions-*.csv
 Koinly-Import-*.csv
 CoinLedger-Import-*.csv
+# Market data only — no personal data in this one, but it is still an export
+# that lands in the working copy and has no business being committed.
+Price-History-*.pdf
+# The "not on Form 8949" companion list. Addresses, amounts, tx hashes.
+Unvalued-Transactions-*.csv
+# The preparer memo and the position defense. No addresses, but they are
+# personal tax documents. The generators are committed; the output is not.
+AMM-Treatment-Memo*.pdf
+AMM-Treatment-A-Defense*.pdf
+# verify-xrpl.js --amm --out. Addresses, amounts, transaction hashes.
+amm-*.csv
+amm.csv
+# verify-xrpl.js --out. Full of addresses and amounts.
+XRPL-Verification-*.csv
