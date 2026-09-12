@@ -44,3 +44,6 @@ amm-*.csv
 amm.csv
 # verify-xrpl.js --out. Full of addresses and amounts.
 XRPL-Verification-*.csv
+# iou-inventory.js --out. Addresses, token names, amounts.
+iou*.csv
+IOU-Inventory-*.csv
