@@ -32,6 +32,11 @@ function row(ts, extra = {}) {
   return { Timestamp: ts, TransactionType: 'Payment', Account: 'rSENDER', Destination: 'rWALLET', ...extra };
 }
 
+// A cache row as insertRows() wants it, wrapping the WinDB shape above.
+function cacheRow(ts, hash) {
+  return { tx_hash: hash, timestamp: ts, raw_json: JSON.stringify(row(ts)) };
+}
+
 console.log('db.js — local SQLite cache tests');
 
 test('fresh db has no sync state and no cached rows', () => {
@@ -338,6 +343,204 @@ test('getChainRowsPage keeps a stable total order when many rows share a timesta
     assert.strictEqual(seen.length, total, `page size ${size}: every row exactly once`);
     assert.strictEqual(new Set(seen).size, total, `page size ${size}: no duplicates`);
   }
+  db.close();
+});
+
+// ── app_meta: facts about the cache rather than in it ──────────────────────
+//
+// These back the fetch-scope fingerprint. The bug they guard against is not
+// hypothetical: every cache built before v1.3.0 was filled by a query that
+// asked only for Payment and OfferCreate, while its sync cursors said
+// "synced through today". Widening the query without noticing that would
+// have produced a report that looked complete and silently was not.
+
+test('getMeta returns null for a key that was never set', () => {
+  const db = createDb(tmpDbPath());
+  assert.strictEqual(db.getMeta('fetch_scope'), null);
+  db.close();
+});
+
+test('setMeta writes, overwrites in place, and survives a restart', () => {
+  const p = tmpDbPath();
+  let db = createDb(p);
+  db.setMeta('fetch_scope', 'Payment,OfferCreate');
+  assert.strictEqual(db.getMeta('fetch_scope'), 'Payment,OfferCreate');
+  db.setMeta('fetch_scope', 'Payment,OfferCreate,AMMDeposit');
+  assert.strictEqual(db.getMeta('fetch_scope'), 'Payment,OfferCreate,AMMDeposit');
+  db.close();
+
+  // "Restart the app" — the whole point is that this outlives the process.
+  db = createDb(p);
+  assert.strictEqual(db.getMeta('fetch_scope'), 'Payment,OfferCreate,AMMDeposit');
+  db.close();
+});
+
+test('a meta key does not disturb schema_version, which shares the table', () => {
+  const db = createDb(tmpDbPath());
+  const before = db.getMeta('schema_version');
+  assert.ok(before, 'schema_version should already be set on a fresh db');
+  db.setMeta('fetch_scope', 'x');
+  assert.strictEqual(db.getMeta('schema_version'), before);
+  db.close();
+});
+
+test('widening the scope: cursors drop, cached rows and the fingerprint stay', () => {
+  // The exact upgrade path. A cache synced under the narrow scope, then the
+  // app widens it: every cursor must go so the next fetch re-requests full
+  // history, and not one cached row may be lost in the process.
+  const db = createDb(tmpDbPath());
+  db.insertRows('rWALLET', 'XRPL', [cacheRow('2024-01-01 00:00:00', 'A'), cacheRow('2024-01-02 00:00:00', 'B')]);
+  db.upsertSyncState('rWALLET', 'XRPL', '2024-01-02 00:00:00');
+  db.setMeta('fetch_scope', 'OfferCreate,Payment');
+  assert.strictEqual(db.getSyncState('rWALLET', 'XRPL'), '2024-01-02 00:00:00');
+
+  db.forceFullResync();
+
+  assert.strictEqual(db.getSyncState('rWALLET', 'XRPL'), null,
+    'the cursor must be gone, or the widened query is never sent');
+  assert.strictEqual(db.getAllRows('rWALLET', 'XRPL').length, 2,
+    'forceFullResync must not delete cached rows');
+  assert.strictEqual(db.getMeta('fetch_scope'), 'OfferCreate,Payment',
+    'the old fingerprint must survive the reset so the warning persists until a fetch runs');
+  db.close();
+});
+
+test('re-fetching after a scope change dedups rather than doubling history', () => {
+  // The cost of the re-sync has to be time, never duplicated rows — a
+  // doubled history would double proceeds on Form 8949.
+  const db = createDb(tmpDbPath());
+  const rows = [cacheRow('2024-01-01 00:00:00', 'A'), cacheRow('2024-01-02 00:00:00', 'B')];
+  db.insertRows('rWALLET', 'XRPL', rows);
+  db.upsertSyncState('rWALLET', 'XRPL', '2024-01-02 00:00:00');
+  db.forceFullResync();
+  // Full history comes back, plus one genuinely new row.
+  db.insertRows('rWALLET', 'XRPL', [...rows, cacheRow('2024-01-03 00:00:00', 'C')]);
+  assert.strictEqual(db.getAllRows('rWALLET', 'XRPL').length, 3);
+  db.close();
+});
+
+// ── amm_ledger: ledger-verified AMM amounts ───────────────────────────────
+// The figures here come from a different source than everything else in the
+// cache, and they exist because WinDB's number is the amount REQUESTED while
+// the ledger delivered more on every comparable withdrawal measured.
+
+function ammRow(type, ts, delivered, extra = {}) {
+  return {
+    wallet: 'rTESTwa11etXRPL1111111111111111111',
+    tx_type: type, timestamp: ts,
+    ledger_hash: 'DEADBEEF', submitted: 100, delivered, flags: 262144, note: '',
+    ...extra,
+  };
+}
+
+test('a fresh db has no imported AMM amounts', () => {
+  const db = createDb(tmpDbPath());
+  assert.deepStrictEqual(db.getAmmLedger(), []);
+  const s = db.getAmmStats();
+  assert.strictEqual(s.rows, 0);
+  assert.strictEqual(s.withDelivered, 0);
+  assert.strictEqual(s.importedAt, null);
+  db.close();
+});
+
+test('importAmmLedger stores rows and counts only those carrying a ledger figure', () => {
+  // An unpaired row is stored deliberately: it is the record that this
+  // transaction was LOOKED FOR on the ledger and no figure exists, which is
+  // different from never having asked.
+  const db = createDb(tmpDbPath());
+  const n = db.importAmmLedger([
+    ammRow('AMMWithdraw', '2025-01-01 00:00:00.1', 105.5),
+    ammRow('AMMDeposit', '2024-05-01 00:00:00.2', 50),
+    ammRow('AMMWithdraw', '2025-02-01 00:00:00.3', null, { submitted: null, ledger_hash: '', flags: null, note: 'no ledger AMM tx of this type within a second' }),
+  ]);
+  assert.strictEqual(n, 3);
+  const s = db.getAmmStats();
+  assert.strictEqual(s.rows, 3);
+  assert.strictEqual(s.withDelivered, 2);
+  assert.ok(s.importedAt, 'an import stamps a time');
+  db.close();
+});
+
+test('getAmmLedger returns rows oldest first', () => {
+  const db = createDb(tmpDbPath());
+  db.importAmmLedger([
+    ammRow('AMMWithdraw', '2025-02-01 00:00:00', 3),
+    ammRow('AMMWithdraw', '2024-01-01 00:00:00', 1),
+    ammRow('AMMWithdraw', '2024-06-01 00:00:00', 2),
+  ]);
+  assert.deepStrictEqual(db.getAmmLedger().map(r => r.delivered), [1, 2, 3]);
+  db.close();
+});
+
+test('re-importing a corrected CSV REPLACES the figure rather than keeping the first one', () => {
+  // This is the whole reason the statement is an UPSERT and not an INSERT OR
+  // IGNORE. The second run of the verifier is the one that fixed the numbers:
+  // the first --amm implementation paired on transaction hash and matched 0 of
+  // 73 rows, because WinDB returns NUL bytes for an AMM hash. A silent
+  // "already have that key, skipping" would keep the wrong figure for ever,
+  // and nothing on screen would say the import had done nothing.
+  const db = createDb(tmpDbPath());
+  db.importAmmLedger([ammRow('AMMWithdraw', '2025-01-01 00:00:00.1', 100)]);
+  db.importAmmLedger([ammRow('AMMWithdraw', '2025-01-01 00:00:00.1', 663.23, { note: 'corrected' })]);
+  const rows = db.getAmmLedger();
+  assert.strictEqual(rows.length, 1, 'replaced, not appended');
+  assert.strictEqual(rows[0].delivered, 663.23);
+  assert.strictEqual(rows[0].note, 'corrected');
+  db.close();
+});
+
+test('the same timestamp on different types, or different wallets, are distinct rows', () => {
+  // A deposit and a withdrawal really can share a second, and the same second
+  // occurs across wallets. Keying on timestamp alone would silently collapse
+  // them and lose a transaction's figure.
+  const db = createDb(tmpDbPath());
+  db.importAmmLedger([
+    ammRow('AMMWithdraw', '2025-01-01 00:00:00', 1),
+    ammRow('AMMDeposit', '2025-01-01 00:00:00', 2),
+    ammRow('AMMWithdraw', '2025-01-01 00:00:00', 3, { wallet: 'rTESTwa11etXRPL2222222222222222222' }),
+  ]);
+  assert.strictEqual(db.getAmmStats().rows, 3);
+  db.close();
+});
+
+test('clearAll wipes the cache but KEEPS imported AMM amounts', () => {
+  // Deliberate. These are not cached WinDB rows; they are an independent
+  // measurement that costs roughly an hour of sweeping a full-history node to
+  // reproduce, and they stay correct across a re-fetch because the same rows
+  // come back under the same (wallet, type, timestamp) keys. Folding them into
+  // the cache wipe would quietly destroy the only copy of figures the cache
+  // itself cannot supply.
+  const db = createDb(tmpDbPath());
+  db.insertRows('rWALLET', 'XRPL', [cacheRow('2024-01-01 00:00:00', 'A')]);
+  db.importAmmLedger([ammRow('AMMWithdraw', '2025-01-01 00:00:00', 105.5)]);
+  db.clearAll();
+  assert.strictEqual(db.countForWallet('rWALLET', 'XRPL'), 0, 'cache is gone');
+  assert.strictEqual(db.getAmmStats().rows, 1, 'imported AMM figures survive');
+  db.close();
+});
+
+test('clearAmmLedger drops them when that is actually what was meant', () => {
+  const db = createDb(tmpDbPath());
+  db.importAmmLedger([ammRow('AMMWithdraw', '2025-01-01 00:00:00', 105.5)]);
+  db.clearAmmLedger();
+  assert.strictEqual(db.getAmmStats().rows, 0);
+  db.close();
+});
+
+test('imported AMM amounts survive a restart', () => {
+  const p = tmpDbPath();
+  const first = createDb(p);
+  first.importAmmLedger([ammRow('AMMWithdraw', '2025-01-01 00:00:00.1', 105.5)]);
+  first.close();
+  const second = createDb(p);
+  assert.strictEqual(second.getAmmLedger()[0].delivered, 105.5);
+  second.close();
+});
+
+test('importAmmLedger on an empty list is a no-op, not an error', () => {
+  const db = createDb(tmpDbPath());
+  assert.strictEqual(db.importAmmLedger([]), 0);
+  assert.strictEqual(db.importAmmLedger(null), 0);
   db.close();
 });
 

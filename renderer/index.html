@@ -123,6 +123,28 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
       <input type="password" id="paymentClaim" value="" placeholder="Paste your base64 Payment-Claim from pay.dhali.io" style="flex:1;margin-bottom:0">
       <button class="sec sml" onclick="window.open('https://pay.dhali.io/?uuids=8d0eb161-551f-4471-bae7-ff9ef205d62b','_blank')">🔑 Get New Claim</button>
       <button class="sml" onclick="testClaim()">▶ Test</button>
+      <button class="sml" onclick="checkWinDBColumns()">🔍 Check WinDB Columns</button>
+    </div>
+    <!-- Asks WinDB directly whether a transaction the ledger has is one it
+         knows about. This is what separates "the app failed to fetch it" from
+         "the data source never had it" — two problems with opposite fixes. -->
+    <div class="row" style="margin-top:8px;gap:6px;align-items:center">
+      <input type="text" id="probeWallet" placeholder="r… address to probe" style="flex:2;margin-bottom:0;font-size:11px">
+      <input type="text" id="probeFrom" placeholder="2024-06-27 10:18:00" style="flex:1;margin-bottom:0;font-size:11px">
+      <input type="text" id="probeTo" placeholder="2024-06-27 10:19:00" style="flex:1;margin-bottom:0;font-size:11px">
+      <button class="sml" onclick="probeWinDBWindow()">🔬 Probe WinDB Window</button>
+    </div>
+    <div class="row" style="margin-top:6px;gap:6px;align-items:center">
+      <button class="sml" style="background:#5a3a00;color:#fff;border-color:#5a3a00"
+              onclick="compareTypeCoverage()">📊 Compare WinDB vs Cache by Type</button>
+      <button class="sml" style="background:#1a4a3a;color:#fff;border-color:#1a4a3a"
+              onclick="inspectTypeColumns()">🧬 Inspect Type Columns</button>
+      <button class="sml" style="background:#5a3a00;color:#fff;border-color:#5a3a00"
+              onclick="inspectUnvaluedRows()">🔬 Why No Amount?</button>
+      <span style="font-size:10px;color:#666">
+        Uses the address above. Asks WinDB what it holds for that address <b>with no type filter</b>,
+        and compares it to the cache — on both chains. Two aggregate queries, ~0.001 XRP.
+      </span>
     </div>
     <div style="font-size:10px;color:#666;margin-top:5px">
       A Payment-Claim is required — this tool has no other data source. Cost per query: ~0.000423 XRP.
@@ -151,6 +173,41 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
       against what's cached — nothing is lost or doubled); "Clear Local
       Database" deletes the local cache entirely and starts over from
       nothing.
+    </div>
+  </section>
+
+  <!-- AMM amounts come from a different place than everything else in this
+       app, and that is the point. WinDB's Amount_XRP on an AMM row is what the
+       transaction REQUESTED; the ledger delivered more on every comparable
+       withdrawal measured. The real figure is only in ledger metadata, which
+       WinDB does not carry at all, so it has to be swept separately and
+       brought in here. -->
+  <section id="ammLedgerSection" style="display:none">
+    <div class="sec-title">AMM Amounts — Verified Against the Ledger</div>
+    <div id="ammLedgerStats" style="font-size:11.5px;color:#333;line-height:1.8">Loading…</div>
+    <div class="row" style="margin-top:10px">
+      <button class="sml" style="background:#1a3a7a;color:#fff;border-color:#1a3a7a"
+              onclick="document.getElementById('ammCsvInput').click()">⬆ Import AMM Ledger CSV</button>
+      <input type="file" id="ammCsvInput" accept=".csv,.txt" style="display:none" onchange="handleAmmLedgerCSV(this)">
+      <button class="sml" onclick="refreshAmmLedgerPanel()">↻ Refresh</button>
+      <button class="sml dan" onclick="clearAmmLedgerUI()">🗑 Clear Imported Amounts</button>
+    </div>
+    <div style="font-size:10px;color:#888;margin-top:6px;line-height:1.5">
+      An AMM deposit or withdrawal carries two different numbers: the amount the
+      transaction <b>asked for</b>, which is what the data source stores, and the
+      amount the ledger <b>actually moved</b>, which lives only in the
+      transaction's own metadata. They are not the same. Measured across one
+      wallet's full AMM history, 24 of 47 comparable rows disagreed, and
+      <b>every comparable withdrawal — 18 of 18 — was short</b>, by 1,583 XRP in
+      total and by 563 XRP in the worst single case. (Deposits go the other way,
+      by tiny amounts: the pool takes only what preserves its ratio.)
+      <br><br>
+      Produce the file by sweeping a full-history node:
+      <code style="font-size:10px">node scripts/verify-xrpl.js --amm --out amm-all.csv</code>
+      then import it here. The import also restores the real transaction hashes,
+      which the data source returns as empty bytes on every AMM row. Rebuild
+      afterwards to apply. Nothing is sent anywhere — the file is read in this
+      window and stored in the local database.
     </div>
   </section>
 
@@ -195,7 +252,7 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
     <div class="sec-title">Tax Year</div>
     <select class="taxYearSelect" id="taxYear" onchange="syncTaxYear(this.value)" style="width:140px">
       <option value="2026">2026 (in progress)</option>
-      <option value="2025" selected>2025</option>
+      <option value="2025">2025</option>
       <option value="2024">2024</option>
       <option value="2023">2023</option>
       <option value="2022">2022</option>
@@ -664,7 +721,33 @@ function parseWinDbTs(ts) {
 }
 const fmtDate = ts => { const d=new Date(ts); return `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()}`; };
 const toDK = ts => { const d=new Date(ts); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; };
-const taxYear = () => parseInt(document.getElementById('taxYear').value);
+// ── The reporting year: one value, three dropdowns ────────────────────────
+//
+// There are three year selectors — Setup, Form 8949 and Schedule D — and they
+// used to get their initial value from the HTML alone. Only the Setup one
+// carried `selected` on 2025; the other two fell back to their first option,
+// 2026, and nothing reconciled them until a FETCH completed. A cache rebuild
+// (which is what happens at every launch) did not.
+//
+// So the Form 8949 tab displayed "2026 (in progress)" above 2025 figures,
+// while taxYear() — which reads the Setup dropdown — returned 2025. The
+// numbers were right and the label above them was wrong, which on a tax form
+// is the more dangerous half to get wrong.
+//
+// DEFAULT_TAX_YEAR is now the single source, applied to all three at startup.
+const DEFAULT_TAX_YEAR = 2025;
+const taxYear = () => {
+  const el = document.getElementById('taxYear');
+  const n = parseInt(el && el.value);
+  return Number.isFinite(n) ? n : DEFAULT_TAX_YEAR;
+};
+
+// Point every selector at the same year. Called at startup and after any
+// build, so what is on screen always names the year the figures are for.
+function syncTaxYearSelects(year) {
+  const v = String(year != null ? year : taxYear());
+  document.querySelectorAll('.taxYearSelect').forEach(el => { el.value = v; });
+}
 const getClaim = () => document.getElementById('paymentClaim').value.trim();
 
 // ── App version in the header ──────────────────────────────────────────────
@@ -1424,9 +1507,452 @@ async function windbQuery(sql, claim) {
     .filter(Boolean);
 }
 
+// Opens the Setup-tab log and brings it into view.
+//
+// The log lives below the 140-row wallet grid, so a diagnostic launched from
+// the button row at the top of the page wrote its entire output several
+// screens down, with nothing to indicate it had happened. It looked like the
+// button did nothing. Anything a button produces has to arrive where the
+// person who pressed it is looking.
+function beginSetupLog() {
+  logEl = document.getElementById('logSetup');
+  logEl.innerHTML = '';
+  logEl.style.display = 'block';
+  try { logEl.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch(e) { logEl.scrollIntoView(); }
+  return logEl;
+}
+
+// ── Which columns carry the value, per transaction type ────────────────────
+//
+// The engine reads Amount_XRP / delivered_amount_XRP / TakerGets_XRP /
+// TakerPays_XRP. Those are Payment and OfferCreate columns. For an
+// AMMWithdraw they are empty — which is why the WinDB window probe showed a
+// transaction the ledger valued at 24,101 XRP as "0 XRP".
+//
+// So before the fetch filter is widened, each new type needs its amount
+// located, not guessed. Guessing which column holds a quantity is precisely
+// the mistake that once turned a 12,000 XRP transfer into 0.012 and silently
+// dropped the largest transactions off Form 8949.
+//
+// METHOD. Sample a few successful rows of each type and report which columns
+// actually carry a value. Deliberately NOT filtered by wallet: the rows are
+// whoever happens to be first in the table, so none of them are yours and the
+// values are safe to print. Counter-columns are shown by name only, so no
+// stray addresses end up in the output.
+// Prints the real cached rows behind every unvalued type that reported no
+// amount. No Payment-Claim, no network, no re-sync — this reads what the last
+// build already had in hand.
+function inspectUnvaluedRows() {
+  beginSetupLog();
+  const types = Object.keys(unvaluedSamples);
+  if(!types.length) {
+    log('No unvalued rows without an amount in the last build. Run a build from cache first if you expected some.', 'wa');
+    return;
+  }
+
+  log('\n─── What is actually in the rows that have no amount ───', 'hd');
+  log('Every populated column of a few real cached rows per type. A column that', 'in');
+  log('is absent here is either not fetched or not present on that transaction —', 'in');
+  log('and which of those it is, is the whole question.', 'in');
+
+  // What the query asked for, so "missing" can be told apart from "empty".
+  const asked = new Set(window._lastSelectedCols || []);
+  if(asked.size) log(`\nThe last fetch selected ${asked.size} columns.`, 'in');
+
+  for(const t of types.sort()) {
+    const rows = unvaluedSamples[t];
+    const reason = UNVALUED_REASON[t] || 'not handled';
+    log(`\n▸ ${t} — ${rows.length} sample(s) of ${unvaluedRows.filter(r => r.type === t).length} · ${reason}`, 'hd');
+    rows.forEach((r, i) => {
+      const keys = Object.keys(r);
+      log(`   [${i + 1}] ${keys.length} populated column(s):`, 'in');
+      for(const k of keys) log(`        ${k} = ${r[k]}`, 'in');
+      // The specific question for the types derivableAmount tries to handle.
+      if(t === 'AMMDeposit') {
+        const has = keys.includes('Asset_currency');
+        log(`        → Asset_currency ${has ? 'IS present: ' + r.Asset_currency : 'is EMPTY or absent'}` +
+            ` · Amount_XRP ${keys.includes('Amount_XRP') ? 'present: ' + r.Amount_XRP : 'EMPTY or absent'}`,
+            has && keys.includes('Amount_XRP') ? 'ok' : 'wa');
+      }
+      if(t === 'Import') {
+        log(`        → win_Import_MintedXAH ${keys.includes('win_Import_MintedXAH') ? 'present: ' + r.win_Import_MintedXAH : 'EMPTY or absent'}`,
+            keys.includes('win_Import_MintedXAH') ? 'ok' : 'wa');
+      }
+    });
+  }
+
+  log('\nRead it this way: if a column this tool needs is absent from EVERY sample,', 'in');
+  log('either the query never asked for it (fixable here) or the ledger does not', 'in');
+  log('put the amount there at all (Phase 2, from node metadata). The column list', 'in');
+  log('printed above tells you which.', 'in');
+}
+
+async function inspectTypeColumns() {
+  beginSetupLog();
+  const claim = getClaim();
+  if(!claim) { log('⚠ No Payment-Claim entered.', 'er'); return; }
+
+  // Payment is included as a CONTROL. It is the type the engine already
+  // handles, so its column set is the known-good baseline every other type is
+  // read against.
+  const PLAN = [
+    ['xrpl.transactions', ['Payment', 'AMMDeposit', 'AMMWithdraw', 'NFTokenAcceptOffer',
+                           'EscrowCreate', 'EscrowFinish', 'CheckCash',
+                           'PaymentChannelCreate', 'PaymentChannelFund', 'PaymentChannelClaim']],
+    ['xahau.transactions', ['Payment', 'Remit', 'ClaimReward', 'URITokenBuy', 'Import']],
+  ];
+  const ENGINE_READS = ['Amount_XRP', 'delivered_amount_XRP', 'Amount_value', 'Amount_currency',
+                        'TakerGets_XRP', 'TakerPays_XRP'];
+
+  const isFilled = (v) => {
+    if(v == null || v === '') return false;
+    const s = String(v);
+    if(/^0+(\.0+)?$/.test(s)) return false;
+    if([...s].every(ch => ch.charCodeAt(0) === 0)) return false;
+    if(s === '[]' || s === '{}') return false;
+    return true;
+  };
+  // Nested values (Remit's Amounts array) stringified as "[object Object]" in
+  // the first version of this, which is exactly the field that matters most.
+  const show = (v) => {
+    if(v != null && typeof v === 'object') { try { return JSON.stringify(v); } catch(e) { return '(unserialisable)'; } }
+    return String(v);
+  };
+
+  log('━━━ Which columns carry the value, by transaction type ━━━', 'hd');
+  log('Rows are sampled from the whole table with no wallet filter, so none are yours.', 'in');
+  log('ONE COMPLETE ROW is shown per type — merging columns across rows made it', 'in');
+  log('look as though a single transaction carried values it did not.', 'in');
+
+  for(const [table, types] of PLAN) {
+    log(`\n════ ${table} ════`, 'hd');
+
+    // Every win_* column XRPLWin computes, from the schema rather than from a
+    // sample. If one of these carries a balance delta it would value EVERY
+    // type uniformly, which is far better than a per-type column hunt.
+    try {
+      const desc = await windbQuery(`DESCRIBE TABLE ${table}`, claim);
+      const wins = desc.map(r => r.name ?? r.Name ?? r.column_name).filter(Boolean).filter(c => /^win_/i.test(c));
+      log(`\ncomputed win_* columns in the schema (${wins.length}):`, 'hd');
+      log('  ' + (wins.length ? wins.join(', ') : '(none)'), 'in');
+    } catch(e) { log('could not read the schema: ' + e.message, 'wa'); }
+
+    for(const t of types) {
+      try {
+        const rows = await windbQuery(
+          `SELECT * FROM ${table} WHERE TransactionType = '${t}' ` +
+          `AND TransactionResult = 'tesSUCCESS' LIMIT 1`, claim);
+        if(rows.length === 0) { log(`\n── ${t}: no successful rows`, 'wa'); continue; }
+
+        const r = rows[0];
+        const filled = Object.entries(r).filter(([, v]) => isFilled(v));
+        const names = new Set(filled.map(([k]) => k));
+        const engineHas = ENGINE_READS.filter(c => names.has(c));
+
+        log(`\n── ${t}  (ONE row, ${filled.length} populated column(s))`, 'hd');
+        log(`   engine-readable today: ${engineHas.length ? engineHas.join(', ') : 'NONE'}`,
+            engineHas.length ? 'ok' : 'er');
+        for(const [k, v] of filled.sort((a, b) => a[0].localeCompare(b[0]))) {
+          log(`     ${k.padEnd(32)} = ${show(v).slice(0, 120)}`, 'in');
+        }
+      } catch(e) {
+        log(`\n── ${t}: query failed — ${e.message}`, 'er');
+      }
+    }
+  }
+  log('\n━━━ Done. One sampled row per type, no wallet filter — safe to share. ━━━', 'hd');
+}
+
+// ── Type-coverage comparison ───────────────────────────────────────────────
+//
+// Measures how much the fetch's TransactionType filter is actually excluding,
+// per chain, without needing a second data source.
+//
+// The XRPL gap was found by reconciling against an independent full-history
+// node, which is the strongest evidence available — but xrplcluster is XRPL
+// only, and Xahau is ~94% of this cache. Rather than wait for an equivalent
+// Xahau node, this asks the SAME question a different way: WinDB advertises
+// full history for both chains ("every transaction since genesis"), so ask it
+// what it holds for one address with NO type filter, and compare against what
+// the cache actually has.
+//
+// That does not prove WinDB matches the Xahau ledger — only a real Xahau node
+// could — but it does exactly size THIS bug, which is what the decision needs.
+async function compareTypeCoverage() {
+  beginSetupLog();
+  const claim = getClaim();
+  if(!claim) { log('⚠ No Payment-Claim entered.', 'er'); return; }
+  const wallet = (document.getElementById('probeWallet').value || '').trim();
+  if(!wallet) { log('⚠ Put an address in the probe field above first.', 'er'); return; }
+  if(/['\\]/.test(wallet)) { log('⚠ Quotes are not valid in an address.', 'er'); return; }
+
+  // Mirrors the fetch filters in fetchXRPLWinDB() / fetchXahauWinDB().
+  const FETCHED_OUT = ['Payment', 'OfferCreate'];   // Account = wallet
+  const FETCHED_IN  = ['Payment'];                  // Destination = wallet
+
+  log('━━━ WinDB vs cache, by transaction type ━━━', 'hd');
+  log(wallet, 'in');
+  log('WinDB counts are unfiltered by type; the cache only ever received what the', 'in');
+  log('app asked for. A gap here is the fetch filter, not a WinDB shortfall.', 'in');
+
+  for(const [chain, table] of [['XRPL','xrpl.transactions'], ['Xahau','xahau.transactions']]) {
+    log(`\n── ${chain} ──`, 'hd');
+    try {
+      const sql =
+        `SELECT TransactionType AS t, count() AS n FROM ${table} ` +
+        `WHERE (Account = '${wallet}' OR Destination = '${wallet}') ` +
+        `AND TransactionResult = 'tesSUCCESS' ` +
+        `GROUP BY TransactionType ORDER BY n DESC`;
+      const rows = await windbQuery(sql, claim);
+      if(rows.length === 0) { log('WinDB holds nothing for this address on this chain.', 'wa'); continue; }
+
+      // Cached rows by type, successful only, so both sides count the same thing.
+      const cached = {};
+      let cachedTotal = 0;
+      if(USE_LOCAL_DB) {
+        try {
+          for(const r of (await window.taxDB.getAllRows(wallet, chain)) || []) {
+            const res = r.TransactionResult;
+            if(res != null && res !== '' && res !== 'tesSUCCESS') continue;
+            const t = r.TransactionType || '?';
+            cached[t] = (cached[t] || 0) + 1;
+            cachedTotal++;
+          }
+        } catch(e) { log('(could not read the local cache for this chain: ' + e.message + ')', 'wa'); }
+      }
+
+      log('  type                    WinDB    cached    missing   asked for?', 'in');
+      let windbTotal = 0, missingFetched = 0, missingUnfetched = 0;
+      for(const r of rows) {
+        const t = r.t || '?';
+        const n = Number(r.n) || 0;
+        windbTotal += n;
+        const c = cached[t] || 0;
+        const miss = Math.max(0, n - c);
+        const asked = FETCHED_OUT.includes(t) || FETCHED_IN.includes(t);
+        if(miss > 0) { if(asked) missingFetched += miss; else missingUnfetched += miss; }
+        const flag = miss === 0 ? 'ok' : (asked ? 'wa' : 'er');
+        log(`  ${t.padEnd(22)} ${String(n).padStart(7)} ${String(c).padStart(9)} ${String(miss).padStart(10)}   ${asked ? 'yes' : 'NO'}`, flag);
+      }
+      log(`  ${'TOTAL'.padEnd(22)} ${String(windbTotal).padStart(7)} ${String(cachedTotal).padStart(9)} ${String(Math.max(0, windbTotal - cachedTotal)).padStart(10)}`, 'hd');
+
+      log('', 'in');
+      if(missingUnfetched > 0) {
+        log(`⇒ ${missingUnfetched.toLocaleString()} transaction(s) WinDB holds are of types the app never asks for.`, 'er');
+        log('  Widening the TransactionType filter would recover these.', 'er');
+      }
+      if(missingFetched > 0) {
+        log(`⇒ ${missingFetched.toLocaleString()} more are of types the app DOES ask for but are still absent.`, 'er');
+        log('  Those are a separate problem — most likely transactions that moved this', 'er');
+        log("  balance without this address being Account or Destination (someone else's", 'er');
+        log('  offer crossing yours), which this query shape cannot see either.', 'er');
+      }
+      if(missingUnfetched === 0 && missingFetched === 0) {
+        log('⇒ No gap on this chain for this address.', 'ok');
+      }
+    } catch(e) {
+      log(`Failed on ${chain}: ${e.message}`, 'er');
+    }
+  }
+  log('\n━━━ Done. Types and counts only — safe to share. ━━━', 'hd');
+}
+
+// ── WinDB window probe ─────────────────────────────────────────────────────
+//
+// Asks WinDB for everything it has for ONE address in ONE time window, and
+// compares that to what is in the local cache for the same window.
+//
+// This exists to settle the question verify-xrpl.js cannot answer. That tool
+// proved 1,178 successful transactions the XRP Ledger holds are absent from
+// the cache — the gap reconciles exactly against the per-wallet coverage
+// counts, and --probe confirmed one directly: nothing cached in that minute
+// at all. What it cannot tell you is WHY, and the two candidates need
+// opposite responses:
+//
+//   WinDB HAS the transaction  → the app failed to fetch or store it.
+//                                A Force Full Re-sync would recover it, and
+//                                the fetch path has a bug worth finding.
+//   WinDB does NOT have it     → the data source is incomplete. Re-syncing
+//                                changes nothing, and the tool needs a
+//                                different source for XRPL.
+//
+// Prints counts, timestamps, types and amounts — no Payment-Claim, and the
+// only address shown is the one you typed in yourself.
+async function probeWinDBWindow() {
+  beginSetupLog();
+  const claim = getClaim();
+  if(!claim) { log('⚠ No Payment-Claim entered.', 'er'); return; }
+
+  const wallet = (document.getElementById('probeWallet').value || '').trim();
+  const from   = (document.getElementById('probeFrom').value || '').trim();
+  const to     = (document.getElementById('probeTo').value || '').trim();
+  if(!wallet || !from || !to) {
+    log('⚠ Fill in the address and both timestamps (UTC, "YYYY-MM-DD HH:MM:SS").', 'er');
+    return;
+  }
+  // Single quotes would break out of the SQL string literals below.
+  if(/['\\]/.test(wallet + from + to)) { log('⚠ Quotes are not valid in any of these fields.', 'er'); return; }
+
+  log('━━━ WinDB window probe ━━━', 'hd');
+  log(`${wallet}`, 'in');
+  log(`${from}  →  ${to}   (UTC)`, 'in');
+
+  try {
+    const sql =
+      `SELECT Timestamp, TransactionType, TransactionResult, Account, Destination, ` +
+      `Amount_XRP, delivered_amount_XRP ` +
+      `FROM xrpl.transactions ` +
+      `WHERE (Account = '${wallet}' OR Destination = '${wallet}') ` +
+      `AND Timestamp >= '${from}' AND Timestamp <= '${to}' ` +
+      `ORDER BY Timestamp LIMIT 200`;
+    const rows = await windbQuery(sql, claim);
+
+    log(`\nWinDB returned ${rows.length} row(s):`, rows.length ? 'ok' : 'er');
+    for(const r of rows) {
+      const amt = r.delivered_amount_XRP ?? r.Amount_XRP ?? '—';
+      const dir = r.Account === wallet ? 'out' : 'in ';
+      log(`  ${String(r.Timestamp).slice(0,26).padEnd(28)} ${dir}  ${String(amt).padStart(18)} XRP  ` +
+          `${String(r.TransactionType||'?').padEnd(12)} ${r.TransactionResult||'?'}`, 'in');
+    }
+
+    // What the local cache holds for the same window, for direct comparison.
+    let cachedCount = null;
+    if(USE_LOCAL_DB) {
+      try {
+        const all = await window.taxDB.getAllRows(wallet, 'XRPL');
+        cachedCount = all.filter(x => {
+          const ts = String(x.rawTs ?? x.Timestamp ?? '');
+          return ts >= from && ts <= to;
+        }).length;
+      } catch(e) { /* reported as unknown below */ }
+    }
+    log(`\nLocal cache holds ${cachedCount == null ? '(unknown)' : cachedCount} row(s) for the same window.`, 'in');
+
+    // The verdict has to account for the fetch FILTER, not just presence.
+    // The app asks WinDB only for:
+    //     TransactionType IN ('Payment','OfferCreate')
+    // on both chains. Any other type is never requested, so "WinDB has it but
+    // your cache does not" does NOT imply a re-sync would help — the query
+    // has to change first. Saying otherwise sends you off to spend hours on a
+    // re-sync that reruns the identical query.
+    const FETCHED_TYPES = ['Payment', 'OfferCreate'];
+    const types = [...new Set(rows.map(r => r.TransactionType).filter(Boolean))];
+    const unfetched = types.filter(t => !FETCHED_TYPES.includes(t));
+
+    log('', 'in');
+    if(rows.length === 0) {
+      log('⇒ WinDB DOES NOT HAVE this transaction. The data source is incomplete;', 'er');
+      log('  a Force Full Re-sync would not recover it. XRPL needs another source.', 'er');
+    } else if(unfetched.length) {
+      log(`⇒ WinDB HAS it, but its type (${unfetched.join(', ')}) is NOT one the app`, 'er');
+      log(`  fetches. The query asks only for ${FETCHED_TYPES.join(' and ')}, so this`, 'er');
+      log('  transaction is never requested, never cached, and invisible to the ledger.', 'er');
+      log('  A Force Full Re-sync would NOT recover it — the fetch filter must change,', 'er');
+      log('  and the engine must learn to value that type. This affects BOTH chains.', 'er');
+    } else if(cachedCount === 0) {
+      log('⇒ WinDB HAS it, its type IS one the app fetches, and your cache lacks it.', 'er');
+      log('  That is a genuine fetch/store bug, and a Force Full Re-sync should recover it.', 'er');
+    } else if(cachedCount != null && cachedCount < rows.length) {
+      log(`⇒ WinDB has ${rows.length}, the cache has ${cachedCount}. Some rows were lost on the way in.`, 'er');
+    } else {
+      log('⇒ Counts agree for this window. Try another timestamp from the report.', 'ok');
+    }
+  } catch(e) {
+    log(`Probe failed: ${e.message}`, 'er');
+  }
+  log('\n━━━ Done. Safe to share — the only address shown is the one you entered. ━━━', 'hd');
+}
+
+// ── WinDB column diagnostic ────────────────────────────────────────────────
+//
+// Answers one narrow question: does WinDB's xrpl.transactions actually return
+// TransactionHash, or is the app dropping the column before it asks?
+//
+// The symptom that prompted this: every cached XRPL row falls back to a
+// synthetic "<timestamp>_<wallet>" id, so the cache cannot be reconciled
+// against the ledger by hash at all. Two very different causes with opposite
+// fixes — a one-line schema-filter bug here, or WinDB genuinely not
+// populating the column — and no way to tell them apart from the cache alone.
+//
+// SAFETY. This logs COLUMN NAMES and whether each came back populated. It
+// never logs a Payment-Claim, an address, an amount, or any row content, so
+// the output can be pasted into a support thread or a conversation without
+// leaking anything. Two queries, ~0.001 XRP.
+async function checkWinDBColumns() {
+  beginSetupLog();
+  const claim = getClaim();
+  if(!claim) { log('⚠ No Payment-Claim entered. Paste your claim from pay.dhali.io first.', 'er'); return; }
+
+  log('━━━ WinDB column diagnostic ━━━', 'hd');
+  log('Reports column names and whether each is populated. No addresses, amounts', 'in');
+  log('or credentials are printed — the output is safe to share.', 'in');
+
+  for(const table of ['xrpl.transactions', 'xahau.transactions']) {
+    log(`\n── ${table} ──`, 'hd');
+    try {
+      // 1. What columns exist at all.
+      const desc = await windbQuery(`DESCRIBE TABLE ${table}`, claim);
+      const cols = desc.map(r => r.name ?? r.Name ?? r.column_name).filter(Boolean);
+      const hashish = cols.filter(c => /hash|ctid|txid|id$/i.test(c));
+      log(`${cols.length} column(s). Hash/ID-shaped: ${hashish.length ? hashish.join(', ') : 'NONE'}`, hashish.length ? 'ok' : 'wa');
+
+      const hasTxHash = cols.some(c => c === 'TransactionHash');
+      const caseOnly  = !hasTxHash && cols.some(c => c.toLowerCase() === 'transactionhash');
+      if(hasTxHash) {
+        log('TransactionHash: present in the schema, exact case matches.', 'ok');
+      } else if(caseOnly) {
+        const actual = cols.find(c => c.toLowerCase() === 'transactionhash');
+        log(`TransactionHash: present but spelled "${actual}" — the app's exact-match`, 'er');
+        log('  schema filter drops it, which is why every row gets a synthetic id.', 'er');
+      } else {
+        log('TransactionHash: NOT in this table. WinDB cannot supply it here.', 'er');
+      }
+
+      // 2. Of the columns the app asks for, which actually carry a value.
+      //
+      // LIMIT 20 and no WHERE clause: this is about column population, not
+      // about any particular wallet, and keeping a wallet out of the query
+      // keeps addresses out of the log.
+      const wanted = ['TransactionHash','Timestamp','Account','Destination','TransactionType',
+                      'TransactionResult','Amount_XRP','delivered_amount_XRP','Fee','LedgerIndex','CTID'];
+      const present = wanted.filter(c => cols.includes(c));
+      if(present.length) {
+        const rows = await windbQuery(`SELECT ${present.join(', ')} FROM ${table} LIMIT 20`, claim);
+        log(`\nSampled ${rows.length} row(s) — populated / sampled:`, 'in');
+        for(const c of present) {
+          // "Populated" means non-null, non-empty, and not all-zero bytes —
+          // makeTxHash() treats an all-zero hash as absent, so a column full
+          // of zeros would look present here and still produce synthetic ids.
+          const filled = rows.filter(r => {
+            const v = r[c];
+            if(v == null || v === '') return false;
+            const s = String(v);
+            return !/^0+$/.test(s) && ![...s].every(ch => ch.charCodeAt(0) === 0);
+          }).length;
+          const flag = filled === 0 ? 'er' : (filled < rows.length ? 'wa' : 'ok');
+          log(`  ${c.padEnd(24)} ${String(filled).padStart(3)} / ${rows.length}`, flag);
+        }
+        // The shape of the hash decides how makeTxHash() should encode it.
+        const sampleHash = rows.map(r => r.TransactionHash).find(v => v != null && v !== '');
+        if(sampleHash != null) {
+          const s = String(sampleHash);
+          const isHexText = /^[0-9a-fA-F]{64}$/.test(s);
+          log(`\n  TransactionHash length ${s.length}, ` +
+              (isHexText ? '64 hex characters — TEXT already in hex.' : 'not 64-char hex — probably raw bytes.'), 'in');
+          log('  (Value itself not printed. Length and shape are what matter.)', 'in');
+        }
+      }
+      const missingWanted = wanted.filter(c => !cols.includes(c));
+      if(missingWanted.length) log(`\nRequested but absent from this table: ${missingWanted.join(', ')}`, 'wa');
+    } catch(e) {
+      log(`Failed on ${table}: ${e.message}`, 'er');
+    }
+  }
+  log('\n━━━ Done. This output is safe to share. ━━━', 'hd');
+}
+
 async function testClaim() {
-  logEl=document.getElementById('logSetup');
-  logEl.innerHTML=''; logEl.style.display='block';
+  beginSetupLog();
   const claim=getClaim();
   if(!claim){log('⚠ No Payment-Claim entered. Paste your claim from pay.dhali.io first.','er');return;}
 
@@ -1499,6 +2025,575 @@ const MAX_PAGES_PER_PASS = 5000; // 5,000,000 rows per wallet per pass
 // transfer rather than dust. Applies to XAH, XRP and EVR alike — the app's
 // long-standing convention. Amounts below it are skipped AND counted, so
 // "we ignored some things" is visible on the Data Summary instead of silent.
+// ── Which transaction types to fetch ───────────────────────────────────────
+//
+// Until v1.3 the fetch asked WinDB only for Payment and OfferCreate. Every
+// other type was never requested, never cached, and invisible — verified
+// against two independent full-history nodes:
+//
+//   XRPL,  5 wallets: 1,179 successful transactions absent, 81,385 XRP,
+//                     94% of it AMMDeposit + AMMWithdraw.
+//   Xahau, 2 wallets: 183,450 absent — but only 234 XAH, 99.99% dust.
+//
+// That contrast is why this is a CURATED list rather than "fetch everything".
+// On Xahau the URIToken family alone was 155,998 transactions worth 2.26 XAH
+// between them: Evernode's lease machinery cycling mint → sell-offer → buy →
+// burn forever. Fetching those would add millions of rows across ~140 wallets
+// to capture a rounding error, making every rebuild slower and no report more
+// accurate. Volume is not the same thing as value, and this list is chosen on
+// value.
+//
+// EXCLUDED DELIBERATELY, with evidence:
+//   URIToken*        155,998 tx / 2.26 XAH   Evernode lease churn
+//   TrustSet             843 tx / 0.11 XRP   trustline housekeeping
+//   Invoke               121 tx / no value   hook calls; confirmed by the user
+//   ClaimReward           38 tx / 0.33 XAH   every one below the dust floor
+//   OfferCancel, AccountSet, SetRegularKey, NFTokenMint, NFTokenCreateOffer,
+//   NFTokenCancelOffer, GenesisMint         sub-1-unit in total
+//
+// Revisit ClaimReward if a wallet ever shows a material one — it is income,
+// not a disposal, so it would need its own path rather than this list.
+const FETCH_TYPES_XRPL = [
+  'Payment', 'OfferCreate',                       // as before
+  'AMMDeposit', 'AMMWithdraw',                    // 94% of the missing XRPL value
+  'NFTokenAcceptOffer',                           // NFT buy/sell, real consideration
+  'EscrowCreate', 'EscrowFinish',                 // lock and release
+  'CheckCash',                                    // delivery of a check
+  'PaymentChannelCreate', 'PaymentChannelFund', 'PaymentChannelClaim',
+];
+const FETCH_TYPES_XAHAU = [
+  'Payment', 'OfferCreate',                       // as before
+  'Remit',                                        // Xahau's multi-purpose transfer
+  'Import',                                       // XRPL→Xahau bridge mint
+  'EscrowCreate', 'EscrowFinish',
+];
+// URITokenBuy was on this list for one run and has been removed. The reasoning
+// was "real consideration when priced"; the measurement was 749,529 of them
+// across these wallets, not one carrying a recoverable amount. That is the
+// same high-volume/no-value profile as the rest of the URIToken family, it
+// grew the Xahau cache by roughly a third, and — worse — it buried the ~270
+// rows that actually matter under three orders of magnitude of noise in the
+// "not on Form 8949" list, which exists precisely to be read.
+//
+// If a URIToken sale ever needs reporting, it needs the price from the offer,
+// which is not in this table at all. That is Phase 2 work against ledger
+// metadata, not a fetch filter.
+// The inbound pass matches on Destination. Only types that HAVE a Destination
+// can be found that way; the rest are caught by the outbound pass or not at all.
+const FETCH_TYPES_IN_XRPL  = ['Payment', 'CheckCash', 'EscrowCreate', 'PaymentChannelCreate'];
+const FETCH_TYPES_IN_XAHAU = ['Payment', 'Remit', 'EscrowCreate'];
+
+const sqlTypeList = (types) => types.map(t => `'${t}'`).join(',');
+
+// The same lists, used in the other direction: what the BUILD will process.
+//
+// Narrowing the fetch does not empty the cache. When URITokenBuy came off the
+// list above, 749,529 of them were already on disk — so the fetch stopped
+// growing while the build carried on reading them and listing every one as
+// "not on Form 8949", burying the ~270 rows that list exists to show.
+//
+// Making the fetch list authoritative in both directions is what stops a
+// narrowing from needing a cache wipe to take effect. Rows for a type that is
+// no longer wanted are read past and counted, not processed.
+const FETCH_TYPE_SET = {
+  XRPL:  new Set(FETCH_TYPES_XRPL),
+  Xahau: new Set(FETCH_TYPES_XAHAU),
+};
+let rowsSkippedStaleType = 0;
+
+// ── Making a widened fetch actually reach an existing cache ────────────────
+//
+// The sync cursor records how far FORWARD each wallet has been fetched. It
+// does not record WHAT was asked for, and that distinction is the whole
+// problem with shipping the lists above.
+//
+// Every cache built before this version was filled by a query that asked only
+// for Payment and OfferCreate. Its cursors say "synced through today", which
+// is true of that question and useless for this one. Without something to
+// notice the change, upgrading would widen the filter, re-fetch nothing,
+// find no AMM transactions in a cache that was never allowed to contain any,
+// and show the user an empty "nothing is missing" panel. That is strictly
+// worse than the silence it replaced: it is silence with a checkmark on it.
+//
+// So the scope is fingerprinted and stored beside the cache. When it differs
+// from what the cache was built with, every cursor is dropped so the next
+// fetch re-requests full history. Cached rows are kept and the insert dedups
+// on hash, so this costs time and a Payment-Claim, never data.
+const FETCH_SCOPE_KEY = 'fetch_scope';
+
+// Columns are part of the ask, not just types. A row cached without a column
+// does not grow one on re-read, so adding a column has to invalidate the
+// cursors exactly like adding a type does.
+function fetchScopeParts() {
+  return [FETCH_TYPES_XRPL, FETCH_TYPES_IN_XRPL, FETCH_TYPES_XAHAU, FETCH_TYPES_IN_XAHAU,
+          DERIVED_AMOUNT_COLS];
+}
+function fetchScopeFingerprint() {
+  return fetchScopeParts().map(l => [...l].sort().join(',')).join('|');
+}
+
+// What the CURRENT scope asks for that a stored one did not.
+//
+// Only a WIDENING needs a re-fetch, and keeping that distinction is worth
+// real money. Removing a type or a column cannot make a cached row worse —
+// the build-side filter (FETCH_TYPE_SET) already ignores types we no longer
+// want, and an unread column is just bytes on disk. Treating every change
+// alike meant deleting one useless column would have cost a second multi-hour
+// re-sync of 6.3 million rows, which is how a correctness feature turns into
+// a reason to never clean anything up.
+//
+// Compared position by position: a type moving between the outbound and
+// inbound list is a real change to what that pass will find, so the lists are
+// not pooled.
+function fetchScopeAdditions(stored) {
+  if(stored == null) return null;                       // nothing to compare against
+  const was = String(stored).split('|').map(part => new Set(part ? part.split(',') : []));
+  const added = [];
+  fetchScopeParts().forEach((list, i) => {
+    const before = was[i] || new Set();
+    for(const item of list) if(!before.has(item)) added.push(item);
+  });
+  return added;
+}
+
+// Set when the cache predates the current scope, and cleared only once a
+// fetch has actually run under it. Read by dataQualityHTML() so no figure is
+// presented as complete while this is true.
+let fetchScopeStale = false;
+// Exactly what the current scope asks for that the cache was not built with.
+// Naming it is the difference between a warning someone acts on and one they
+// dismiss — and it is what tells them whether the fetch is worth its cost.
+let fetchScopeAdded = [];
+
+// `store` is a parameter rather than a reach for window.taxDB because the
+// preload bridge is a frozen contextBridge object: it cannot be redefined, so
+// a test has no way to stand in for the database unless the seam is here.
+// That is not a concession to testing — this function decides whether a
+// user's whole history gets re-fetched, and it is worth being able to drive
+// every branch of it.
+async function checkFetchScope(store) {
+  const db = store || (USE_LOCAL_DB ? window.taxDB : null);
+  if(!db || typeof db.getMeta !== 'function') return;
+  try {
+    const stored = await db.getMeta(FETCH_SCOPE_KEY);
+    const current = fetchScopeFingerprint();
+    if(stored === current) { fetchScopeStale = false; return; }
+
+    // No fingerprint AND no cached rows is a first run, not a stale cache.
+    const stats = await db.getStats();
+    if(stored === null && !(stats && stats.totalRows > 0)) {
+      await db.setMeta(FETCH_SCOPE_KEY, current);
+      fetchScopeStale = false;
+      return;
+    }
+
+    // A pure narrowing — something dropped, nothing added — costs nothing.
+    // The cache is a superset of what is now wanted, the build-side filter
+    // ignores the rest, and re-pulling millions of rows would buy exactly
+    // nothing. Record the new scope and say so quietly.
+    const added = fetchScopeAdditions(stored);
+    if(added && added.length === 0) {
+      await db.setMeta(FETCH_SCOPE_KEY, current);
+      fetchScopeStale = false;
+      log('\nThis version asks for less than the one that built your cache — nothing new to fetch.', 'ok');
+      return;
+    }
+
+    fetchScopeStale = true;
+    fetchScopeAdded = added || [];
+    await db.forceFullResync();
+    const what = fetchScopeAdded.length ? fetchScopeAdded.join(', ') : 'more than it used to';
+    log(`\n⚠ This cache was built before the app asked for: ${what}`, 'wa');
+    log(`   Its sync markers have been cleared, so the next fetch re-requests complete history for every`, 'wa');
+    log(`   wallet. Nothing cached was deleted — rows already held are kept and duplicates are discarded.`, 'wa');
+    log(`   Until that fetch runs, the report is missing the newly-requested data entirely.`, 'wa');
+  } catch(e) {
+    // A failure here must not stop the app starting. It leaves the cursors
+    // alone, which means the old (narrow) behaviour — the state the user was
+    // already in — rather than a broken one.
+    console.error('Fetch-scope check failed:', e);
+  }
+}
+
+// Stamped only after a fetch has actually completed under the current scope.
+// Doing it at startup instead would clear the warning for a user who quit
+// before fetching, and they would never be told again.
+async function stampFetchScope(store) {
+  const db = store || (USE_LOCAL_DB ? window.taxDB : null);
+  if(!db || typeof db.setMeta !== 'function') return;
+  try {
+    await db.setMeta(FETCH_SCOPE_KEY, fetchScopeFingerprint());
+    fetchScopeStale = false;
+  } catch(e) { console.error('Could not record the fetch scope:', e); }
+}
+
+// ── Transactions fetched but not yet valued ────────────────────────────────
+//
+// Widening the fetch above brings these types into the cache. It does NOT
+// make the engine book them, and that is deliberate.
+//
+// Each new type carries different tax semantics — an AMMDeposit is arguably a
+// disposal, an EscrowCreate is not (the coins are still yours), a
+// PaymentChannelCreate locks rather than transfers — and several of them
+// (AMMWithdraw, NFTokenAcceptOffer, EscrowFinish) have NO amount in any WinDB
+// column at all; the figure exists only in ledger metadata. Booking those on
+// a guess would put invented numbers on a tax return, which is worse than the
+// current state of omitting them.
+//
+// So this phase makes them VISIBLE instead. Every such row is recorded here
+// with whatever is known, and surfaced as an explicit "not included in Form
+// 8949" list the preparer can work from. Silence becomes a list.
+// Every time FIFO ran out of lots and fell back to $0 basis / unknown date.
+// Aggregated for display — see basisShortfallHTML(). One entry per shortfall,
+// not per lot, because the question is "how much of my basis is missing and
+// where", not "how many times did it happen".
+const basisShortfalls = [];
+
+const unvaluedRows = [];
+
+// Types the engine genuinely knows how to book today.
+const VALUED_TYPES = new Set(['Payment', 'OfferCreate']);
+
+// Why each unvalued type is unvalued, shown to the user rather than left to
+// be inferred.
+const UNVALUED_REASON = {
+  // MEASURED against the XRPL, and the two halves of the AMM family behave
+  // differently — so they say different things.
+  //
+  // DEPOSITS are reliable: of 18 with a cached amount, 12 matched the ledger
+  // exactly and 6 differed by -0.02%, which is rounding. (21 more had no
+  // cached amount at all — for a tfTwoAsset deposit the XRP can be the second
+  // asset, which WinDB does not put in Amount_XRP.)
+  AMMDeposit:           'liquidity added to an AMM pool — likely a disposal of the deposited asset; the amount matches the ledger where one is recorded',
+  // WITHDRAWALS are never right. Reconciled against the XRPL across every
+  // cached XRPL wallet: of 29, eighteen had an amount to compare and ALL
+  // EIGHTEEN were understated — +2.5% to +3.6% typically, twice over +40%,
+  // once by 563 XRP, +1,583 XRP in total. Not one matched.
+  //
+  // The other eleven carry no amount at all, and that is correct rather than
+  // missing: in tfLPToken and tfWithdrawAll the protocol IGNORES the Amount
+  // field — you return LP tokens and take what they redeem for — so there is
+  // no requested figure for WinDB to have recorded.
+  //
+  // An earlier note here said those modes "matched exactly". They were never
+  // compared; a two-way exact/differ split had filed every uncomparable row as
+  // agreement. Nothing about a withdrawal amount in this cache is confirmed.
+  AMMWithdraw:          'liquidity removed from an AMM pool — this is the amount REQUESTED, and the ledger delivered MORE every single time it could be checked (18 of 18, once by 563 XRP, +1,583 XRP in total). It is a floor, never the figure; run scripts/verify-xrpl.js --amm for what was actually delivered, then import it in the Setup tab',
+  NFTokenAcceptOffer:   'NFT bought or sold — the price lives in the offer, not this transaction',
+  EscrowCreate:         'coins locked in escrow — still yours, normally not a disposal; token escrows carry no XRP amount',
+  EscrowFinish:         'escrow released — a disposal only if the destination is not you',
+  CheckCash:            'a check was cashed — an acquisition',
+  PaymentChannelCreate: 'payment channel funded — locked, not yet transferred',
+  PaymentChannelFund:   'payment channel topped up — locked, not yet transferred',
+  PaymentChannelClaim:  'payment channel claimed — this is where value actually moves',
+  Remit:                'Xahau multi-purpose transfer — amounts are in a nested field',
+  Import:               'XRP burned on XRPL, XAH minted on Xahau',
+  URITokenBuy:          'URIToken purchased — consideration when priced',
+};
+
+// A few real rows per unvalued type, kept so "why has this no amount?" can be
+// answered from the cache instead of guessed at.
+//
+// It is here because guessing cost a full re-sync. AMMDeposit reported no
+// amount; the diagnosis was "the column is not being fetched"; the columns
+// were added, the cache was re-pulled over several hours, and AMMDeposit
+// still reported no amount. The second diagnosis has to come from the data.
+const unvaluedSamples = {};
+const UNVALUED_SAMPLES_PER_TYPE = 3;
+
+function sampleUnvalued(type, row) {
+  const bag = unvaluedSamples[type] || (unvaluedSamples[type] = []);
+  if(bag.length >= UNVALUED_SAMPLES_PER_TYPE) return;
+  // Only the fields that actually carry something — a row with 25 columns of
+  // which 6 are populated is a 6-line answer, not a 25-line one.
+  const filled = {};
+  for(const [k, v] of Object.entries(row)) {
+    if(v == null || v === '') continue;
+    const str = String(v);
+    if(/^0+(\.0+)?$/.test(str)) continue;                    // a real zero is not a value
+    if([...str].every(ch => ch.charCodeAt(0) === 0)) continue; // NUL padding, as seen on TransactionHash
+    filled[k] = str.length > 60 ? str.slice(0, 60) + '…' : str;
+  }
+  bag.push(filled);
+}
+
+function recordUnvalued(chain, wallet, row, txId, dk, dateStr, yr, knownQty, knownTicker) {
+  const t = row.TransactionType ?? '?';
+  if(VALUED_TYPES.has(t)) return;
+  if(knownQty == null) sampleUnvalued(t, row);
+  // Where the quantity came from. An AMM figure read off the ledger and one
+  // read off WinDB differ in kind, not just in value — the first is what
+  // moved, the second is what was asked for — and a column of numbers that
+  // does not say which is which invites them being treated alike.
+  const imported = ammDeltaFor(wallet, row);
+  const measured = !!(imported && imported.delivered != null);
+  const noXrpLeg = measured && !(imported.delivered > 0);
+  unvaluedRows.push({
+    chain, wallet, type: t, dk, dateStr, year: yr, hash: txId,
+    src: row.Account ?? '', dest: row.Destination ?? '',
+    qty: (knownQty != null && isFinite(knownQty) && knownQty > 0) ? knownQty : null,
+    ticker: knownTicker || null,
+    amountSrc: measured ? 'ledger' : (knownQty != null ? 'windb' : ''),
+    submitted: measured && imported.submitted != null ? imported.submitted : null,
+    reason: noXrpLeg
+      // Not a gap. The ledger was asked and answered: this transaction moved
+      // no XRP at all, so it is the pool's other asset that changed hands —
+      // which this tool does not track, and which a preparer has to know about
+      // rather than see reported as an amount that could not be found.
+      ? 'ledger-verified: no XRP moved — this withdrawal took the pool’s OTHER asset, which this tool does not track'
+      : measured
+      ? 'amount verified against XRP Ledger metadata (delivered, not requested)'
+      : (UNVALUED_REASON[t] || 'type not yet handled by the tax engine'),
+  });
+}
+
+// Every WinDB column derivableAmount() reads that no other code path needs.
+// It exists so the two SELECT lists cannot drift away from the function that
+// depends on them — both splice this in, and a test asserts that every `row.X`
+// inside derivableAmount() appears either here or in the common columns.
+//
+// That test is the real fix. The instance it caught (AMMDeposit and Import
+// silently reporting no amount, because Asset_currency and win_Import_MintedXAH
+// were never selected) is the second time this project has shipped code that
+// reads a column the query does not fetch. The first was TakerPays_*, and it
+// cost every Xahau DEX acquisition its cost basis.
+// Only what derivableAmount() actually reads.
+//
+// Asset_currency used to be here, to answer "is this AMM pool's first asset
+// native?". Inspecting the real cached rows showed it is EMPTY on every
+// native-XRP AMMDeposit — WinDB leaves the currency blank for XRP rather than
+// writing "XRP" — so the guard built on it rejected every row it was meant to
+// admit. Worse, it was the stated reason for a full re-sync that recovered
+// nothing. Removing it is a narrowing, which now costs nothing.
+//
+// The convention this table actually follows: Amount_XRP is populated only
+// when the amount is native; an IOU lands in Amount_value + Amount_currency +
+// Amount_issuer instead. That single fact replaces the whole guard.
+const DERIVED_AMOUNT_COLS = [
+  'win_Import_MintedXAH',  // Import: XAH minted on this chain
+];
+
+// Best-effort amount, from the columns proven — by inspecting real cached
+// rows, not by reasoning about the schema — to carry one for each type.
+//
+// The governing convention, confirmed against this cache: Amount_XRP is
+// populated ONLY when the amount is native XRP/XAH. An IOU goes to
+// Amount_value + Amount_currency + Amount_issuer and leaves Amount_XRP empty.
+// So a populated Amount_XRP is itself the proof that the figure is native and
+// priceable — no separate currency check is needed, and the one that was here
+// rejected every row it was meant to admit.
+//
+// Returns null where nothing holds the amount. Never 0: a zero would read as
+// "nothing moved", which is the one answer that is actively wrong rather than
+// merely absent.
+function derivableAmount(row) {
+  const t = row.TransactionType ?? '';
+  const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) && n > 0 ? n : null; };
+  switch(t) {
+    // AMMWithdraw was documented here as having no amount in any WinDB column
+    // — "only in ledger metadata". That was wrong, and it mattered: the real
+    // rows carry Amount_XRP, one of them 23,537 XRP. The claim came from a
+    // schema-level probe rather than from looking at the rows.
+    //
+    // Read them as the amount SUBMITTED, not necessarily the amount delivered:
+    // on a withdrawal the field can be a bound rather than an exact figure,
+    // and the delivered amount really is only in metadata. Good enough to
+    // show and to hand a preparer; not good enough to book. See
+    // UNVALUED_REASON, which says so on screen.
+    case 'AMMDeposit':
+    case 'AMMWithdraw':
+    case 'EscrowCreate':
+    case 'PaymentChannelCreate':
+    case 'PaymentChannelFund':
+    case 'PaymentChannelClaim':
+      return num(row.Amount_XRP);
+    case 'CheckCash':
+      return num(row.delivered_amount_XRP);
+    case 'Import':
+      return num(row.win_Import_MintedXAH);
+    default:
+      return null;
+  }
+}
+
+// ── Ledger-verified AMM amounts ───────────────────────────────────────────
+//
+// derivableAmount() returns, for an AMM row, the amount the transaction
+// REQUESTED. That is not what moved.
+//
+// Measured against a full-history node across one wallet's entire AMM history,
+// 47 rows carried both figures and 24 disagreed. The direction of the
+// disagreement is NOT the same on both sides, and an earlier version of this
+// comment got that wrong by quoting a single net figure across both types:
+//
+//   AMMWithdraw   18 comparable, 18 delivered MORE, 0 exact.
+//                 Net +1,583.47 XRP; worst single row +563.23 XRP.
+//   AMMDeposit    29 comparable, 23 exact, 6 delivered LESS.
+//                 Net -1.07 XRP; worst single row -0.35 XRP.
+//
+// Both make sense from the protocol. A withdrawal's Amount field is a bound,
+// and the AMM pays out what the pool's formula says; a two-asset deposit's
+// Amount is a maximum, and the AMM takes only what preserves the pool ratio.
+// So "the requested figure is a floor" is true of withdrawals and false of
+// deposits — which is exactly why the fix is to use the measured figure rather
+// than to apply a correction in a direction someone reasoned out.
+//
+// The delivered figure is |balance delta + fee| from the transaction's own
+// ledger metadata, which WinDB does not expose at all. scripts/verify-xrpl.js
+// --amm sweeps account_tx to produce it; importAmmLedgerCSV() below brings the
+// result in, and this map is how the engine reaches it.
+//
+// Keyed by wallet|type|timestamp because WinDB returns TransactionHash as 64
+// NUL bytes on every AMM row — there is no hash to join on. The timestamp is
+// the cache's own string, matched exactly.
+const ammDeltas = new Map();
+let ammDeltasLoadedAt = null;
+
+function ammDeltaKey(wallet, type, ts) {
+  return `${wallet}|${type}|${ts}`;
+}
+
+// `store` is an injectable parameter, not a lookup of window.taxDB, because
+// contextBridge objects are non-configurable and cannot be stubbed in tests.
+// This project learned that from a defineProperty that threw.
+async function loadAmmDeltas(store) {
+  const db = store || (USE_LOCAL_DB ? window.taxDB : null);
+  ammDeltas.clear();
+  ammDeltasLoadedAt = null;
+  if(!db || !db.getAmmLedger) return 0;
+  let rows = [];
+  try { rows = await db.getAmmLedger() || []; } catch(e) { return 0; }
+  for(const r of rows) {
+    ammDeltas.set(ammDeltaKey(r.wallet, r.tx_type, r.timestamp), {
+      delivered: Number.isFinite(r.delivered) ? r.delivered : null,
+      submitted: Number.isFinite(r.submitted) ? r.submitted : null,
+      hash: r.ledger_hash || '',
+      flags: r.flags,
+      note: r.note || '',
+    });
+  }
+  ammDeltasLoadedAt = rows.length ? new Date().toISOString() : null;
+  return ammDeltas.size;
+}
+
+function ammDeltaFor(wallet, row) {
+  const t = row && row.TransactionType;
+  if(t !== 'AMMDeposit' && t !== 'AMMWithdraw') return null;
+  return ammDeltas.get(ammDeltaKey(wallet, t, row.Timestamp ?? '')) || null;
+}
+
+// How many rows the engine actually valued from the ledger rather than from
+// WinDB, and how far the two differed. Drives the disclosure panel: a figure
+// sourced from a different place than the rest of the report has to say so.
+//
+// ammNoXrpLeg counts a case the real data turned up and no fixture would have:
+// three AMMWithdraw rows whose measured XRP delta is exactly ZERO. They are
+// tfOneAssetWithdrawAll withdrawals of the pool's OTHER asset — real
+// transactions that moved real value, none of it XRP. That is a measurement,
+// not a missing figure, and the two must not be reported as the same thing.
+let ammLedgerUsed = 0, ammLedgerMissing = 0, ammLedgerUplift = 0, ammNoXrpLeg = 0;
+
+function ammIsAmmRow(row) {
+  const t = row && row.TransactionType;
+  return t === 'AMMDeposit' || t === 'AMMWithdraw';
+}
+
+// The amount to use for a row, preferring the ledger over WinDB.
+//
+// Deliberately NOT folded into derivableAmount(): that function is pure in
+// `row` and a test asserts every `row.X` it reads is in the SELECT list. This
+// one needs the wallet, reaches module state, and counts things.
+function amountForRow(wallet, row) {
+  const submitted = derivableAmount(row);
+  const d = ammDeltaFor(wallet, row);
+  if(d && d.delivered != null) {
+    ammLedgerUsed++;
+    if(submitted != null) ammLedgerUplift += (d.delivered - submitted);
+    if(d.delivered > 0) return d.delivered;
+    // A measured zero means no XRP moved. Falling back to the WinDB figure
+    // here would invent an XRP amount the ledger says did not move — and on
+    // these rows WinDB's figure is absent anyway, so the fallback would only
+    // ever fire if a future cache started carrying one. Returns null, not 0,
+    // because 0 would be booked as a real quantity while null is this
+    // engine's word for "no figure": see the note on derivableAmount().
+    ammNoXrpLeg++;
+    return null;
+  }
+  // An AMM row with no imported figure is not the same as an ordinary row
+  // with no amount: the figure exists on the ledger and simply has not been
+  // fetched. Counted so the panel can say how many are still on the WinDB
+  // number, rather than letting them pass as fully verified.
+  if(ammIsAmmRow(row)) ammLedgerMissing++;
+  return submitted;
+}
+
+// The verifier's --amm CSV. Header:
+//   Wallet,Type,Timestamp,LedgerHash,SubmittedAmount,LedgerDelta,Difference,Flags,Note
+//
+// Tolerant about column ORDER (matched by name) and strict about everything
+// else. A row whose Type is not an AMM type, or whose Timestamp is empty, is
+// an error naming the line rather than a silent skip — a dropped row here does
+// not fail loudly later, it just quietly leaves that transaction on the
+// understated WinDB figure, which is the failure this import exists to end.
+const AMM_CSV_COLS = {
+  wallet: 'wallet', type: 'type', timestamp: 'timestamp', hash: 'ledgerhash',
+  submitted: 'submittedamount', delivered: 'ledgerdelta', flags: 'flags', note: 'note',
+};
+const AMM_TYPES_IMPORT = new Set(['AMMDeposit', 'AMMWithdraw']);
+
+function parseAmmLedgerCSV(text) {
+  const raw = parseCSVRows(text);
+  const rows = [], errors = [];
+  if(raw.length === 0) return { rows, errors: ['The file is empty.'], stats: null };
+
+  const header = raw[0].map(f => String(f || '').trim().toLowerCase().replace(/[\s_]+/g, ''));
+  const idx = {};
+  for(const [k, name] of Object.entries(AMM_CSV_COLS)) idx[k] = header.indexOf(name);
+  for(const req of ['wallet', 'type', 'timestamp', 'delivered']) {
+    if(idx[req] === -1) {
+      return { rows, stats: null, errors: [
+        `This does not look like a verify-xrpl.js --amm file: no "${AMM_CSV_COLS[req]}" column.`,
+        `Expected header: Wallet,Type,Timestamp,LedgerHash,SubmittedAmount,LedgerDelta,Difference,Flags,Note`,
+        `Produce one with:  node scripts/verify-xrpl.js --amm --out amm-all.csv`,
+      ] };
+    }
+  }
+
+  const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+  let withDelivered = 0, unpaired = 0, flagged = 0;
+  const seen = new Set();
+
+  for(let i = 1; i < raw.length; i++) {
+    const r = raw[i];
+    const line = i + 1;
+    const at = (k) => idx[k] === -1 ? '' : String(r[idx[k]] ?? '').trim();
+    const wallet = at('wallet'), type = at('type'), ts = at('timestamp');
+    if(!wallet && !type && !ts) continue;
+    if(!wallet) { errors.push(`Line ${line}: no wallet address.`); continue; }
+    if(!AMM_TYPES_IMPORT.has(type)) { errors.push(`Line ${line}: "${type || '(blank)'}" is not an AMM type.`); continue; }
+    if(!ts) { errors.push(`Line ${line}: no timestamp — nothing to match the cached row on.`); continue; }
+
+    const key = ammDeltaKey(wallet, type, ts);
+    if(seen.has(key)) { errors.push(`Line ${line}: duplicate ${type} for this wallet at ${ts}.`); continue; }
+    seen.add(key);
+
+    const delivered = num(at('delivered'));
+    const note = at('note');
+    if(delivered != null && delivered > 0) withDelivered++; else unpaired++;
+    if(note) flagged++;
+
+    rows.push({
+      wallet, tx_type: type, timestamp: ts,
+      ledger_hash: at('hash'),
+      submitted: num(at('submitted')),
+      delivered,
+      flags: num(at('flags')),
+      note,
+    });
+  }
+  return { rows, errors, stats: { total: rows.length, withDelivered, unpaired, flagged } };
+}
+
 const DUST_MIN_UNITS = 1.0;
 let dustSkipped = 0;
 
@@ -1707,11 +2802,17 @@ async function fetchXahauWinDB(claim, year) {
     'TransactionResult', // tesSUCCESS filter
     'Flags',
     'DestinationTag',
+    // Columns read only by derivableAmount(), spliced in from one shared list
+    // so this query and the XRPL one below cannot drift apart. The first cut
+    // of the curated fetch omitted them, and every AMMDeposit and Import
+    // reported "no amount" while the amount sat in the table unfetched.
+    ...DERIVED_AMOUNT_COLS,
   ];
   // Only include columns that actually exist in schema
   const safeCols = cols
     ? wantCols.filter(c => cols.includes(c))
     : wantCols;
+  window._lastSelectedCols = safeCols;
   log(`Selecting ${safeCols.length} cols: ${safeCols.join(', ')}`, 'in');
 
   const PAGE = 1000; // rows per page — small enough to not crash browser
@@ -1740,7 +2841,7 @@ async function fetchXahauWinDB(claim, year) {
       buildSql: (offset, page) => `SELECT ${safeCols.join(', ')}
 FROM xahau.transactions
 WHERE ${acctCol} = '${w}'
-  AND ${typeCol} IN ('Payment','OfferCreate')
+  AND ${typeCol} IN (${sqlTypeList(FETCH_TYPES_XAHAU)})
   ${timeFilter}
 ORDER BY ${timeCol} ASC
 LIMIT ${page} OFFSET ${offset}`.trim(),
@@ -1763,7 +2864,7 @@ LIMIT ${page} OFFSET ${offset}`.trim(),
       buildSql: (offset, page) => `SELECT ${safeCols.join(', ')}
 FROM xahau.transactions
 WHERE ${destCol} = '${w}'
-  AND ${typeCol} = 'Payment'
+  AND ${typeCol} IN (${sqlTypeList(FETCH_TYPES_IN_XAHAU)})
   ${timeFilter}
 ORDER BY ${timeCol} ASC
 LIMIT ${page} OFFSET ${offset}`.trim(),
@@ -1905,6 +3006,18 @@ function ledgerFIFODetailed(wallet, ticker, qty) {
     // No basis lot available for the remainder — $0 basis, unknown acquisition
     // date. Treated as short-term (the more conservative / higher-tax
     // assumption) since we cannot prove a >1yr holding period without a lot.
+    //
+    // THIS IS NOT A NEUTRAL FALLBACK. It is the most expensive possible
+    // answer — 100% of proceeds as gain, at short-term rates — and until now
+    // it happened silently, so the only way to discover it was to read the
+    // Basis Ledger by hand and notice a number that looked wrong.
+    //
+    // It fires when coins LEFT a wallet that the ledger never saw them ENTER.
+    // The usual cause is an acquisition type the engine does not book: an
+    // AMMWithdraw returns thousands of XRP to a wallet, no lot is created,
+    // and the next transfer out finds an empty ledger. Recording it here is
+    // what makes that chain visible — see basisShortfalls.
+    basisShortfalls.push({ wallet, ticker, qty: rem });
     consumed.push({qty: rem, unitCost: 0, acqDate: null});
   }
   return consumed;
@@ -2022,6 +3135,11 @@ function resetLedgerState() {
   // previous run's totals forward would silently double them.
   Object.keys(myVolumeByMonth).forEach(k => delete myVolumeByMonth[k]);
   _flowsCache = null;
+  // Same reasoning again: these are collected during the build, so carrying
+  // the previous run's list forward would double every entry on screen.
+  unvaluedRows.length = 0;
+  basisShortfalls.length = 0;
+  Object.keys(unvaluedSamples).forEach(k => delete unvaluedSamples[k]);
   allTransactionHistory.length = 0;
   transactionsScanned = 0;
   Object.keys(walletLedger).forEach(k => delete walletLedger[k]);
@@ -2030,6 +3148,14 @@ function resetLedgerState() {
   ledgerCountMismatch = null;
   rowsStreamedThisBuild = 0;
   rowsSkippedNotOwned = 0;
+  rowsSkippedStaleType = 0;
+  // Counted during the build, same as the rest of this block. The map itself
+  // is NOT cleared here — it is loaded from the cache once per rebuild by the
+  // caller, and clearing it here would empty it between load and use.
+  ammLedgerUsed = 0;
+  ammLedgerMissing = 0;
+  ammLedgerUplift = 0;
+  ammNoXrpLeg = 0;
 }
 
 const MS_PER_DAY = 86400000;
@@ -2392,6 +3518,64 @@ function grandTotalRaw() {
 // quietly multiplied by a million.
 function dataQualityHTML() {
   const parts = [];
+  if(basisShortfalls.length) {
+    // Grouped by wallet+ticker: "4 shortfalls" means nothing, "9,873 XRP at
+    // your Coinbase address has no basis" is the sentence that gets acted on.
+    const by = {};
+    for(const b of basisShortfalls) {
+      const k = b.wallet + '|' + b.ticker;
+      (by[k] = by[k] || { wallet: b.wallet, ticker: b.ticker, qty: 0, n: 0 });
+      by[k].qty += b.qty; by[k].n++;
+    }
+    const rows = Object.values(by).sort((a, b) => b.qty - a.qty);
+    const label = (w) => (walletLabels && walletLabels[w]) ? `${walletLabels[w]} (${w.slice(0,10)}…)` : w;
+    // Value it at the newest price we have, so the cost is a dollar figure
+    // rather than a quantity the reader has to price themselves.
+    const priceOf = (t) => {
+      const src = t === 'XRP' ? XRP_PRICES : (t === 'EVR' ? EVR_PRICES : XAH_PRICES);
+      const p = lookupPrice(src, t, toDK(Date.now()), 'high');
+      return Number.isFinite(p) ? p : 0;
+    };
+    const totalUsd = rows.reduce((sum, r) => sum + r.qty * priceOf(r.ticker), 0);
+    parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#fdecea;border:2px solid #8b0000;border-radius:4px;font-size:11px;color:#8b0000">
+      <strong>✗ ${rows.reduce((n,r)=>n+r.qty,0).toLocaleString(undefined,{maximumFractionDigits:2})} coin(s) are being reported with ZERO cost basis and no acquisition date.</strong><br>
+      This is the most expensive answer the engine can give: 100% of proceeds as gain, at short-term rates,
+      whatever the coins actually cost and however long they were actually held. At today's prices that is
+      roughly <strong>$${fmt(totalUsd)}</strong> of overstated gain waiting to be reported.
+      <table style="margin:8px 0 6px;border-collapse:collapse;font-size:10px;width:100%">
+        <tr style="background:#f6d7d3"><th style="text-align:left;padding:3px 6px">Wallet</th>
+          <th style="text-align:left;padding:3px 6px">Asset</th>
+          <th style="text-align:right;padding:3px 6px">Quantity with no basis</th>
+          <th style="text-align:right;padding:3px 6px">At today's price</th></tr>
+        ${rows.map(r => `<tr style="border-top:1px solid #e8c0ba">
+          <td style="padding:3px 6px">${label(r.wallet)}</td>
+          <td style="padding:3px 6px">${r.ticker}</td>
+          <td style="padding:3px 6px;text-align:right">${r.qty.toLocaleString(undefined,{maximumFractionDigits:4})}</td>
+          <td style="padding:3px 6px;text-align:right">$${fmt(r.qty * priceOf(r.ticker))}</td>
+        </tr>`).join('')}
+      </table>
+      <strong>Why it happens:</strong> coins LEFT a wallet that this tool never saw them ENTER. The usual cause is
+      an acquisition it does not yet book — an <code>AMMWithdraw</code> returns thousands of XRP, no cost-basis lot
+      is created, and the next transfer out finds an empty ledger. Those are the same transactions listed in
+      &ldquo;not on Form 8949&rdquo; above, which is why that list is not merely incomplete disclosure: it is
+      corrupting the basis of everything downstream of it.
+    </div>`);
+  }
+  if(fetchScopeStale) {
+    parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#fdecea;border:2px solid #8b0000;border-radius:4px;font-size:11px;color:#8b0000">
+      <strong>✗ These figures are from a cache built before this version widened what it asks for.</strong><br>
+      ${fetchScopeAdded.length
+        ? `It was built before this version asked for: <code>${fetchScopeAdded.join('</code>, <code>')}</code>.
+           Those rows and columns cannot be in a cache that never requested them, so they are absent from the
+           figures below.`
+        : `Earlier versions requested only <code>Payment</code> and <code>OfferCreate</code> from WinDB. Everything
+           else — AMM deposits and withdrawals, NFT sales, escrows, payment channels, Xahau remits — was never
+           fetched, so it cannot be in this cache and is not in the figures below. On the wallets measured while
+           building this, that was 1,179 XRPL transactions moving 81,385 XRP.`}<br>
+      The sync markers have already been cleared. <strong>Run a fetch to pull the missing history</strong>; nothing
+      cached was deleted, and rows already held are kept rather than duplicated.
+    </div>`);
+  }
   if(ledgerCountMismatch) {
     parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#fdecea;border:2px solid #8b0000;border-radius:4px;font-size:11px;color:#8b0000">
       <strong>✗ DO NOT FILE THESE FIGURES — internal consistency check failed.</strong><br>
@@ -2428,6 +3612,89 @@ function dataQualityHTML() {
       <br><strong>Replace this with the exchange's own records if the real purchase price differs</strong> — it is a
       reasonable estimate, not a substantiated figure, and the holding period starts on the arrival date rather
       than the true purchase date.
+    </div>`);
+  }
+  // AMM amounts come from a different source than everything else here, and a
+  // report that mixes sources without saying so is the problem this panel
+  // exists to prevent. Shown whenever ANY AMM row was seen — including the
+  // case where none were verified, which is the one worth warning about.
+  if(ammLedgerUsed || ammLedgerMissing) {
+    const total = ammLedgerUsed + ammLedgerMissing;
+    if(ammLedgerUsed) {
+      parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#eaf5ee;border:1px solid #8fbfa0;border-radius:4px;font-size:11px;color:#123a24">
+        <strong>✓ ${ammLedgerUsed.toLocaleString()} of ${total.toLocaleString()} AMM transaction(s) are valued from XRP Ledger metadata,</strong>
+        not from the data source. The ledger figure is what actually moved; the data source stores what the
+        transaction <em>requested</em>, and the two differ.
+        ${ammLedgerUplift > 0.000001
+          ? `Across the rows where both figures exist, the ledger delivered
+             <strong>${ammLedgerUplift.toLocaleString(undefined,{maximumFractionDigits:6})} more units</strong>
+             than the requested amounts would have shown.`
+          : ''}
+        ${ammLedgerMissing
+          ? `<br><span style="color:#7a4a00">${ammLedgerMissing.toLocaleString()} AMM transaction(s) have no imported ledger figure and
+             remain on the requested amount.</span>`
+          : ''}
+        ${ammNoXrpLeg
+          // These are not gaps — the ledger answered, and the answer was zero
+          // XRP. They are the clearest evidence in the whole report that the
+          // pool's second asset moved value this tool never sees, which is a
+          // disclosure item in its own right.
+          ? `<br><span style="color:#7a4a00"><b>${ammNoXrpLeg.toLocaleString()} withdrawal(s) moved no XRP at all</b> — they took the pool's
+             OTHER asset, which this tool does not track. Their value is real and is not in any figure on this page.</span>`
+          : ''}
+      </div>`);
+    } else {
+      parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#fff3e0;border:2px solid #b06000;border-radius:4px;font-size:11px;color:#5a3200">
+        <strong>⚠ ${total.toLocaleString()} AMM transaction(s) are valued at the amount requested, not the amount delivered.</strong><br>
+        The data source does not carry what an AMM transaction actually moved — that is only in the transaction's own
+        ledger metadata. Measured against a full-history node, every comparable withdrawal checked was understated.
+        Run <code>node scripts/verify-xrpl.js --amm --out amm-all.csv</code> and import it in the Setup tab to replace
+        these with verified figures.
+      </div>`);
+    }
+  }
+  if(rowsSkippedStaleType) {
+    parts.push(`<div style="margin-top:8px;padding:8px 10px;background:#eef4ff;border:1px solid #c4d4f0;border-radius:4px;font-size:9.5px">
+      <strong>${rowsSkippedStaleType.toLocaleString()} cached row(s) were read past</strong> because they are transaction
+      types this version no longer fetches. They were pulled by an earlier version, and nothing is re-fetching them —
+      they only take up disk space. Nothing in your figures depends on them.
+    </div>`);
+  }
+  if(unvaluedRows.length) {
+    // Grouped by type, because "1,179 transactions are missing" is useless and
+    // "1,140 of them are AMM deposits and withdrawals" is actionable.
+    const byType = {};
+    for(const r of unvaluedRows) {
+      const e = byType[r.type] || (byType[r.type] = { n: 0, known: 0, qty: 0 });
+      e.n++;
+      if(r.qty != null) { e.known++; e.qty += r.qty; }
+    }
+    const order = Object.entries(byType).sort((a,b) => b[1].n - a[1].n);
+    const withAmount = unvaluedRows.filter(r => r.qty != null).length;
+    parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#fff3e0;border:2px solid #b06000;border-radius:4px;font-size:11px;color:#5a3200">
+      <strong>⚠ ${unvaluedRows.length.toLocaleString()} transaction(s) are in your history but NOT on Form 8949.</strong><br>
+      These are transaction types this tool now fetches but does not yet book — each one has tax treatment
+      that depends on facts the ledger alone does not settle, and inventing a number for them would be worse
+      than listing them. ${withAmount.toLocaleString()} of them have an amount recorded;
+      ${(unvaluedRows.length - withAmount).toLocaleString()} carry their amount only in ledger metadata that is
+      not in the local cache.
+      <table style="margin:8px 0 6px;border-collapse:collapse;font-size:10px;width:100%">
+        <tr style="background:#f3e0c8"><th style="text-align:left;padding:3px 6px">Type</th>
+          <th style="text-align:right;padding:3px 6px">Count</th>
+          <th style="text-align:right;padding:3px 6px">With amount</th>
+          <th style="text-align:right;padding:3px 6px">Units known</th>
+          <th style="text-align:left;padding:3px 6px">Why it is not booked</th></tr>
+        ${order.map(([t,v]) => `<tr style="border-top:1px solid #e0cba8">
+          <td style="padding:3px 6px"><code>${t}</code></td>
+          <td style="padding:3px 6px;text-align:right">${v.n.toLocaleString()}</td>
+          <td style="padding:3px 6px;text-align:right">${v.known.toLocaleString()}</td>
+          <td style="padding:3px 6px;text-align:right">${v.qty ? v.qty.toLocaleString(undefined,{maximumFractionDigits:2}) : '—'}</td>
+          <td style="padding:3px 6px">${UNVALUED_REASON[t] || 'type not yet handled by the tax engine'}</td>
+        </tr>`).join('')}
+      </table>
+      <strong>Give this list to your preparer.</strong> It is the complete set of activity the reported figures
+      leave out, which is exactly what a return needs disclosed rather than discovered later.
+      <div style="margin-top:6px"><button class="sml" style="background:#b06000;color:#fff;border-color:#b06000" onclick="exportUnvaluedCSV()">⬇ Not-on-8949 Transactions (CSV)</button></div>
     </div>`);
   }
   if(missingPriceRows.length) {
@@ -2498,6 +3765,8 @@ function processOneXahauRow(row, wallet, walletSet, mode, helpers) {
   const type  = row.TransactionType ?? '';
   const src   = row.Account ?? '';
   const dest  = row.Destination ?? '';
+  // Cached under a wider fetch scope than the current one — see FETCH_TYPE_SET.
+  if(!FETCH_TYPE_SET.Xahau.has(type)) { rowsSkippedStaleType++; return; }
   // In the "received" (inbound-query) pass, a row where this wallet is
   // also the sender is a self-payment already fully handled by the
   // outbound pass for this same wallet — skip to avoid double-processing.
@@ -2512,6 +3781,12 @@ function processOneXahauRow(row, wallet, walletSet, mode, helpers) {
     TakerGets_XRP:row.TakerGets_XRP,TakerGets_value:row.TakerGets_value,TakerGets_currency:row.TakerGets_currency,
     TakerPays_XRP:row.TakerPays_XRP,TakerPays_value:row.TakerPays_value,TakerPays_currency:row.TakerPays_currency,
     hash});
+
+  // Types the curated fetch now brings in but the engine does not book. They
+  // are listed rather than silently dropped — see recordUnvalued().
+  if(!VALUED_TYPES.has(type) && (src === wallet || dest === wallet)) {
+    recordUnvalued('Xahau', wallet, row, hash, dk, ds, yr, amountForRow(wallet, row), 'XAH');
+  }
 
   if(type === 'Payment') {
     const amtXAH = parseFloat(row.delivered_amount_XRP ?? row.Amount_XRP ?? 0);
@@ -2719,7 +3994,9 @@ async function fetchXRPLWinDB(claim) {
     // cached before this was added still lack them, so a Force Full Re-sync is
     // what backfills them.
     'TakerGets_XRP','TakerGets_value','TakerGets_currency',
-    'TakerPays_XRP','TakerPays_value','TakerPays_currency'].filter(c => {
+    'TakerPays_XRP','TakerPays_value','TakerPays_currency',
+    // Read only by derivableAmount() — see the note in the Xahau column list.
+    ...DERIVED_AMOUNT_COLS].filter(c => {
       const schema = window._windbSchema || [];
       return schema.length === 0 || schema.includes(c);
     });
@@ -2747,7 +4024,7 @@ async function fetchXRPLWinDB(claim) {
       buildSql: (offset, page) => `SELECT ${safeCols.join(', ')}
 FROM ${XRPL_TABLE}
 WHERE Account = '${w}'
-  AND TransactionType IN ('Payment','OfferCreate')
+  AND TransactionType IN (${sqlTypeList(FETCH_TYPES_XRPL)})
   ${timeFilter}
 ORDER BY Timestamp ASC
 LIMIT ${page} OFFSET ${offset}`.trim(),
@@ -2769,7 +4046,7 @@ LIMIT ${page} OFFSET ${offset}`.trim(),
       buildSql: (offset, page) => `SELECT ${safeCols.join(', ')}
 FROM ${XRPL_TABLE}
 WHERE Destination = '${w}'
-  AND TransactionType = 'Payment'
+  AND TransactionType IN (${sqlTypeList(FETCH_TYPES_IN_XRPL)})
   ${timeFilter}
 ORDER BY Timestamp ASC
 LIMIT ${page} OFFSET ${offset}`.trim(),
@@ -2843,6 +4120,8 @@ function processOneXRPLRow(row, wallet, walletSet, mode, helpers) {
   const txType = row.TransactionType ?? '';
   const result = row.TransactionResult ?? '';
   if(result && result !== 'tesSUCCESS') return;
+  // Cached under a wider fetch scope than the current one — see FETCH_TYPE_SET.
+  if(!FETCH_TYPE_SET.XRPL.has(txType)) { rowsSkippedStaleType++; return; }
   // In the "received" pass, a row where this wallet is also the sender is
   // a self-payment already fully handled by the outbound pass — skip it.
   if(mode === 'in' && src === wallet) return;
@@ -2865,7 +4144,15 @@ function processOneXRPLRow(row, wallet, walletSet, mode, helpers) {
     const bytes = [...rawHash].map(c=>c.charCodeAt(0));
     if(!bytes.every(b=>b===0)) txHash = bytes.map(b=>b.toString(16).padStart(2,'0')).join('').toUpperCase();
   }
-  const txId = txHash || (ts+'_'+wallet).replace(/[^a-zA-Z0-9_]/g,'');
+  // WinDB returns TransactionHash as 64 NUL bytes on every AMM row, so those
+  // fall back to a synthetic "<timestamp>_<wallet>" id that nothing outside
+  // this app can resolve. The imported ledger data carries the REAL hash — use
+  // it where we have it, so an AMM entry on a return can be looked up on any
+  // explorer instead of being untraceable.
+  const ammImported = ammDeltaFor(wallet, row);
+  const txId = txHash
+    || (ammImported && ammImported.hash)
+    || (ts+'_'+wallet).replace(/[^a-zA-Z0-9_]/g,'');
 
   // NOTE: this used to be missing entirely — allTransactionHistory was only
   // ever populated by processOneXahauRow(), so the "All Transactions" export
@@ -2878,6 +4165,12 @@ function processOneXRPLRow(row, wallet, walletSet, mode, helpers) {
     TakerGets_XRP:row.TakerGets_XRP,TakerGets_value:row.TakerGets_value,TakerGets_currency:row.TakerGets_currency,
     TakerPays_XRP:row.TakerPays_XRP,TakerPays_value:row.TakerPays_value,TakerPays_currency:row.TakerPays_currency,
     hash:txId});
+
+  // Types the curated fetch now brings in but the engine does not book. They
+  // are listed rather than silently dropped — see recordUnvalued().
+  if(!VALUED_TYPES.has(txType) && (src === wallet || dest === wallet)) {
+    recordUnvalued('XRPL', wallet, row, txId, dk, dateStr, yr, amountForRow(wallet, row), 'XRP');
+  }
 
   if(txType === 'Payment') {
     // WinDB's Amount_XRP / delivered_amount_XRP for the XRP Ledger is in
@@ -3092,7 +4385,11 @@ async function runFetch(){
 
     if(highRows.length){const b=document.getElementById('hdrXah');b.textContent=highRows.length+' DISPOSALS';b.style.display='inline';}
 
-    document.querySelectorAll('.taxYearSelect').forEach(el => { el.value = String(year); });
+    syncTaxYearSelects(year);
+    // A fetch has now run under the current type list, so the cache and the
+    // scope agree. Any wallet whose pass failed kept a null cursor and will
+    // be re-pulled in full next time, so this is safe on a partial run.
+    if(!abortFlag) await stampFetchScope();
     renderDataSummary();
     renderResults();
     showTab('results');
@@ -3105,6 +4402,7 @@ async function runFetch(){
     document.getElementById('fetchBtn').disabled=false;
     document.getElementById('stopBtn').style.display='none';
     refreshLocalDataPanel();
+    refreshAmmLedgerPanel();
   }
 }
 function doStop(){abortFlag=true;}
@@ -3713,6 +5011,14 @@ async function _buildReportFromCacheInner(opts = {}) {
 
   resetLedgerState();
 
+  // Load the ledger-verified AMM amounts BEFORE any row is processed. They are
+  // consulted per row by amountForRow(), so arriving late means the early
+  // wallets silently book WinDB's understated requested figures while the
+  // later ones book the real ones — the same report, two conventions, nothing
+  // on screen saying so. Loaded after resetLedgerState() because that resets
+  // the counters this feeds.
+  await loadAmmDeltas();
+
   const walletSet = ownedWalletSet(wallets); // configured list ∪ cached wallets — must match the fetch path exactly
 
   // Stream each chain's rows in true global chronological order, one page at
@@ -3742,6 +5048,9 @@ async function _buildReportFromCacheInner(opts = {}) {
 
   await verifyScannedRowCount();
 
+  // Re-assert it after the build too: a rebuild is exactly when the labels
+  // used to drift away from the data.
+  syncTaxYearSelects();
   applyReportingYear(taxYear());
   renderDataSummary();
   // Price History is repainted by buildReportFromCache()'s finally block, so
@@ -3801,10 +5110,85 @@ async function forceFullResyncUI() {
 
 async function clearLocalDBUI() {
   if(!USE_LOCAL_DB) return;
-  if(!confirm('Permanently delete the entire local transaction cache? This cannot be undone — the next fetch will need to re-download complete history for every wallet from WinDB, at full Payment-Claim cost. Your wallet list, tax-year settings, and term overrides are NOT affected (those are stored separately).')) return;
+  if(!confirm('Permanently delete the entire local transaction cache? This cannot be undone — the next fetch will need to re-download complete history for every wallet from WinDB, at full Payment-Claim cost. Your wallet list, tax-year settings, term overrides, and imported AMM ledger amounts are NOT affected (those are stored separately).')) return;
   await window.taxDB.clearAll();
   await refreshLocalDataPanel();
-  alert('Local database cleared.');
+  alert('Local database cleared. Imported AMM ledger amounts were kept — clear those separately if you meant to drop them too.');
+}
+
+// ── AMM ledger amounts panel ──────────────────────────────────────────────
+async function refreshAmmLedgerPanel() {
+  const section = document.getElementById('ammLedgerSection');
+  if(!section) return;
+  if(!USE_LOCAL_DB || !window.taxDB.getAmmStats) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  const box = document.getElementById('ammLedgerStats');
+  try {
+    const s = await window.taxDB.getAmmStats();
+    if(!s || s.rows === 0) {
+      box.innerHTML = '<span style="color:#b06000">No ledger-verified AMM amounts imported.</span> ' +
+        'AMM deposits and withdrawals are currently valued at the amount each transaction <i>requested</i>, ' +
+        'which understated every comparable withdrawal that has been checked.';
+    } else {
+      const when = s.importedAt ? new Date(s.importedAt).toLocaleString() : '—';
+      const short = s.rows - s.withDelivered;
+      box.innerHTML =
+        `<b>${s.rows.toLocaleString()}</b> AMM transaction(s) imported &nbsp;·&nbsp; ` +
+        `<b>${s.withDelivered.toLocaleString()}</b> carry a ledger-verified amount` +
+        (short ? ` &nbsp;·&nbsp; <span style="color:#b06000"><b>${short}</b> could not be paired with a ledger transaction</span>` : '') +
+        `<br>Imported: <b>${when}</b>`;
+    }
+  } catch(e) {
+    box.textContent = 'Could not read imported AMM amounts: ' + e.message;
+  }
+}
+
+function handleAmmLedgerCSV(input) {
+  const file = input.files && input.files[0];
+  input.value = '';
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    const { rows, errors, stats } = parseAmmLedgerCSV(String(e.target.result || ''));
+    if(rows.length === 0) {
+      alert('Nothing to import.\n\n' + (errors.length ? errors.slice(0,12).join('\n') : 'No AMM rows found in that file.'));
+      return;
+    }
+    // Show what will happen BEFORE it happens, including the rows that carry
+    // no figure. Those are not failures of the import — the protocol ignores
+    // the amount field in some withdrawal modes, so no figure exists — but
+    // they stay on the WinDB number and the user has to know that.
+    const preview =
+      `Import ledger-verified amounts for ${stats.total} AMM transaction(s)?\n\n` +
+      `  ${stats.withDelivered} carry a ledger-verified amount — these replace the requested figure\n` +
+      `  ${stats.unpaired} carry no ledger figure — these stay on the requested figure\n` +
+      (stats.flagged ? `  ${stats.flagged} carry a note from the verifier (near-miss pairing, ambiguity, or a failed sweep)\n` : '') +
+      `\nAnything already imported for the same wallet, type and timestamp is REPLACED.\n\n` +
+      (errors.length ? `${errors.length} row(s) will be SKIPPED:\n${errors.slice(0,10).join('\n')}` +
+        (errors.length > 10 ? `\n…and ${errors.length-10} more.` : '') + '\n\n' : '') +
+      `Rebuild afterwards to apply this to Form 8949.`;
+    if(!confirm(preview)) return;
+
+    try {
+      const n = await window.taxDB.importAmmLedger(rows);
+      await refreshAmmLedgerPanel();
+      let msg = `Imported ${n} AMM transaction(s); ${stats.withDelivered} now carry a ledger-verified amount.`;
+      if(errors.length) msg += `\n\nSkipped ${errors.length} row(s) — see the list you just confirmed.`;
+      msg += `\n\nNow rebuild: "View Report From Cache (offline)".`;
+      alert(msg);
+    } catch(err) {
+      alert('Import failed: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+async function clearAmmLedgerUI() {
+  if(!USE_LOCAL_DB || !window.taxDB.clearAmmLedger) return;
+  if(!confirm('Delete every imported AMM ledger amount?\n\nAMM deposits and withdrawals will go back to the amount each transaction REQUESTED, which understated every comparable withdrawal measured. Re-importing means sweeping a full-history node again (node scripts/verify-xrpl.js --amm), which takes about an hour.')) return;
+  await window.taxDB.clearAmmLedger();
+  await refreshAmmLedgerPanel();
+  alert('Imported AMM amounts cleared. Rebuild to apply.');
 }
 
 function renderDataSummary() {
@@ -4003,6 +5387,32 @@ function exportCSV() {
     ].join(','))
   ];
   downloadCSV(lines, `Form8949-${yr}.csv`);
+}
+
+// The companion to exportCSV(): everything the Form 8949 export leaves out.
+// Amount is deliberately blank rather than 0 where no column carries it — a
+// zero here would read as "nothing moved", which is the one wrong answer.
+function exportUnvaluedCSV() {
+  const rows = [...unvaluedRows].sort((a,b) =>
+    (a.dk < b.dk ? -1 : a.dk > b.dk ? 1 : 0) || a.type.localeCompare(b.type));
+  // "Amount Source" and "Submitted Amount" are not padding. An AMM figure read
+  // off the ledger is what moved; the WinDB figure is what was requested, and
+  // it was short on every comparable withdrawal measured. A preparer reading
+  // this file has to be able to tell the two apart, and to see the gap where
+  // both exist.
+  const lines = [
+    'Date,Year,Chain,Type,Amount,Ticker,Amount Source,Submitted Amount,From,To,Wallet,TX Hash,Why not on Form 8949',
+    ...rows.map(r => [
+      `"${r.dateStr}"`, r.year, r.chain, r.type,
+      r.qty != null ? r.qty : '',
+      r.qty != null ? (r.ticker || '') : '',
+      r.amountSrc === 'ledger' ? 'XRP Ledger metadata' : (r.amountSrc === 'windb' ? 'WinDB (requested)' : ''),
+      r.submitted != null ? r.submitted : '',
+      `"${r.src}"`, `"${r.dest}"`, `"${r.wallet}"`, `"${r.hash}"`,
+      `"${r.reason}"`,
+    ].join(','))
+  ];
+  downloadCSV(lines, `Unvalued-Transactions-${taxYear()}.csv`);
 }
 
 // ── PDF export (Form 8949-style statement + summary + Schedule D) ─────────
@@ -5780,7 +7190,7 @@ function exportLedger() {
 // re-filters the already-fetched master arrays instantly — no re-fetch,
 // no Payment-Claim cost, works from wherever the user is in the app.
 function syncTaxYear(newVal) {
-  document.querySelectorAll('.taxYearSelect').forEach(el => { el.value = newVal; });
+  syncTaxYearSelects(newVal);
   const year = parseInt(newVal);
   if(allDisposalsHigh.length === 0 && allIncomeRows.length === 0) {
     return; // nothing fetched yet
@@ -5813,12 +7223,16 @@ document.getElementById('xrpBasis')?.addEventListener('input', function() {
   document.getElementById('xrpBasisWarn').textContent = this.value;
 });
 renderWallets();
+// Before anything renders: the three year dropdowns must agree, or the Form
+// 8949 tab labels this year's figures with next year's heading.
+syncTaxYearSelects(DEFAULT_TAX_YEAR);
 // showPriceAsset() rather than renderPriceHistory() directly: it both renders
 // and styles the sub-tab, so the default XRP tab does not start out looking
 // unselected while its table is on screen.
 showPriceAsset('XRP');
 setAppVersion();
 refreshLocalDataPanel();
+refreshAmmLedgerPanel();
 // Silently rebuild Form 8949 / Schedule D from whatever's already cached on
 // this computer, so results are ready the moment the user clicks over to
 // them — no click, no Payment-Claim, no waiting for a fetch. "Silent" here
@@ -5827,7 +7241,10 @@ refreshLocalDataPanel();
 if(USE_LOCAL_DB) {
   const startupBtn = document.getElementById('buildFromCacheBtn');
   if(startupBtn) { startupBtn.disabled = true; startupBtn.textContent = '⏳ Building…'; }
-  buildReportFromCache({ silent: true }).finally(() => {
+  // Before the rebuild, not after: the rebuild paints the Data Summary, and
+  // the scope warning belongs in it the first time it appears rather than on
+  // the second paint.
+  checkFetchScope().then(() => buildReportFromCache({ silent: true })).finally(() => {
     if(startupBtn) { startupBtn.disabled = false; startupBtn.textContent = '📄 View Report From Cache (offline)'; }
   }).then(ok => {
     if(ok) log(`\n✓ Loaded ${transactionsScanned.toLocaleString()} cached transactions from previous sessions — Form 8949 is ready without fetching anything.`, 'ok');

@@ -29,6 +29,10 @@ contextBridge.exposeInMainWorld('taxDB', {
 
   forceFullResync: () => ipcRenderer.invoke('db:forceFullResync'),
 
+  /** Facts about the cache rather than in it — see db.js getMeta(). */
+  getMeta: (key) => ipcRenderer.invoke('db:getMeta', key),
+  setMeta: (key, value) => ipcRenderer.invoke('db:setMeta', key, value),
+
   clearAll: () => ipcRenderer.invoke('db:clearAll'),
 
   getStats: () => ipcRenderer.invoke('db:getStats'),
@@ -50,6 +54,18 @@ contextBridge.exposeInMainWorld('taxDB', {
    */
   getChainRowsPage: (chain, limit, cursor) =>
     ipcRenderer.invoke('db:getChainRowsPage', chain, limit, cursor),
+
+  /**
+   * Ledger-verified AMM amounts, from scripts/verify-xrpl.js --amm.
+   * WinDB's Amount_XRP on an AMM row is what the transaction REQUESTED; the
+   * ledger delivered more in 24 of 47 comparable rows and in every comparable
+   * withdrawal. These are the delivered figures. See db.js amm_ledger.
+   * rows: [{wallet, tx_type, timestamp, ledger_hash, submitted, delivered, flags, note}]
+   */
+  importAmmLedger: (rows) => ipcRenderer.invoke('db:importAmmLedger', rows),
+  getAmmLedger: () => ipcRenderer.invoke('db:getAmmLedger'),
+  getAmmStats: () => ipcRenderer.invoke('db:getAmmStats'),
+  clearAmmLedger: () => ipcRenderer.invoke('db:clearAmmLedger'),
 });
 
 contextBridge.exposeInMainWorld('appInfo', {

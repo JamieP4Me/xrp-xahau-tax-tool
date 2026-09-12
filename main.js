@@ -316,6 +316,12 @@ function registerIpcHandlers(db, dbPath) {
 
   ipcMain.handle('db:forceFullResync', () => db.forceFullResync());
 
+  // Read/write only — the renderer decides what a key means. Used for the
+  // fetch-scope fingerprint; see db.js getMeta().
+  ipcMain.handle('db:getMeta', (_evt, key) => db.getMeta(key));
+
+  ipcMain.handle('db:setMeta', (_evt, key, value) => db.setMeta(key, value));
+
   ipcMain.handle('db:clearAll', () => db.clearAll());
 
   ipcMain.handle('db:getStats', () => db.getStats());
@@ -328,4 +334,15 @@ function registerIpcHandlers(db, dbPath) {
 
   ipcMain.handle('db:getChainRowsPage', (_evt, chain, limit, cursor) =>
     db.getChainRowsPage(chain, limit, cursor));
+
+  // Ledger-verified AMM amounts. The renderer parses the verifier's CSV (it
+  // already has a CSV parser, and parsing there keeps it testable under
+  // Playwright) and sends the rows; nothing here touches the filesystem.
+  ipcMain.handle('db:importAmmLedger', (_evt, rows) => db.importAmmLedger(rows));
+
+  ipcMain.handle('db:getAmmLedger', () => db.getAmmLedger());
+
+  ipcMain.handle('db:getAmmStats', () => db.getAmmStats());
+
+  ipcMain.handle('db:clearAmmLedger', () => db.clearAmmLedger());
 }

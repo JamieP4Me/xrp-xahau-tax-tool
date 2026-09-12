@@ -57,6 +57,42 @@ CREATE TABLE IF NOT EXISTS app_meta (
   key   TEXT PRIMARY KEY,
   value TEXT
 );
+
+-- Ledger-verified AMM amounts, imported from scripts/verify-xrpl.js --amm.
+--
+-- This table exists because WinDB's Amount_XRP on an AMM transaction is the
+-- amount the transaction REQUESTED, and the ledger routinely delivered more.
+-- Measured across one wallet's real history: of 47 rows where both figures
+-- exist, 24 disagreed, and every single comparable AMMWithdraw (18 of 18) was
+-- understated — by 1,582 XRP in total, one of them by 563 XRP. Booking the
+-- requested figure would understate acquisitions by that much.
+--
+-- The correct figure is |balance delta + fee| read from the transaction's own
+-- ledger metadata, which WinDB does not expose. The verifier sweeps account_tx
+-- on a full-history node to get it; this is where the answer lands so the
+-- renderer can use it without any network access of its own.
+--
+-- The key is (wallet, tx_type, timestamp) rather than the transaction hash for
+-- a reason that cost a whole rewrite of the verifier: WinDB returns
+-- TransactionHash as 64 NUL bytes on every AMM row, so there is no hash on the
+-- cache side to join against. The timestamp here is the CACHE's own timestamp
+-- string, copied verbatim from the CSV, so the lookup is an exact string match
+-- against raw_transactions.timestamp — no parsing, no rounding, no timezone.
+--
+-- ledger_hash is the real hash the cache does not have. Keeping it turns these
+-- rows into the audit trail for the AMM entries on a return.
+CREATE TABLE IF NOT EXISTS amm_ledger (
+  wallet      TEXT NOT NULL,
+  tx_type     TEXT NOT NULL,          -- 'AMMDeposit' | 'AMMWithdraw'
+  timestamp   TEXT NOT NULL,          -- the cache's Timestamp string, verbatim
+  ledger_hash TEXT,                   -- real tx hash from the ledger; '' if unpaired
+  submitted   REAL,                   -- what WinDB had (the requested amount); NULL if none
+  delivered   REAL,                   -- |balance delta + fee| from ledger metadata; NULL if unpaired
+  flags       INTEGER,                -- the ledger's Flags, for withdrawal-mode reporting
+  note        TEXT,                   -- verifier's caveats: near-miss pairing, ambiguity, failures
+  imported_at TEXT NOT NULL,
+  PRIMARY KEY (wallet, tx_type, timestamp)
+);
 `;
 
 const SCHEMA_VERSION = 1;
@@ -77,6 +113,11 @@ function openDb(dbPath) {
 // ── Statements are prepared once per DB handle for speed ───────────────────
 function makeApi(db) {
   const stmts = {
+    getMeta: db.prepare('SELECT value FROM app_meta WHERE key = ?'),
+    setMeta: db.prepare(`
+      INSERT INTO app_meta (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `),
     getSyncState: db.prepare('SELECT last_timestamp FROM sync_state WHERE wallet = ? AND chain = ?'),
     // last_synced_at is ALWAYS written; only last_timestamp is guarded
     // against moving backward.
@@ -164,6 +205,32 @@ function makeApi(db) {
     countForChain: db.prepare(`
       SELECT COUNT(*) AS n FROM raw_transactions WHERE chain = ?
     `),
+    // Re-importing a corrected CSV must REPLACE, not accumulate. An UPSERT
+    // rather than INSERT OR IGNORE because the second run of the verifier is
+    // the one that fixed the figures, and a silent "already there, skipping"
+    // would keep the wrong ones.
+    insertAmmRow: db.prepare(`
+      INSERT INTO amm_ledger (wallet, tx_type, timestamp, ledger_hash, submitted, delivered, flags, note, imported_at)
+      VALUES (@wallet, @tx_type, @timestamp, @ledger_hash, @submitted, @delivered, @flags, @note, @imported_at)
+      ON CONFLICT(wallet, tx_type, timestamp) DO UPDATE SET
+        ledger_hash = excluded.ledger_hash,
+        submitted   = excluded.submitted,
+        delivered   = excluded.delivered,
+        flags       = excluded.flags,
+        note        = excluded.note,
+        imported_at = excluded.imported_at
+    `),
+    getAmmLedger: db.prepare(`
+      SELECT wallet, tx_type, timestamp, ledger_hash, submitted, delivered, flags, note
+      FROM amm_ledger ORDER BY timestamp ASC
+    `),
+    clearAmmLedger: db.prepare('DELETE FROM amm_ledger'),
+    statsAmm: db.prepare(`
+      SELECT COUNT(*) AS n,
+             SUM(CASE WHEN delivered IS NOT NULL THEN 1 ELSE 0 END) AS with_delivered,
+             MAX(imported_at) AS imported_at
+      FROM amm_ledger
+    `),
   };
 
   // Parameter order matches the public insertRows(wallet, chain, ...) exactly.
@@ -214,6 +281,32 @@ function makeApi(db) {
   const clearAllTxn = db.transaction(() => {
     stmts.clearEverything_sync.run();
     stmts.clearEverything_tx.run();
+    // amm_ledger is deliberately NOT cleared here. It is not cached WinDB
+    // data; it is an independent measurement that costs an hour of sweeping a
+    // full-history node to reproduce, and it stays correct across a re-fetch
+    // because its key is (wallet, type, timestamp) — the same rows come back
+    // under the same keys. Wiping it with the cache would quietly discard the
+    // only copy of figures the cache cannot supply. clearAmmLedger() exists
+    // for when dropping it is actually what was meant.
+  });
+
+  const importAmmLedgerTxn = db.transaction((rows, nowIso) => {
+    let n = 0;
+    for (const r of rows) {
+      stmts.insertAmmRow.run({
+        wallet: r.wallet,
+        tx_type: r.tx_type,
+        timestamp: r.timestamp,
+        ledger_hash: r.ledger_hash || '',
+        submitted: Number.isFinite(r.submitted) ? r.submitted : null,
+        delivered: Number.isFinite(r.delivered) ? r.delivered : null,
+        flags: Number.isFinite(r.flags) ? r.flags : null,
+        note: r.note || '',
+        imported_at: nowIso,
+      });
+      n++;
+    }
+    return n;
   });
 
   return {
@@ -300,6 +393,26 @@ function makeApi(db) {
       clearWalletChainTxn(wallet, chain);
     },
 
+    /**
+     * Small key/value store for facts ABOUT the cache rather than in it.
+     *
+     * It exists for one problem in particular. The sync cursor answers "how
+     * far forward have we fetched?", and nothing answers "what did we ask
+     * for?" — so when the app widened its WinDB type filter in v1.3.0, every
+     * existing cache said "synced through today" while holding none of the
+     * newly-requested types. The user would have been shown an empty
+     * "nothing is missing" box that was only true of a question never asked.
+     * The renderer stores its fetch scope here and re-syncs when it changes.
+     */
+    getMeta(key) {
+      const row = stmts.getMeta.get(key);
+      return row ? row.value : null;
+    },
+
+    setMeta(key, value) {
+      stmts.setMeta.run(key, value == null ? null : String(value));
+    },
+
     /** Keep cached rows, but drop every sync cursor — next fetch re-requests complete history from WinDB for every wallet (still dedups against what's cached, so it's a re-verify, not a data-loss operation). */
     forceFullResync() {
       stmts.resetAllSyncState.run();
@@ -335,6 +448,40 @@ function makeApi(db) {
      */
     listCachedWallets() {
       return stmts.listCachedWallets.all().map(r => r.wallet);
+    },
+
+    /**
+     * Replace-or-insert ledger-verified AMM amounts, one transaction.
+     * rows: [{ wallet, tx_type, timestamp, ledger_hash, submitted, delivered, flags, note }]
+     * @returns {number} rows written
+     */
+    importAmmLedger(rows) {
+      if (!rows || rows.length === 0) return 0;
+      return importAmmLedgerTxn(rows, new Date().toISOString());
+    },
+
+    /**
+     * Every imported AMM row, oldest first. The renderer loads these once per
+     * rebuild and keys them by wallet|type|timestamp — small enough (tens to
+     * low hundreds of rows) that paging would be pointless ceremony.
+     */
+    getAmmLedger() {
+      return stmts.getAmmLedger.all();
+    },
+
+    /** Counts for the disclosure panel: how many rows, how many actually carry a ledger figure. */
+    getAmmStats() {
+      const r = stmts.statsAmm.get() || {};
+      return {
+        rows: r.n || 0,
+        withDelivered: r.with_delivered || 0,
+        importedAt: r.imported_at || null,
+      };
+    },
+
+    /** Drop the imported AMM figures. Separate from clearAll() on purpose — see the note there. */
+    clearAmmLedger() {
+      stmts.clearAmmLedger.run();
     },
 
     close() {
