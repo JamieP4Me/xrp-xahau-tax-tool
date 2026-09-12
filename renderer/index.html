@@ -5314,8 +5314,20 @@ async function refreshAmmLedgerPanel() {
       box.innerHTML =
         `<b>${s.rows.toLocaleString()}</b> AMM transaction(s) imported &nbsp;·&nbsp; ` +
         `<b>${s.withDelivered.toLocaleString()}</b> carry a ledger-verified amount` +
-        (short ? ` &nbsp;·&nbsp; <span style="color:#b06000"><b>${short}</b> could not be paired with a ledger transaction</span>` : '') +
-        `<br>Imported: <b>${when}</b>`;
+        // Not painted as a warning. Measured on a real cache, every unpaired
+        // row was a transaction that FAILED on-chain — the verifier used to
+        // filter tesSUCCESS on the ledger side but not on the cache side, so
+        // failures were structurally unpairable and got reported as if data
+        // were missing. Failed transactions move nothing but the fee and the
+        // engine never books them, so this is a footnote, not a problem.
+        (short ? ` &nbsp;·&nbsp; <span style="color:#666">${short} unpaired</span>` : '') +
+        `<br>Imported: <b>${when}</b>` +
+        (short
+          ? `<div style="font-size:10px;color:#666;margin-top:4px">The unpaired rows are usually
+             transactions that <b>failed on-chain</b> (<code>tecAMM_FAILED</code> and similar). They moved nothing
+             but the fee, are never booked under any treatment, and need no action. Verifier versions
+             after this note exclude them up front.</div>`
+          : '');
     }
   } catch(e) {
     box.textContent = 'Could not read imported AMM amounts: ' + e.message;
