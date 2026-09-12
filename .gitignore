@@ -47,3 +47,6 @@ XRPL-Verification-*.csv
 # iou-inventory.js --out. Addresses, token names, amounts.
 iou*.csv
 IOU-Inventory-*.csv
+
+# Screenshots and scratch dropped in by hand.
+Claude outputs/

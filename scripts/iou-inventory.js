@@ -161,6 +161,103 @@ function nonNativeLegs(raw) {
   return legs;
 }
 
+// Which way an asset actually moved.
+//
+// Signing a transaction is not the same as sending an asset. On an AMMWithdraw
+// you are the Account -- you signed it -- but the assets travel OUT of the pool
+// and INTO your wallet. Reading Account as "outbound" booked a 4,050 SOLO
+// withdrawal as a disposal: wrong sign, and wrong by twice the amount in any
+// net. Same failure as the cross-currency self-payment below, found the same
+// way, by a balance that could not be true.
+function directionOf(raw, wallet) {
+  const t = raw.TransactionType;
+  const isAccount = raw.Account === wallet;
+  if (isAccount && t === 'AMMWithdraw') return 'in';
+  if (isAccount && t === 'AMMDeposit') return 'out';
+  // A cross-currency Payment to YOURSELF is how a token is bought with XRP
+  // without placing a DEX offer: SendMax is XRP, Amount is the token,
+  // Account === Destination === your own wallet. Testing Account first
+  // labelled every one of those a DISPOSAL when it is an ACQUISITION.
+  //
+  // It also explains a finding that should have looked suspicious on its face:
+  // "zero of 20,818 acquisitions were purchases". Purchases made this way were
+  // in the data all along, filed under the wrong heading.
+  if (isAccount && raw.Destination === wallet) return 'in';
+  if (isAccount) return 'out';
+  if (raw.Destination === wallet) return 'in';
+  return '\u2014';
+}
+
+// What LEAVING meant, and what ARRIVING meant.
+//
+// This used to read a destination equal to the issuer as a burn, full stop,
+// and a burn has a specific and painful tax consequence: a section 165
+// abandonment loss is a miscellaneous itemized deduction, disallowed
+// permanently now that OBBBA made the section 67(g) repeal permanent. So the
+// label is not cosmetic -- it decides whether a loss is claimable.
+//
+// It was also wrong. Measured on a real cache: 42 payments of XXX to onexah
+// protocol addresses were reported as burns. They are liquidity-pool deposits.
+// Sending XXX to the XLP issuer is how LP tokens are MINTED. The tax question
+// there is a section 1001 exchange, not an abandonment -- a different analysis
+// with a different answer, reached by guessing from an address.
+//
+// The fix is not a list of protocol addresses; that would rot. It is a
+// property already in the data: A BURN IS ONE-WAY. If an address has ever sent
+// this wallet an asset, it is a counterparty you transact with, not a sink you
+// abandon tokens into. ctx.inboundFrom holds exactly that, built from every
+// cached transaction -- including the Remits whose amounts WinDB dropped,
+// because who sent them survived even though what they sent did not.
+function classifyRoutes(row, ctx) {
+  const out = { disposal: '', acquisition: '' };
+  const inboundFrom = (ctx && ctx.inboundFrom) || new Set();
+  const issuers = (ctx && ctx.issuers) || new Set();
+  const own = (ctx && ctx.ownWallets) || new Set();
+
+  if (row.dir === 'in') {
+    out.acquisition = own.has(row.source || '') ? 'moved in from your own wallet (NOT an acquisition)'
+      : row.selfPay ? 'bought (cross-currency payment)'
+      : row.type === 'AMMWithdraw' ? 'withdrawn from AMM pool'
+      : 'received';
+    return out;
+  }
+  if (row.dir !== 'out') return out;
+  if (row.type === 'AMMDeposit') { out.disposal = 'deposited to AMM pool'; return out; }
+  if (row.type === 'OfferCreate') { out.disposal = 'sale (DEX)'; return out; }
+
+  const dest = row.destination || '';
+  if (!dest) return out;
+  // Moving a token from one of YOUR wallets to another of YOUR wallets is not
+  // a disposal at all -- there is no realisation, the lot just changes hands
+  // with itself. This has to be tested BEFORE any issuer rule, because WinDB
+  // sometimes records a holder's own address in an issuer field, which put
+  // rG9RH into the issuer set and relabelled 97 consolidation transfers as
+  // liquidity-pool deposits. One stray row poisoned the whole set.
+  if (own.has(dest)) {
+    out.disposal = 'moved to your own wallet (NOT a disposal)';
+    return out;
+  }
+  const roundTrip = inboundFrom.has(row.wallet + '|' + dest);
+
+  if (row.issuer && dest === row.issuer) {
+    out.disposal = roundTrip
+      ? 'returned to issuer (round-trip \u2014 NOT a burn)'
+      : 'sent to issuer (possible burn)';
+    return out;
+  }
+  // Sending token X to the address that ISSUES token Y is the signature of a
+  // protocol deposit: it is how a liquidity position is opened and how a
+  // receipt token gets minted back to you.
+  if (issuers.has(dest)) {
+    out.disposal = roundTrip
+      ? 'to protocol (issues another token, round-trip)'
+      : 'sent to the issuer of another token';
+    return out;
+  }
+  out.disposal = roundTrip ? 'sent to a known counterparty' : 'sent to another address';
+  return out;
+}
+
 function main() {
   const args = parseArgs(process.argv);
   if (!fs.existsSync(args.db)) {
@@ -173,6 +270,9 @@ function main() {
   const rows = [];
   const byAsset = new Map();
   let scanned = 0, failedSkipped = 0;
+  const inboundFrom = new Set();   // wallet|counterparty that ever PAID us
+  const issuers = new Set();       // every issuing address seen anywhere
+  const ownWallets = new Set();    // every wallet in the cache is one of ours
 
   for (const chain of chains) {
     const stmt = db.prepare(
@@ -184,7 +284,16 @@ function main() {
       // A failed transaction moved nothing. Same rule the engine and the AMM
       // reconciler now use — see the tesSUCCESS note in verify-xrpl.js.
       if (raw.TransactionResult && raw.TransactionResult !== 'tesSUCCESS') { failedSkipped++; continue; }
+      // Built from EVERY transaction, not only ones with a token leg. The 171
+      // Remits carry no amounts at all -- WinDB's flattened export has one
+      // scalar Amount slot and Remit's payload is an ARRAY -- but they still
+      // record who paid whom, and that is all this needs.
+      if (raw.Destination === r.wallet && raw.Account && raw.Account !== r.wallet) {
+        inboundFrom.add(r.wallet + '|' + raw.Account);
+      }
+      ownWallets.add(r.wallet);
       for (const leg of nonNativeLegs(raw)) {
+        if (leg.issuer) issuers.add(leg.issuer);
         // A cross-currency Payment to YOURSELF is how a token is bought with
         // XRP without placing a DEX offer: SendMax is XRP, Amount is the
         // token, Account === Destination === your own wallet. Testing Account
@@ -195,9 +304,7 @@ function main() {
         // face: "zero of 20,818 acquisitions were purchases". Purchases made
         // this way were in the data all along, filed under the wrong heading.
         const selfPay = raw.Account === r.wallet && raw.Destination === r.wallet;
-        const dir = selfPay ? 'in'
-                  : raw.Account === r.wallet ? 'out'
-                  : (raw.Destination === r.wallet ? 'in' : '—');
+        const dir = directionOf(raw, r.wallet);
         const key = `${chain}|${leg.currency}|${leg.issuer}`;
         let e = byAsset.get(key);
         if (!e) {
@@ -213,12 +320,6 @@ function main() {
         if (leg.qty == null) e.noQty++;
         else if (dir === 'in') e.qtyIn += leg.qty;
         else if (dir === 'out') e.qtyOut += leg.qty;
-        // Destination is what separates a SALE from an ABANDONMENT, and the
-        // two have opposite tax outcomes: a sale is a capital loss on
-        // Schedule D, while a burn is a section 165 abandonment loss, which
-        // is a miscellaneous itemized deduction and therefore disallowed --
-        // permanently, since OBBBA made the section 67(g) repeal permanent.
-        // A destination equal to the ISSUER is the signature of a burn.
         const dest = raw.Destination || '';
         // The counterparty, and the single most diagnostic field here. A token
         // arriving from ONE address on a 24-hour cadence is a scheduled
@@ -228,18 +329,27 @@ function main() {
         // a median gap of exactly 24.0 hours, up to 99% of gaps clustered
         // there. That is not a purchase pattern and it is not spam.
         const src = raw.Account || '';
+        // Routes are assigned AFTER the scan, not here: whether a destination
+        // is a burn sink or a counterparty depends on transactions that may
+        // not have been read yet.
         rows.push({ chain, wallet: r.wallet, timestamp: r.timestamp, type: raw.TransactionType,
-                    role: leg.role, dir, currency: leg.currency, issuer: leg.issuer, qty: leg.qty,
-                    source: src, destination: dest,
-                    disposal: dir === 'out'
-                      ? (raw.TransactionType === 'OfferCreate' ? 'sale (DEX)'
-                         : dest && leg.issuer && dest === leg.issuer ? 'sent to ISSUER (burn?)'
-                         : dest ? 'sent to another address' : '')
-                      : '',
-                    acquisition: dir === 'in'
-                      ? (selfPay ? 'bought (cross-currency payment)' : 'received') : '' });
+                    role: leg.role, dir, selfPay, currency: leg.currency, issuer: leg.issuer,
+                    qty: leg.qty, source: src, destination: dest,
+                    disposal: '', acquisition: '' });
       }
     }
+  }
+
+  // Now that every counterparty and issuer is known, label the movements.
+  // A wallet of ours is never treated as a token issuer: WinDB writes a
+  // holder address into that field often enough to matter, and the issuer
+  // rules are what decide burn-versus-deposit.
+  for (const w of ownWallets) issuers.delete(w);
+  const ctx = { inboundFrom, issuers, ownWallets };
+  for (const row of rows) {
+    const c = classifyRoutes(row, ctx);
+    row.disposal = c.disposal;
+    row.acquisition = c.acquisition;
   }
 
   const assets = [...byAsset.values()].sort((a, b) => b.n - a.n);
@@ -301,6 +411,14 @@ function main() {
     console.log('  Schedule D. A BURN is a section 165 abandonment loss, which is a');
     console.log('  miscellaneous itemized deduction -- disallowed by section 67(g), which');
     console.log('  OBBBA made PERMANENT. Same economics, and only one of them counts.');
+    console.log('');
+    console.log('  A ROUND-TRIP is NEITHER. If the destination has ever paid this wallet,');
+    console.log('  it is a counterparty, not a sink -- typically a liquidity pool, a stake');
+    console.log('  or a loan. Sending a token to the issuer of a DIFFERENT token is how an');
+    console.log('  LP position is opened and how the receipt token is minted back to you.');
+    console.log('  Those are section 1001 exchanges, analysed like an AMM deposit; calling');
+    console.log('  one an abandonment reaches the opposite answer.');
+    console.log('');
     console.log('  Either way a loss needs BASIS: a token airdropped free, with no income');
     console.log('  ever recognised on it, has none, and produces no loss however it leaves.');
   }
@@ -398,4 +516,5 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { decodeCurrency, nonNativeLegs, BOOKED, parseArgs, openCache };
+module.exports = { decodeCurrency, nonNativeLegs, BOOKED, parseArgs, openCache,
+                   directionOf, classifyRoutes };
