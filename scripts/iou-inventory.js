@@ -30,19 +30,52 @@
  *
  * It books nothing and decides nothing. It tells you what is missing.
  *
- * Usage:
- *   node scripts/iou-inventory.js                 both chains, summary
- *   node scripts/iou-inventory.js --detail        every transaction, per asset
- *   node scripts/iou-inventory.js --chain XRPL
- *   node scripts/iou-inventory.js --out iou.csv   machine-readable
- *   node scripts/iou-inventory.js --db /path/to/tax-data.sqlite3
+ * Usage — via npm, so the native module gets rebuilt for plain Node first
+ * (see the ABI note below; a bare `node scripts/...` fails after a release
+ * build, and says so):
+ *
+ *   npm run iou:inventory                     both chains, summary
+ *   npm run iou:inventory -- --detail         every transaction, per asset
+ *   npm run iou:inventory -- --chain XRPL
+ *   npm run iou:inventory -- --out iou.csv    machine-readable
+ *   npm run iou:inventory -- --db /path/to/tax-data.sqlite3
  */
 'use strict';
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+
+// better-sqlite3 is a native module with ONE build at a time, and this repo
+// needs two ABIs: Electron's (the app) and plain Node's (this script and the
+// tests). Whichever ran last wins, so running `node scripts/iou-inventory.js`
+// straight after `npm run dist:mac` throws ERR_DLOPEN_FAILED with a stack
+// trace that says "recompile" without saying how.
+//
+// NOTE the binding loads LAZILY. `require('better-sqlite3')` succeeds; the
+// throw happens inside `new Database(...)`. A first attempt at this guard
+// wrapped the require and never fired once — which is why openCache() exists
+// rather than a try around the import.
 const Database = require('better-sqlite3');
+
+function openCache(dbPath) {
+  try {
+    // readonly, always: this script audits tax data and must never alter it.
+    return new Database(dbPath, { readonly: true, fileMustExist: true });
+  } catch (e) {
+    if (e && e.code === 'ERR_DLOPEN_FAILED') {
+      console.error('\nbetter-sqlite3 is currently built for Electron, not for plain Node.');
+      console.error('(Whichever ran last wins; a release build leaves it on Electron.)\n');
+      console.error('Run this instead \u2014 it rebuilds for Node first:\n');
+      console.error('    npm run iou:inventory\n');
+      console.error('...passing any flags after a double dash:\n');
+      console.error('    npm run iou:inventory -- --detail\n');
+      console.error('The app rebuilds itself the same way on the next `npm start` or `npm run dist:mac`.\n');
+      process.exit(1);
+    }
+    throw e;
+  }
+}
 
 // The three the engine actually books. Everything else is what this reports.
 const BOOKED = new Set(['XRP', 'XAH', 'EVR']);
@@ -127,8 +160,7 @@ function main() {
     console.error(`\nNo cache found at:\n    ${args.db}\n\nPass --db /path/to/tax-data.sqlite3 if it lives elsewhere.\n`);
     process.exit(1);
   }
-  // readonly, always: this script audits tax data and must never alter it.
-  const db = new Database(args.db, { readonly: true, fileMustExist: true });
+  const db = openCache(args.db);
 
   const chains = args.chain ? [args.chain] : ['XRPL', 'Xahau'];
   const rows = [];
@@ -249,4 +281,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { decodeCurrency, nonNativeLegs, BOOKED, parseArgs };
+module.exports = { decodeCurrency, nonNativeLegs, BOOKED, parseArgs, openCache };
