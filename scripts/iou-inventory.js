@@ -194,8 +194,21 @@ function main() {
         if (leg.qty == null) e.noQty++;
         else if (dir === 'in') e.qtyIn += leg.qty;
         else if (dir === 'out') e.qtyOut += leg.qty;
+        // Destination is what separates a SALE from an ABANDONMENT, and the
+        // two have opposite tax outcomes: a sale is a capital loss on
+        // Schedule D, while a burn is a section 165 abandonment loss, which
+        // is a miscellaneous itemized deduction and therefore disallowed --
+        // permanently, since OBBBA made the section 67(g) repeal permanent.
+        // A destination equal to the ISSUER is the signature of a burn.
+        const dest = raw.Destination || '';
         rows.push({ chain, wallet: r.wallet, timestamp: r.timestamp, type: raw.TransactionType,
-                    role: leg.role, dir, currency: leg.currency, issuer: leg.issuer, qty: leg.qty });
+                    role: leg.role, dir, currency: leg.currency, issuer: leg.issuer, qty: leg.qty,
+                    destination: dest,
+                    disposal: dir === 'out'
+                      ? (raw.TransactionType === 'OfferCreate' ? 'sale (DEX)'
+                         : dest && leg.issuer && dest === leg.issuer ? 'sent to ISSUER (burn?)'
+                         : dest ? 'sent to another address' : '')
+                      : '' });
       }
     }
   }
@@ -218,18 +231,49 @@ function main() {
   console.log(`${assets.length} distinct asset(s) found across ${new Set(rows.map(r => r.wallet)).size} wallet(s).`);
   console.log('');
   const pad = (s, n) => String(s).padEnd(n).slice(0, n);
+  const tickerCount = new Map();
+  for (const a of assets) tickerCount.set(a.currency, (tickerCount.get(a.currency) || 0) + 1);
+  const dupTickers = new Set([...tickerCount].filter(([, n]) => n > 1).map(([c]) => c));
   const rpad = (s, n) => String(s).padStart(n);
-  console.log(pad('Asset', 14) + pad('Chain', 7) + rpad('Txs', 6) + rpad('Received', 18) +
-              rpad('Sent', 18) + '  Years');
-  console.log('-'.repeat(78));
+  // Widths measured against the real run: a 40-char hex currency code and an
+  // 11-figure quantity both overran and collided with the next column, which
+  // is how "ShibaNFT XRPL 23711,471,732,749" ends up on screen.
+  console.log(pad('Asset', 16) + pad('Chain', 7) + rpad('Txs', 6) + rpad('Received', 22) +
+              rpad('Sent', 22) + '  Years');
+  console.log('-'.repeat(96));
   for (const a of assets) {
     const q = (v) => v ? v.toLocaleString(undefined, { maximumFractionDigits: 6 }) : '—';
-    console.log(pad(a.currency, 14) + pad(a.chain, 7) + rpad(a.n, 6) +
-                rpad(q(a.qtyIn), 18) + rpad(q(a.qtyOut), 18) + '  ' +
+    console.log(pad(a.currency, 16) + pad(a.chain, 7) + rpad(a.n, 6) +
+                rpad(q(a.qtyIn), 22) + rpad(q(a.qtyOut), 22) + '  ' +
                 [...a.years].sort().join(', '));
-    if (a.noQty) {
-      console.log(pad('', 27) + `${a.noQty} row(s) carry no quantity`);
+    // Same ticker, different issuer, is a DIFFERENT ASSET. Three "LUC" rows
+    // are not a duplicate-row bug; saying so stops them being ignored as one.
+    if (dupTickers.has(a.currency)) {
+      console.log(pad('', 16) + `issuer ${a.issuer.slice(0, 20)}…  (same ticker, different issuer)`);
     }
+    if (a.noQty) {
+      console.log(pad('', 29) + `${a.noQty} row(s) carry no quantity`);
+    }
+  }
+
+  // The split that decides whether a loss is usable at all.
+  const disposals = rows.filter(r => r.disposal);
+  if (disposals.length) {
+    const route = new Map();
+    for (const r of disposals) route.set(r.disposal, (route.get(r.disposal) || 0) + 1);
+    console.log('');
+    console.log('HOW THE DISPOSALS LEFT — this decides whether a loss is deductible');
+    console.log('-'.repeat(78));
+    for (const [k, v] of [...route].sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${String(v).padStart(5)}  ${k}`);
+    }
+    console.log('');
+    console.log('  A SALE (including a DEX sale for a trivial amount) is a capital loss on');
+    console.log('  Schedule D. A BURN is a section 165 abandonment loss, which is a');
+    console.log('  miscellaneous itemized deduction -- disallowed by section 67(g), which');
+    console.log('  OBBBA made PERMANENT. Same economics, and only one of them counts.');
+    console.log('  Either way a loss needs BASIS: a token airdropped free, with no income');
+    console.log('  ever recognised on it, has none, and produces no loss however it leaves.');
   }
 
   console.log('');
@@ -267,9 +311,10 @@ function main() {
       const s = v == null ? '' : String(v);
       return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
-    const lines = ['Chain,Wallet,Timestamp,Type,Role,Direction,Asset,Issuer,Quantity',
+    const lines = ['Chain,Wallet,Timestamp,Type,Role,Direction,Asset,Issuer,Quantity,Destination,Disposal Route',
       ...rows.map(r => [r.chain, r.wallet, r.timestamp, r.type, r.role, r.dir,
-                        r.currency, r.issuer, r.qty == null ? '' : r.qty].map(cell).join(','))];
+                        r.currency, r.issuer, r.qty == null ? '' : r.qty,
+                        r.destination, r.disposal].map(cell).join(','))];
     fs.writeFileSync(args.csv, lines.join('\n'));
     console.log('');
     console.log(`Wrote ${rows.length.toLocaleString()} row(s) to ${args.csv}`);
