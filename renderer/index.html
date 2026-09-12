@@ -217,6 +217,16 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
         <option value="A">Treatment A — deposit is a disposal, withdrawal is an acquisition at FMV</option>
       </select>
       <div id="ammTreatmentNote" style="font-size:10px;color:#888;line-height:1.5"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="sml" style="background:#1a2a52;color:#fff;border-color:#1a2a52"
+                id="cmpTreatmentBtn" onclick="compareTreatmentsUI()">⚖ What would Treatment A change?</button>
+      </div>
+      <div style="font-size:10px;color:#888;margin-top:4px;line-height:1.5">
+        Builds the whole report twice — once each way — and shows the difference in reported
+        proceeds, basis and gain, year by year. Changes nothing: your setting is restored when it
+        finishes. It re-reads the entire local cache twice, so it takes a few minutes.
+      </div>
+      <div id="treatmentCompare" style="margin-top:10px"></div>
     </div>
   </section>
 
@@ -5411,6 +5421,183 @@ function renderAmmTreatmentNote() {
       'disclosure list with their ledger-verified amounts, for your preparer to handle. ' +
       'This is the default: adopting a tax position is a decision for you and your preparer, ' +
       'not something a software update should make on your behalf.';
+}
+
+// ── "What would Treatment A change?" ──────────────────────────────────────
+//
+// The argument for a tax position is one thing; the dollars are another, and
+// the dollars are what a preparer signs off on. This builds the report both
+// ways from the same cache and diffs the totals, so the number comes out of
+// the real engine over the real history rather than out of an estimate.
+//
+// Deliberately a MEASUREMENT, not a change: the setting is restored and the
+// report rebuilt under it before this returns, on every path including a
+// thrown error. Nothing is persisted.
+function treatmentSnapshot() {
+  const byYear = {};
+  for(const r of allDisposalsHigh) {
+    const y = byYear[r.year] || (byYear[r.year] =
+      { rows: 0, stProceeds: 0, stBasis: 0, ltProceeds: 0, ltBasis: 0 });
+    y.rows++;
+    // effectiveTerm(), not r.term: a manual ST/LT override is what actually
+    // gets reported, so a comparison built on the automatic classification
+    // would not be a comparison of what goes on the return.
+    if(effectiveTerm(r) === 'LT') { y.ltProceeds += r.proceedsH; y.ltBasis += r.basis; }
+    else { y.stProceeds += r.proceedsH; y.stBasis += r.basis; }
+  }
+  return {
+    byYear,
+    shortQty: basisShortfalls.reduce((a, b) => a + b.qty, 0),
+    shortRows: basisShortfalls.length,
+    booked: ammBookedDeposits + ammBookedWithdrawals,
+    skipped: ammSkippedUnverified,
+    unvalued: unvaluedRows.length,
+  };
+}
+
+async function compareTreatmentsUI() {
+  if(!USE_LOCAL_DB) { alert('This needs the local cache.'); return; }
+  const btn = document.getElementById('cmpTreatmentBtn');
+  const box = document.getElementById('treatmentCompare');
+  const original = ammTreatment;
+
+  if(!confirm('Build the report twice to measure the difference?\n\n' +
+              'This reads the entire local cache once per treatment, so it will take a few ' +
+              'minutes. Your current setting is restored when it finishes — nothing is changed ' +
+              'and nothing is saved.')) return;
+
+  if(btn) { btn.disabled = true; btn.textContent = '⏳ Building…'; }
+  box.innerHTML = '<div style="font-size:11px;color:#555">Building with the current default (not booked)…</div>';
+  try {
+    ammTreatment = 'none';
+    await buildReportFromCache({ silent: true });
+    const before = treatmentSnapshot();
+
+    box.innerHTML = '<div style="font-size:11px;color:#555">Building again with Treatment A…</div>';
+    ammTreatment = 'A';
+    await buildReportFromCache({ silent: true });
+    const after = treatmentSnapshot();
+
+    box.innerHTML = renderTreatmentCompare(before, after);
+    _lastTreatmentCompare = { before, after, at: new Date().toISOString() };
+  } catch(e) {
+    box.innerHTML = `<div style="font-size:11px;color:#8b0000">Comparison failed: ${e.message}. ` +
+                    `Your setting was restored; rebuild to be sure the figures on screen match it.</div>`;
+  } finally {
+    // The restore is in `finally` on purpose. Leaving the app holding a
+    // treatment the user never chose — because a build threw halfway — is the
+    // one outcome this feature must not be able to produce.
+    ammTreatment = original;
+    syncAmmTreatmentSelect();
+    renderAmmTreatmentNote();
+    await buildReportFromCache({ silent: true });
+    renderResults();
+    renderDataSummary();
+    if(btn) { btn.disabled = false; btn.textContent = '⚖ What would Treatment A change?'; }
+  }
+}
+
+let _lastTreatmentCompare = null;
+
+function renderTreatmentCompare(before, after) {
+  const years = [...new Set([...Object.keys(before.byYear), ...Object.keys(after.byYear)])]
+    .sort();
+  const blank = { rows: 0, stProceeds: 0, stBasis: 0, ltProceeds: 0, ltBasis: 0 };
+  const money = (v) => (v < 0 ? '-$' : '$') + fmt(Math.abs(v));
+  const delta = (v) => {
+    if(Math.abs(v) < 0.005) return '<span style="color:#888">—</span>';
+    const c = v > 0 ? '#8b0000' : '#1a5c2a';   // more tax red, less tax green
+    return `<span style="color:${c};font-weight:600">${v > 0 ? '+' : '−'}$${fmt(Math.abs(v))}</span>`;
+  };
+
+  let rows = '';
+  let totalDelta = 0;
+  for(const y of years) {
+    const b = before.byYear[y] || blank, a = after.byYear[y] || blank;
+    const bGain = (b.stProceeds - b.stBasis) + (b.ltProceeds - b.ltBasis);
+    const aGain = (a.stProceeds - a.stBasis) + (a.ltProceeds - a.ltBasis);
+    totalDelta += (aGain - bGain);
+    rows += `<tr style="border-top:1px solid #c8d0e0">
+      <td style="padding:4px 6px"><b>${y}</b></td>
+      <td style="padding:4px 6px;text-align:right">${b.rows.toLocaleString()} → ${a.rows.toLocaleString()}</td>
+      <td style="padding:4px 6px;text-align:right">${money(b.stProceeds + b.ltProceeds)} → ${money(a.stProceeds + a.ltProceeds)}</td>
+      <td style="padding:4px 6px;text-align:right">${money(b.stBasis + b.ltBasis)} → ${money(a.stBasis + a.ltBasis)}</td>
+      <td style="padding:4px 6px;text-align:right">${money(bGain)} → ${money(aGain)}</td>
+      <td style="padding:4px 6px;text-align:right">${delta(aGain - bGain)}</td>
+    </tr>`;
+  }
+
+  const shortCured = before.shortQty - after.shortQty;
+
+  return `<div style="padding:12px;background:#f7f8fc;border:2px solid #1a2a52;border-radius:4px">
+    <div style="font-size:12px;font-weight:700;color:#12224a;margin-bottom:2px">
+      What Treatment A would change</div>
+    <div style="font-size:10px;color:#555;margin-bottom:8px">
+      Both columns built from the same local cache, minutes apart. Left of each arrow is the
+      current setting (not booked); right is Treatment A. Proceeds and gain use the daily-high
+      price convention.</div>
+    <table style="border-collapse:collapse;font-size:10.5px;width:100%">
+      <tr style="background:#1a2a52;color:#fff">
+        <th style="text-align:left;padding:4px 6px">Year</th>
+        <th style="text-align:right;padding:4px 6px">8949 rows</th>
+        <th style="text-align:right;padding:4px 6px">Proceeds</th>
+        <th style="text-align:right;padding:4px 6px">Basis</th>
+        <th style="text-align:right;padding:4px 6px">Gain</th>
+        <th style="text-align:right;padding:4px 6px">Change in gain</th>
+      </tr>
+      ${rows}
+      <tr style="background:#fff3e0;font-weight:700;border-top:2px solid #1a2a52">
+        <td style="padding:4px 6px" colspan="5">Net change in reported gain, all years</td>
+        <td style="padding:4px 6px;text-align:right">${delta(totalDelta)}</td>
+      </tr>
+    </table>
+    <div style="font-size:10.5px;color:#333;margin-top:8px;line-height:1.6">
+      ${shortCured > 0.005
+        ? `<b>${shortCured.toLocaleString(undefined,{maximumFractionDigits:2})} XRP of zero-basis disposals are cured</b>
+           (${before.shortRows.toLocaleString()} → ${after.shortRows.toLocaleString()} disposals with no lot to draw on).
+           Those were reporting 100% of proceeds as gain, and as short-term, because a missing
+           acquisition date cannot establish a holding period.<br>`
+        : ''}
+      ${after.booked ? `${after.booked.toLocaleString()} AMM transaction(s) booked. ` : ''}
+      ${after.skipped
+        ? `<span style="color:#7a4a00"><b>${after.skipped.toLocaleString()} skipped</b> for want of a ledger-verified
+           amount — import the verifier CSV above and run this again, or these stay unbooked.</span><br>`
+        : ''}
+      ${before.unvalued.toLocaleString()} → ${after.unvalued.toLocaleString()} transactions on the
+      "not on Form 8949" disclosure list.
+      <br><br>
+      <b>A rise in reported gain is the expected direction.</b> Treatment A recognises income at the
+      deposit that the current setting does not recognise at all; the basis it creates on withdrawal
+      only reduces gain when those coins are later sold. Whether the deposits fall in a year already
+      filed is the question for your preparer.
+    </div>
+    <div style="margin-top:8px">
+      <button class="sml" onclick="exportTreatmentCompareCSV()">⬇ Comparison (CSV)</button>
+    </div>
+  </div>`;
+}
+
+function exportTreatmentCompareCSV() {
+  if(!_lastTreatmentCompare) { alert('Run the comparison first.'); return; }
+  const { before, after } = _lastTreatmentCompare;
+  const years = [...new Set([...Object.keys(before.byYear), ...Object.keys(after.byYear)])].sort();
+  const blank = { rows: 0, stProceeds: 0, stBasis: 0, ltProceeds: 0, ltBasis: 0 };
+  const lines = ['Year,Treatment,Form 8949 rows,ST Proceeds,ST Basis,LT Proceeds,LT Basis,Total Gain'];
+  for(const y of years) {
+    for(const [label, s] of [['Not booked (current)', before], ['Treatment A', after]]) {
+      const v = s.byYear[y] || blank;
+      const gain = (v.stProceeds - v.stBasis) + (v.ltProceeds - v.ltBasis);
+      lines.push([y, `"${label}"`, v.rows,
+        v.stProceeds.toFixed(2), v.stBasis.toFixed(2),
+        v.ltProceeds.toFixed(2), v.ltBasis.toFixed(2), gain.toFixed(2)].join(','));
+    }
+  }
+  lines.push('');
+  lines.push(`"Zero-basis XRP, not booked",${before.shortQty.toFixed(6)}`);
+  lines.push(`"Zero-basis XRP, Treatment A",${after.shortQty.toFixed(6)}`);
+  lines.push(`"AMM transactions booked under Treatment A",${after.booked}`);
+  lines.push(`"AMM transactions skipped for want of a ledger-verified amount",${after.skipped}`);
+  downloadCSV(lines, `AMM-Treatment-Comparison-${new Date().toISOString().slice(0,10)}.csv`);
 }
 
 async function clearAmmLedgerUI() {

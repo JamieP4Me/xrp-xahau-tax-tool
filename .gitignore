@@ -33,6 +33,8 @@ CoinLedger-Import-*.csv
 Price-History-*.pdf
 # The "not on Form 8949" companion list. Addresses, amounts, tx hashes.
 Unvalued-Transactions-*.csv
+# The treatment before/after. No addresses, but it is a personal tax figure.
+AMM-Treatment-Comparison-*.csv
 # The preparer memo and the position defense. No addresses, but they are
 # personal tax documents. The generators are committed; the output is not.
 AMM-Treatment-Memo*.pdf

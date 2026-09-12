@@ -1793,3 +1793,118 @@ test.describe('the position is stated on the report', () => {
     expect(html).not.toContain('Tax position applied');
   });
 });
+
+test.describe('the treatment comparison', () => {
+  // Measures, never changes. The setting it finds is the setting it leaves,
+  // and nothing is written to storage — a tool for deciding whether to adopt
+  // a tax position must not adopt one as a side effect of being consulted.
+  test.afterEach(resetAmmBuild);
+
+  test('the snapshot splits ST and LT and totals gain per year', async () => {
+    const snap = await window.evaluate((wallet) => {
+      resetLedgerState();
+      ledgerAdd(wallet, 'XRP', '2021-05-01', 1000, 0.50, 'test');
+      ledgerAdd(wallet, 'XRP', '2025-01-02', 500, 2.00, 'test');
+      // Long-term: drawn from the 2021 lot.
+      pushDisposal(wallet, 'XRP', 100, '2025-06-01', '2025-06-01', 2025, 'H1', 3.00, 2.80, '', '');
+      // Short-term: 2021 lot is now partly spent, but FIFO still reaches it,
+      // so force a second year to prove years are kept apart.
+      pushDisposal(wallet, 'XRP', 50, '2024-06-01', '2024-06-01', 2024, 'H2', 1.00, 0.90, '', '');
+      return treatmentSnapshot();
+    }, W_XRPL);
+
+    expect(Object.keys(snap.byYear).sort()).toEqual(['2024', '2025']);
+    expect(snap.byYear['2025'].ltProceeds).toBeCloseTo(300, 4);
+    expect(snap.byYear['2025'].ltBasis).toBeCloseTo(50, 4);
+    expect(snap.byYear['2024'].rows).toBe(1);
+  });
+
+  test('the snapshot follows a manual ST/LT override, because that is what gets reported', async () => {
+    // Built on r.term instead, the comparison would diff a classification the
+    // return does not use.
+    const out = await window.evaluate((wallet) => {
+      resetLedgerState();
+      ledgerAdd(wallet, 'XRP', '2021-05-01', 1000, 0.50, 'test');
+      pushDisposal(wallet, 'XRP', 100, '2025-06-01', '2025-06-01', 2025, 'H1', 3.00, 2.80, '', '');
+      const auto = treatmentSnapshot().byYear['2025'];
+      const key = allDisposalsHigh[0].rowKey;
+      termOverrides[key] = 'ST';
+      const overridden = treatmentSnapshot().byYear['2025'];
+      delete termOverrides[key];
+      return { autoLT: auto.ltProceeds, autoST: auto.stProceeds,
+               ovLT: overridden.ltProceeds, ovST: overridden.stProceeds };
+    }, W_XRPL);
+
+    expect(out.autoLT).toBeCloseTo(300, 4);
+    expect(out.autoST).toBe(0);
+    expect(out.ovST, 'the override moved it').toBeCloseTo(300, 4);
+    expect(out.ovLT).toBe(0);
+  });
+
+  test('the zero-basis shortfall is what the comparison reports as cured', async () => {
+    const out = await window.evaluate((wallet) => {
+      resetLedgerState();
+      ledgerFIFODetailed(wallet, 'XRP', 9873.6705);   // nothing to draw on
+      const withGap = treatmentSnapshot();
+      resetLedgerState();
+      ledgerAdd(wallet, 'XRP', '2024-06-27', 24101.03668, 0.48, 'amm_withdrawal');
+      ledgerFIFODetailed(wallet, 'XRP', 9873.6705);   // now covered
+      const cured = treatmentSnapshot();
+      return { before: withGap.shortQty, after: cured.shortQty,
+               beforeRows: withGap.shortRows, afterRows: cured.shortRows };
+    }, W_XRPL);
+
+    expect(out.before).toBeCloseTo(9873.6705, 4);
+    expect(out.after).toBe(0);
+    expect(out.beforeRows).toBe(1);
+    expect(out.afterRows).toBe(0);
+  });
+
+  test('the rendered comparison names the direction and does not bury the skipped rows', async () => {
+    const html = await window.evaluate(() => {
+      const mk = (gainY) => ({
+        byYear: { '2024': { rows: 10, stProceeds: gainY, stBasis: 0, ltProceeds: 0, ltBasis: 0 } },
+        shortQty: 0, shortRows: 0, booked: 0, skipped: 0, unvalued: 40,
+      });
+      const before = mk(1000);
+      const after = { ...mk(11556.83), booked: 68, skipped: 5, unvalued: 5, shortQty: 0, shortRows: 0 };
+      before.shortQty = 10010; before.shortRows = 4;
+      return renderTreatmentCompare(before, after);
+    });
+
+    expect(html).toContain('2024');
+    // The change in gain, not just the two totals.
+    expect(html).toMatch(/\+\$10,556\.83/);
+    expect(html).toMatch(/10,010 XRP of zero-basis disposals are cured/);
+    expect(html).toMatch(/5 skipped/);
+    expect(html).toMatch(/A rise in reported gain is the expected direction/);
+    // The decision it hands back rather than makes.
+    expect(html).toMatch(/your preparer/);
+  });
+
+  test('a year present under one treatment and absent under the other still appears', async () => {
+    // Treatment A can create the first disposal in a year that previously had
+    // none. Iterating only the "before" years would hide exactly that.
+    const html = await window.evaluate(() => renderTreatmentCompare(
+      { byYear: {}, shortQty: 0, shortRows: 0, booked: 0, skipped: 0, unvalued: 39 },
+      { byYear: { '2024': { rows: 39, stProceeds: 10556.83, stBasis: 4000, ltProceeds: 0, ltBasis: 0 } },
+        shortQty: 0, shortRows: 0, booked: 39, skipped: 0, unvalued: 0 }));
+    expect(html).toContain('2024');
+    expect(html).toMatch(/0 → 39/);
+  });
+
+  test('the CSV carries both treatments per year, and refuses when nothing has been run', async () => {
+    const out = await window.evaluate(() => {
+      const saved = _lastTreatmentCompare;
+      _lastTreatmentCompare = null;
+      let refused = false;
+      const realAlert = window.alert;
+      window.alert = () => { refused = true; };
+      exportTreatmentCompareCSV();
+      window.alert = realAlert;
+      _lastTreatmentCompare = saved;
+      return refused;
+    });
+    expect(out, 'exporting before running would write an empty file').toBe(true);
+  });
+});
