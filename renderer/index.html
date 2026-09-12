@@ -209,6 +209,15 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
       afterwards to apply. Nothing is sent anywhere — the file is read in this
       window and stored in the local database.
     </div>
+
+    <div style="margin-top:14px;padding-top:12px;border-top:1px dashed #ccc">
+      <label style="font-weight:600">Tax treatment of AMM deposits and withdrawals</label>
+      <select id="ammTreatmentSelect" onchange="setAmmTreatmentUI(this.value)" style="width:100%;margin-bottom:6px">
+        <option value="none">Not booked — disclosed only (default)</option>
+        <option value="A">Treatment A — deposit is a disposal, withdrawal is an acquisition at FMV</option>
+      </select>
+      <div id="ammTreatmentNote" style="font-size:10px;color:#888;line-height:1.5"></div>
+    </div>
   </section>
 
   <section>
@@ -2482,6 +2491,57 @@ function ammDeltaFor(wallet, row) {
   return ammDeltas.get(ammDeltaKey(wallet, t, row.Timestamp ?? '')) || null;
 }
 
+// ── AMM tax treatment ─────────────────────────────────────────────────────
+//
+// The IRS has published NO guidance on liquidity pool deposits. Two positions
+// are in general use and they put income in different years, so a position has
+// to be chosen, applied to BOTH sides, and applied consistently across years.
+// This setting is that choice, made explicit and recorded on every report
+// rather than left implicit in what the code happens to do.
+//
+//   'none'  Deposits and withdrawals are not booked at all. They appear on the
+//           "not on Form 8949" disclosure list instead. This is what the tool
+//           did before the setting existed, and it is the DEFAULT — turning a
+//           position on is a decision for the taxpayer and their preparer, not
+//           a default someone inherits from a software update.
+//
+//   'A'     Deposit  = a disposition of the XRP under section 1001.
+//           Withdraw = an acquisition at fair market value on that date, with
+//                      a new holding period (section 1223 tacking needs a
+//                      carryover basis, which recognition prevents).
+//           The conservative position; what commercial software does on this
+//           data; the one that reports MORE income, EARLIER.
+//
+// Treatment B (deposit is a non-event, withdrawal returns the original lots)
+// is deliberately absent rather than stubbed. It is not implementable on data
+// like this: it needs a deposit lot to hand back for every withdrawal, and
+// this taxpayer withdrew 2.84x what went in. Offering it as a greyed-out
+// option would imply it is a matter of effort. It is not.
+const AMM_TREATMENT_DEFAULT = 'none';
+const AMM_TREATMENTS = {
+  none: { label: 'Not booked (default)',
+          short: 'AMM activity is disclosed but not booked' },
+  A:    { label: 'Treatment A — deposit is a disposal, withdrawal is an acquisition at FMV',
+          short: 'Treatment A (deposit = disposal, withdrawal = acquisition at FMV)' },
+};
+let ammTreatment = AMM_TREATMENT_DEFAULT;
+
+function saveAmmTreatment() {
+  try { localStorage.setItem('ammTreatment', ammTreatment); } catch(e) {}
+}
+function loadAmmTreatment() {
+  try {
+    const s = localStorage.getItem('ammTreatment');
+    // An unrecognised stored value falls back to the default rather than to
+    // whatever it happens to be. A typo in storage must never leave the app
+    // booking a position nobody chose.
+    ammTreatment = (s && AMM_TREATMENTS[s]) ? s : AMM_TREATMENT_DEFAULT;
+  } catch(e) { ammTreatment = AMM_TREATMENT_DEFAULT; }
+}
+function ammTreatmentLabel() {
+  return (AMM_TREATMENTS[ammTreatment] || AMM_TREATMENTS[AMM_TREATMENT_DEFAULT]).short;
+}
+
 // How many rows the engine actually valued from the ledger rather than from
 // WinDB, and how far the two differed. Drives the disclosure panel: a figure
 // sourced from a different place than the rest of the report has to say so.
@@ -2492,6 +2552,16 @@ function ammDeltaFor(wallet, row) {
 // transactions that moved real value, none of it XRP. That is a measurement,
 // not a missing figure, and the two must not be reported as the same thing.
 let ammLedgerUsed = 0, ammLedgerMissing = 0, ammLedgerUplift = 0, ammNoXrpLeg = 0;
+
+// What the active treatment actually did this build. ammSkippedUnverified is
+// the one that matters: under treatment A a row is booked ONLY from a
+// ledger-verified amount, never from WinDB's requested figure. Booking a
+// withdrawal at the requested amount would create a basis lot up to 563 XRP
+// short of what arrived, and it would look exactly as settled on Form 8949 as
+// a correct one. A skipped row stays on the disclosure list and is counted
+// here so the omission is visible rather than inferred.
+let ammBookedDeposits = 0, ammBookedWithdrawals = 0, ammSkippedUnverified = 0;
+let ammBookedDepositQty = 0, ammBookedWithdrawQty = 0;
 
 function ammIsAmmRow(row) {
   const t = row && row.TransactionType;
@@ -2525,6 +2595,65 @@ function amountForRow(wallet, row) {
   // number, rather than letting them pass as fully verified.
   if(ammIsAmmRow(row)) ammLedgerMissing++;
   return submitted;
+}
+
+// Apply the active AMM treatment to one row. Returns true if the row was
+// BOOKED — in which case the caller must not also list it as omitted.
+//
+// Under treatment A:
+//   AMMDeposit   XRP left the taxpayer's hands in exchange for LP tokens.
+//                A disposition: pushDisposal consumes FIFO lots and produces
+//                Form 8949 rows with proceeds at that day's price.
+//   AMMWithdraw  XRP arrived in exchange for LP tokens surrendered.
+//                An acquisition: ledgerAdd creates a basis lot at that day's
+//                price, dated that day. This is what cures the zero-basis
+//                chain — without it a withdrawal returns thousands of XRP,
+//                no lot is created, and a later transfer out finds an empty
+//                ledger and books $0 basis with a null acquisition date.
+//
+// THREE THINGS THIS DELIBERATELY REFUSES TO DO:
+//
+//  1. Book from an unverified amount. WinDB's figure is what the transaction
+//     REQUESTED; every comparable withdrawal measured was short, by up to 563
+//     XRP. A basis lot built on it would be wrong and would look exactly as
+//     settled on Form 8949 as a correct one. Unverified rows are skipped,
+//     counted, and stay on the disclosure list.
+//  2. Book a withdrawal that moved no XRP. Those took the pool's OTHER asset
+//     (see ammNoXrpLeg). There is no XRP acquisition to record, and inventing
+//     a zero-quantity lot would be noise at best.
+//  3. Guess at the second asset. Only the XRP leg is booked, on either side.
+//     The disclosure says so; it is an open item, not a solved one.
+//
+// Basis convention on acquisition is the daily HIGH, matching every other
+// acquisition path in this file (see the 'received_market' branch). Proceeds
+// on the disposal side carry both high and low, as all disposals do, so the
+// daily-low view of a report projects correctly.
+function bookAmmRow(wallet, row, txType, qty, dk, dateStr, yr, txId, priceH, priceL) {
+  if(ammTreatment !== 'A') return false;
+  if(txType !== 'AMMDeposit' && txType !== 'AMMWithdraw') return false;
+  // AMM transactions have no Destination; the submitting Account is the only
+  // party. Booking from any other perspective would double-count.
+  if((row.Account ?? '') !== wallet) return false;
+
+  const d = ammDeltaFor(wallet, row);
+  const verified = !!(d && d.delivered != null);
+  if(!verified) { ammSkippedUnverified++; return false; }
+  if(!(qty > 0)) return false;   // the measured-zero case; already counted by amountForRow
+
+  if(txType === 'AMMDeposit') {
+    ammBookedDeposits++;
+    ammBookedDepositQty += qty;
+    pushDisposal(wallet, 'XRP', qty, dk, dateStr, yr, txId, priceH, priceL,
+                 ' deposited to AMM pool', '');
+  } else {
+    ammBookedWithdrawals++;
+    ammBookedWithdrawQty += qty;
+    // `|| 0` rather than a flat-rate fallback: a missing price is already
+    // recorded and surfaced by lookupPrice(), and quietly substituting a
+    // stated rate here would hide it behind a plausible number.
+    ledgerAdd(wallet, 'XRP', dk, qty, priceH || 0, 'amm_withdrawal');
+  }
+  return true;
 }
 
 // The verifier's --amm CSV. Header:
@@ -3156,6 +3285,11 @@ function resetLedgerState() {
   ammLedgerMissing = 0;
   ammLedgerUplift = 0;
   ammNoXrpLeg = 0;
+  ammBookedDeposits = 0;
+  ammBookedWithdrawals = 0;
+  ammSkippedUnverified = 0;
+  ammBookedDepositQty = 0;
+  ammBookedWithdrawQty = 0;
 }
 
 const MS_PER_DAY = 86400000;
@@ -3618,6 +3752,35 @@ function dataQualityHTML() {
   // report that mixes sources without saying so is the problem this panel
   // exists to prevent. Shown whenever ANY AMM row was seen — including the
   // case where none were verified, which is the one worth warning about.
+  // The active tax position, stated on every report that carries a figure
+  // produced under it. A position adopted where no guidance exists is
+  // defensible largely because it was chosen deliberately and applied
+  // consistently — neither of which a reader can verify from a number alone.
+  if(ammTreatment === 'A' && (ammBookedDeposits || ammBookedWithdrawals || ammSkippedUnverified)) {
+    parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#eef1f8;border:2px solid #1a2a52;border-radius:4px;font-size:11px;color:#12224a">
+      <strong>Tax position applied: Treatment A — an AMM deposit is a disposition, a withdrawal is an acquisition at fair market value.</strong><br>
+      There is no IRS guidance on liquidity pool deposits. This position was chosen deliberately, is applied to
+      both sides of every pool transaction and to every year, and restarts the holding period on withdrawal.
+      <table style="margin:8px 0 6px;border-collapse:collapse;font-size:10px;width:100%">
+        <tr style="background:#dde3f0"><th style="text-align:left;padding:3px 6px">Booked under this position</th>
+          <th style="text-align:right;padding:3px 6px">Count</th>
+          <th style="text-align:right;padding:3px 6px">XRP</th></tr>
+        <tr style="border-top:1px solid #c8d0e0"><td style="padding:3px 6px">Deposits booked as disposals (on Form 8949)</td>
+          <td style="padding:3px 6px;text-align:right">${ammBookedDeposits.toLocaleString()}</td>
+          <td style="padding:3px 6px;text-align:right">${ammBookedDepositQty.toLocaleString(undefined,{maximumFractionDigits:2})}</td></tr>
+        <tr style="border-top:1px solid #c8d0e0"><td style="padding:3px 6px">Withdrawals booked as acquisitions (new basis lots)</td>
+          <td style="padding:3px 6px;text-align:right">${ammBookedWithdrawals.toLocaleString()}</td>
+          <td style="padding:3px 6px;text-align:right">${ammBookedWithdrawQty.toLocaleString(undefined,{maximumFractionDigits:2})}</td></tr>
+      </table>
+      ${ammSkippedUnverified
+        ? `<span style="color:#7a4a00"><b>${ammSkippedUnverified.toLocaleString()} AMM transaction(s) were NOT booked</b> because no
+           ledger-verified amount is imported for them. The requested figure is never used to build a basis lot —
+           it was short on every comparable withdrawal measured. They remain on the disclosure list below.</span><br>`
+        : ''}
+      <strong>Only the XRP leg is booked.</strong> The pool's second asset is not tracked by this tool, and
+      consistency requires that it receive the same treatment. That reconstruction is outstanding.
+    </div>`);
+  }
   if(ammLedgerUsed || ammLedgerMissing) {
     const total = ammLedgerUsed + ammLedgerMissing;
     if(ammLedgerUsed) {
@@ -4168,8 +4331,14 @@ function processOneXRPLRow(row, wallet, walletSet, mode, helpers) {
 
   // Types the curated fetch now brings in but the engine does not book. They
   // are listed rather than silently dropped — see recordUnvalued().
+  //
+  // An AMM row under an active treatment is the exception: it IS booked, so it
+  // must leave the "not on Form 8949" list. Listing a transaction as omitted
+  // while also reporting it would be a worse disclosure than either alone.
   if(!VALUED_TYPES.has(txType) && (src === wallet || dest === wallet)) {
-    recordUnvalued('XRPL', wallet, row, txId, dk, dateStr, yr, amountForRow(wallet, row), 'XRP');
+    const qty = amountForRow(wallet, row);
+    const booked = bookAmmRow(wallet, row, txType, qty, dk, dateStr, yr, txId, xrpH, xrpL);
+    if(!booked) recordUnvalued('XRPL', wallet, row, txId, dk, dateStr, yr, qty, 'XRP');
   }
 
   if(txType === 'Payment') {
@@ -5141,6 +5310,8 @@ async function refreshAmmLedgerPanel() {
   } catch(e) {
     box.textContent = 'Could not read imported AMM amounts: ' + e.message;
   }
+  syncAmmTreatmentSelect();
+  renderAmmTreatmentNote();
 }
 
 function handleAmmLedgerCSV(input) {
@@ -5181,6 +5352,65 @@ function handleAmmLedgerCSV(input) {
     }
   };
   reader.readAsText(file);
+}
+
+// Changing a tax position mid-session and leaving the previous position's
+// figures on screen would be the worst possible outcome of this control, so
+// the change and the rebuild are one action.
+async function setAmmTreatmentUI(value) {
+  const next = AMM_TREATMENTS[value] ? value : AMM_TREATMENT_DEFAULT;
+  if(next === ammTreatment) { renderAmmTreatmentNote(); return; }
+
+  if(next === 'A') {
+    const s = (USE_LOCAL_DB && window.taxDB.getAmmStats) ? await window.taxDB.getAmmStats() : null;
+    const verified = s ? s.withDelivered : 0;
+    const ok = confirm(
+      'Apply Treatment A?\n\n' +
+      '  • Each AMM deposit becomes a DISPOSAL of the XRP deposited, with proceeds\n' +
+      '    at that day’s price. It will appear on Form 8949.\n' +
+      '  • Each AMM withdrawal becomes an ACQUISITION at fair market value, starting\n' +
+      '    a NEW holding period. A later sale within a year is short-term.\n\n' +
+      'This is a tax position, not a display setting. There is no IRS guidance on\n' +
+      'liquidity pools; the position must be applied consistently across every year\n' +
+      'and should be confirmed with whoever signs the return.\n\n' +
+      (verified
+        ? `${verified} AMM transaction(s) carry a ledger-verified amount and will be booked.\n` +
+          'Any without one are SKIPPED, not estimated, and stay on the disclosure list.\n\n'
+        : 'WARNING: no ledger-verified AMM amounts are imported, so NOTHING will be\n' +
+          'booked. Import the verifier CSV above first, or this setting will have no\n' +
+          'effect at all.\n\n') +
+      'The report rebuilds now.');
+    if(!ok) { syncAmmTreatmentSelect(); return; }
+  }
+
+  ammTreatment = next;
+  saveAmmTreatment();
+  syncAmmTreatmentSelect();
+  renderAmmTreatmentNote();
+  // A figure produced under one treatment must never sit alongside a figure
+  // produced under another, so this is not optional and not deferred.
+  if(USE_LOCAL_DB) await buildReportFromCache({ silent: true });
+  renderResults();
+  renderDataSummary();
+}
+
+function syncAmmTreatmentSelect() {
+  const el = document.getElementById('ammTreatmentSelect');
+  if(el) el.value = ammTreatment;
+}
+
+function renderAmmTreatmentNote() {
+  const el = document.getElementById('ammTreatmentNote');
+  if(!el) return;
+  el.innerHTML = ammTreatment === 'A'
+    ? 'Active. Deposits are booked as disposals and withdrawals as acquisitions at that day’s ' +
+      'price, <b>only where a ledger-verified amount exists</b> — the requested figure is never ' +
+      'used to create a basis lot. Only the XRP leg is booked; the pool’s other asset is not ' +
+      'tracked. The active treatment is named on every report this tool produces.'
+    : 'AMM deposits and withdrawals are <b>not booked</b>. They appear on the "not on Form 8949" ' +
+      'disclosure list with their ledger-verified amounts, for your preparer to handle. ' +
+      'This is the default: adopting a tax position is a decision for you and your preparer, ' +
+      'not something a software update should make on your behalf.';
 }
 
 async function clearAmmLedgerUI() {
@@ -7217,6 +7447,7 @@ loadLabels();
 reconcileClassification();
 loadSelected();
 loadTermOverrides();
+loadAmmTreatment();
 logEl = document.getElementById('logSetup'); // so log() works even before the first Fetch click (e.g. the silent cache-load below)
 document.getElementById('xrpBasis')?.addEventListener('input', function() {
   document.getElementById('xrpBasisDisplay').textContent = this.value;

@@ -1416,3 +1416,380 @@ test.describe('a measured zero is an answer, not a gap', () => {
     expect(html).toMatch(/remain on the requested amount/);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AMM TAX TREATMENT
+//
+// There is no IRS guidance on liquidity pool deposits. Two positions are in
+// general use and they put income in different years, so the tool cannot have
+// an opinion by accident: the position is an explicit setting, it defaults to
+// OFF, and it is named on every report produced under it.
+//
+// The tests below cover three things in order of importance:
+//   1. The default books nothing. A software update must never adopt a tax
+//      position on a taxpayer's behalf.
+//   2. Treatment A never books from an unverified amount. A basis lot built on
+//      WinDB's requested figure would be up to 563 XRP short and would look
+//      exactly as settled on Form 8949 as a correct one.
+//   3. It actually cures the zero-basis chain, which is the whole reason the
+//      question came up.
+
+async function setTreatment(value) {
+  await window.evaluate((v) => { ammTreatment = v; }, value);
+}
+
+async function resetAmmBuild() {
+  await window.evaluate(() => {
+    resetLedgerState();
+    ammDeltas.clear();
+    ammLedgerUsed = 0; ammLedgerMissing = 0; ammLedgerUplift = 0; ammNoXrpLeg = 0;
+    ammBookedDeposits = 0; ammBookedWithdrawals = 0; ammSkippedUnverified = 0;
+    ammBookedDepositQty = 0; ammBookedWithdrawQty = 0;
+    ammTreatment = AMM_TREATMENT_DEFAULT;
+  });
+}
+
+// One AMM row as the cache holds it: no Destination, and a hash of NUL bytes.
+function ammRowFor(wallet, type, ts, requested) {
+  return {
+    TransactionType: type, Timestamp: ts, TransactionResult: 'tesSUCCESS',
+    TransactionHash: '', Account: wallet, Destination: '',
+    Amount_XRP: requested == null ? '' : String(requested),
+  };
+}
+
+test.describe('the treatment setting itself', () => {
+  test.afterEach(resetAmmBuild);
+
+  test('the default is to book nothing', async () => {
+    // The single most important assertion in this file. Adopting a tax
+    // position is the taxpayer's decision, made with whoever signs the return.
+    // Shipping it on by default would make it a decision nobody made.
+    const out = await window.evaluate(() => ({
+      dflt: AMM_TREATMENT_DEFAULT,
+      current: ammTreatment,
+      options: Object.keys(AMM_TREATMENTS),
+    }));
+    expect(out.dflt).toBe('none');
+    expect(out.current).toBe('none');
+    expect(out.options).toContain('A');
+  });
+
+  test('an unrecognised stored value falls back to the default, not to whatever it is', async () => {
+    // A typo in localStorage must never leave the app quietly booking a
+    // position nobody chose.
+    const out = await window.evaluate(() => {
+      const before = ammTreatment;
+      try { localStorage.setItem('ammTreatment', 'TreatmentQ'); } catch (e) {}
+      loadAmmTreatment();
+      const afterGarbage = ammTreatment;
+      try { localStorage.setItem('ammTreatment', 'A'); } catch (e) {}
+      loadAmmTreatment();
+      const afterValid = ammTreatment;
+      try { localStorage.removeItem('ammTreatment'); } catch (e) {}
+      loadAmmTreatment();
+      const afterMissing = ammTreatment;
+      ammTreatment = before;
+      return { afterGarbage, afterValid, afterMissing };
+    });
+    expect(out.afterGarbage).toBe('none');
+    expect(out.afterValid, 'a valid stored value is still honoured').toBe('A');
+    expect(out.afterMissing).toBe('none');
+  });
+
+  test('Treatment B is absent rather than offered and broken', async () => {
+    // Not an oversight. Treatment B needs a deposit lot to hand back for every
+    // withdrawal, and this taxpayer withdrew 2.84x what went in. Listing it
+    // greyed out would imply it is a matter of effort.
+    const opts = await window.evaluate(() => Object.keys(AMM_TREATMENTS));
+    expect(opts).not.toContain('B');
+  });
+});
+
+test.describe('Treatment A — what it books', () => {
+  test.afterEach(resetAmmBuild);
+
+  test('with the default setting, an AMM row is disclosed and NOT booked', async () => {
+    const out = await window.evaluate((wallet) => {
+      resetLedgerState();
+      ammDeltas.set(ammDeltaKey(wallet, 'AMMWithdraw', '2025-01-01 00:00:00.1'),
+        { delivered: 663.23, submitted: 100, hash: 'ABC', flags: 262144, note: '' });
+      processOneXRPLRow({ TransactionType: 'AMMWithdraw', Timestamp: '2025-01-01 00:00:00.1',
+        TransactionResult: 'tesSUCCESS', TransactionHash: '', Account: wallet, Destination: '',
+        Amount_XRP: '100' }, wallet, new Set([wallet]), 'out', { xrpBasisRate: 0.5 });
+      return {
+        disposals: allDisposalsHigh.length,
+        lots: (walletLedger[wallet] && walletLedger[wallet].XRP || []).length,
+        disclosed: unvaluedRows.length,
+        booked: ammBookedWithdrawals,
+      };
+    }, W_XRPL);
+
+    expect(out.disposals).toBe(0);
+    expect(out.lots).toBe(0);
+    expect(out.disclosed, 'still on the not-on-8949 list').toBe(1);
+    expect(out.booked).toBe(0);
+  });
+
+  test('a deposit becomes a disposal on Form 8949, consuming FIFO lots', async () => {
+    const out = await window.evaluate((wallet) => {
+      resetLedgerState();
+      ammTreatment = 'A';
+      // 1,000 XRP bought at $0.50 well before the deposit.
+      ledgerAdd(wallet, 'XRP', '2021-05-01', 1000, 0.50, 'test');
+      ammDeltas.set(ammDeltaKey(wallet, 'AMMDeposit', '2024-05-24 13:01:32.755'),
+        { delivered: 992.165079, submitted: 992.165079, hash: 'DEP1', flags: 1048576, note: '' });
+      processOneXRPLRow({ TransactionType: 'AMMDeposit', Timestamp: '2024-05-24 13:01:32.755',
+        TransactionResult: 'tesSUCCESS', TransactionHash: '', Account: wallet, Destination: '',
+        Amount_XRP: '992.165079' }, wallet, new Set([wallet]), 'out', { xrpBasisRate: 0.5 });
+      const lots = walletLedger[wallet].XRP;
+      return {
+        rows: allDisposalsHigh.map(r => ({
+          qty: r.qty, basis: r.basis, term: r.term, hash: r.txHash,
+          desc: r.description, year: r.year, proceedsH: r.proceedsH,
+        })),
+        remaining: lots.reduce((a, l) => a + l.remaining, 0),
+        booked: ammBookedDeposits,
+        shortfalls: basisShortfalls.length,
+      };
+    }, W_XRPL);
+
+    expect(out.rows).toHaveLength(1);
+    expect(out.rows[0].qty).toBeCloseTo(992.165079, 6);
+    // Basis came from the real 2021 lot, so the holding period is long-term.
+    expect(out.rows[0].basis).toBeCloseTo(992.165079 * 0.50, 4);
+    expect(out.rows[0].term).toBe('LT');
+    expect(out.rows[0].year).toBe(2024);
+    expect(out.rows[0].desc).toContain('deposited to AMM pool');
+    expect(out.rows[0].hash, 'the real ledger hash, not a synthetic id').toBe('DEP1');
+    expect(out.rows[0].proceedsH).toBeGreaterThan(0);
+    expect(out.remaining).toBeCloseTo(1000 - 992.165079, 6);
+    expect(out.booked).toBe(1);
+    expect(out.shortfalls, 'the lot covered it, so nothing was zero-based').toBe(0);
+  });
+
+  test('a withdrawal becomes an acquisition lot at that day\'s price', async () => {
+    const out = await window.evaluate((wallet) => {
+      resetLedgerState();
+      ammTreatment = 'A';
+      ammDeltas.set(ammDeltaKey(wallet, 'AMMWithdraw', '2025-01-01 00:00:00.1'),
+        { delivered: 663.231417, submitted: 100, hash: 'WD1', flags: 262144, note: '' });
+      processOneXRPLRow({ TransactionType: 'AMMWithdraw', Timestamp: '2025-01-01 00:00:00.1',
+        TransactionResult: 'tesSUCCESS', TransactionHash: '', Account: wallet, Destination: '',
+        Amount_XRP: '100' }, wallet, new Set([wallet]), 'out', { xrpBasisRate: 0.5 });
+      const lots = walletLedger[wallet].XRP || [];
+      return {
+        lots: lots.map(l => ({ qty: l.qty, date: l.date, unitCost: l.unitCost, source: l.source })),
+        expectedPrice: lookupPrice(XRP_PRICES, 'XRP', '2025-01-01', 'high'),
+        disposals: allDisposalsHigh.length,
+        booked: ammBookedWithdrawals,
+        qty: ammBookedWithdrawQty,
+      };
+    }, W_XRPL);
+
+    expect(out.lots).toHaveLength(1);
+    // The DELIVERED figure, not the 100 XRP the transaction requested.
+    expect(out.lots[0].qty).toBeCloseTo(663.231417, 6);
+    expect(out.lots[0].date).toBe('2025-01-01');
+    expect(out.lots[0].unitCost).toBeCloseTo(out.expectedPrice, 8);
+    expect(out.lots[0].source).toBe('amm_withdrawal');
+    expect(out.disposals, 'an acquisition is not a disposal').toBe(0);
+    expect(out.booked).toBe(1);
+    expect(out.qty).toBeCloseTo(663.231417, 6);
+  });
+
+  test('a booked row LEAVES the not-on-Form-8949 list', async () => {
+    // Reporting a transaction and also listing it as omitted would be a worse
+    // disclosure than either alone.
+    const out = await window.evaluate((wallet) => {
+      resetLedgerState();
+      ammTreatment = 'A';
+      ammDeltas.set(ammDeltaKey(wallet, 'AMMWithdraw', '2025-01-01 00:00:00.1'),
+        { delivered: 663.23, submitted: 100, hash: 'WD1', flags: 262144, note: '' });
+      processOneXRPLRow({ TransactionType: 'AMMWithdraw', Timestamp: '2025-01-01 00:00:00.1',
+        TransactionResult: 'tesSUCCESS', TransactionHash: '', Account: wallet, Destination: '',
+        Amount_XRP: '100' }, wallet, new Set([wallet]), 'out', { xrpBasisRate: 0.5 });
+      return { disclosed: unvaluedRows.length, booked: ammBookedWithdrawals };
+    }, W_XRPL);
+    expect(out.booked).toBe(1);
+    expect(out.disclosed).toBe(0);
+  });
+});
+
+test.describe('Treatment A — what it refuses to book', () => {
+  test.afterEach(resetAmmBuild);
+
+  test('an UNVERIFIED amount is never booked, and the refusal is counted', async () => {
+    // The most consequential rule here. WinDB's figure is what the transaction
+    // REQUESTED; every comparable withdrawal measured was short, by up to 563
+    // XRP. A basis lot built on it would be wrong and would look exactly as
+    // settled as a correct one. Skipping is visible; a wrong lot is not.
+    const out = await window.evaluate((wallet) => {
+      resetLedgerState();
+      ammTreatment = 'A';
+      // No entry in ammDeltas at all — nothing imported for this row.
+      processOneXRPLRow({ TransactionType: 'AMMWithdraw', Timestamp: '2025-01-01 00:00:00.1',
+        TransactionResult: 'tesSUCCESS', TransactionHash: '', Account: wallet, Destination: '',
+        Amount_XRP: '100' }, wallet, new Set([wallet]), 'out', { xrpBasisRate: 0.5 });
+      return {
+        lots: (walletLedger[wallet] && walletLedger[wallet].XRP || []).length,
+        booked: ammBookedWithdrawals,
+        skipped: ammSkippedUnverified,
+        disclosed: unvaluedRows.length,
+      };
+    }, W_XRPL);
+
+    expect(out.lots, 'no basis lot from a requested figure').toBe(0);
+    expect(out.booked).toBe(0);
+    expect(out.skipped).toBe(1);
+    expect(out.disclosed, 'and it stays on the disclosure list').toBe(1);
+  });
+
+  test('a withdrawal that moved no XRP creates no lot', async () => {
+    // The pool's other asset changed hands. There is no XRP acquisition to
+    // record, and a zero-quantity lot would be noise.
+    const out = await window.evaluate((wallet) => {
+      resetLedgerState();
+      ammTreatment = 'A';
+      ammDeltas.set(ammDeltaKey(wallet, 'AMMWithdraw', '2025-08-27 22:56:01.819'),
+        { delivered: 0, submitted: null, hash: 'F00D', flags: 262144, note: '' });
+      processOneXRPLRow({ TransactionType: 'AMMWithdraw', Timestamp: '2025-08-27 22:56:01.819',
+        TransactionResult: 'tesSUCCESS', TransactionHash: '', Account: wallet, Destination: '',
+        Amount_XRP: '' }, wallet, new Set([wallet]), 'out', { xrpBasisRate: 0.5 });
+      return {
+        lots: (walletLedger[wallet] && walletLedger[wallet].XRP || []).length,
+        booked: ammBookedWithdrawals,
+        noLeg: ammNoXrpLeg,
+        reason: unvaluedRows.length ? unvaluedRows[0].reason : null,
+      };
+    }, W_XRPL);
+
+    expect(out.lots).toBe(0);
+    expect(out.booked).toBe(0);
+    expect(out.noLeg).toBe(1);
+    expect(out.reason, 'and it explains itself').toMatch(/OTHER asset/);
+  });
+
+  test('only the submitting account books it, so nothing is counted twice', async () => {
+    // If the same transaction were processed from a second wallet's
+    // perspective, the deposit would be disposed of twice and the proceeds
+    // doubled on Form 8949.
+    const out = await window.evaluate(([wallet, other]) => {
+      resetLedgerState();
+      ammTreatment = 'A';
+      ammDeltas.set(ammDeltaKey(other, 'AMMDeposit', '2024-05-24 13:01:32.755'),
+        { delivered: 992.17, submitted: 992.17, hash: 'DEP1', flags: 1048576, note: '' });
+      // `other` submitted it; we are looking at it from `wallet`'s perspective.
+      processOneXRPLRow({ TransactionType: 'AMMDeposit', Timestamp: '2024-05-24 13:01:32.755',
+        TransactionResult: 'tesSUCCESS', TransactionHash: '', Account: other, Destination: '',
+        Amount_XRP: '992.17' }, wallet, new Set([wallet, other]), 'out', { xrpBasisRate: 0.5 });
+      return { disposals: allDisposalsHigh.length, booked: ammBookedDeposits };
+    }, [W_XRPL, OTHER]);
+
+    expect(out.disposals).toBe(0);
+    expect(out.booked).toBe(0);
+  });
+});
+
+test.describe('Treatment A cures the zero-basis chain', () => {
+  // This is why the question came up at all.
+  //
+  // The real sequence: an AMMWithdraw returned 24,101 XRP to a wallet; the
+  // engine did not book AMMWithdraw, so no lot was created; a later transfer
+  // to a Coinbase address found an empty ledger and produced lots at ZERO
+  // basis with a NULL acquisition date. On a sale that reports 100% of
+  // proceeds as gain, and all of it short-term, because a null date fails
+  // every long-term test.
+  test.afterEach(resetAmmBuild);
+
+  // Inlined into each test rather than shared through a helper: the two runs
+  // differ only in the treatment, and seeing both sequences in full is the
+  // point of the pair.
+  const SEQUENCE = (wallet, treatment) => {
+    resetLedgerState();
+    ammTreatment = treatment;
+    ammDeltas.set(ammDeltaKey(wallet, 'AMMWithdraw', '2024-06-27 10:18:00.5'),
+      { delivered: 24101.03668, submitted: 24000, hash: 'WD24K', flags: 262144, note: '' });
+    processOneXRPLRow({ TransactionType: 'AMMWithdraw', Timestamp: '2024-06-27 10:18:00.5',
+      TransactionResult: 'tesSUCCESS', TransactionHash: '', Account: wallet, Destination: '',
+      Amount_XRP: '24000' }, wallet, new Set([wallet]), 'out', { xrpBasisRate: 0.5 });
+    const consumed = ledgerFIFODetailed(wallet, 'XRP', 10000);
+    return {
+      consumed: consumed.map(c => ({ qty: c.qty, unitCost: c.unitCost, acqDate: c.acqDate })),
+      shortfalls: basisShortfalls.map(b => ({ ticker: b.ticker, qty: b.qty })),
+      basis: consumed.reduce((a, c) => a + c.qty * c.unitCost, 0),
+    };
+  };
+
+  test('WITHOUT a treatment, the disposal falls through to zero basis and a null date', async () => {
+    const out = await window.evaluate(([wallet, src]) => {
+      const run = new Function('return ' + src)();
+      return run(wallet, 'none');
+    }, [W_XRPL, SEQUENCE.toString()]);
+
+    expect(out.consumed).toHaveLength(1);
+    expect(out.consumed[0].unitCost, 'the defect').toBe(0);
+    expect(out.consumed[0].acqDate, 'and it cannot establish a holding period').toBeNull();
+    expect(out.shortfalls).toHaveLength(1);
+    expect(out.shortfalls[0].qty).toBeCloseTo(10000, 6);
+    expect(out.basis).toBe(0);
+  });
+
+  test('WITH Treatment A, the disposal draws on a real, dated lot and nothing is zero-based', async () => {
+    const out = await window.evaluate(([wallet, src]) => {
+      const run = new Function('return ' + src)();
+      return run(wallet, 'A');
+    }, [W_XRPL, SEQUENCE.toString()]);
+
+    expect(out.consumed).toHaveLength(1);
+    expect(out.consumed[0].qty).toBeCloseTo(10000, 6);
+    expect(out.consumed[0].unitCost, 'a real price, not zero').toBeGreaterThan(0);
+    expect(out.consumed[0].acqDate, 'and a date, so the holding period is knowable').toBe('2024-06-27');
+    expect(out.shortfalls, 'nothing fell through').toEqual([]);
+    expect(out.basis).toBeGreaterThan(0);
+  });
+});
+
+test.describe('the position is stated on the report', () => {
+  test.afterEach(resetAmmBuild);
+
+  test('the panel names the treatment and what it booked', async () => {
+    // A position adopted where no guidance exists is defensible largely
+    // because it was chosen deliberately and applied consistently. A reader
+    // cannot verify either of those from a number alone.
+    const html = await window.evaluate(() => {
+      resetLedgerState();
+      ammTreatment = 'A';
+      ammBookedDeposits = 39; ammBookedDepositQty = 19990.20;
+      ammBookedWithdrawals = 29; ammBookedWithdrawQty = 56803.37;
+      return dataQualityHTML();
+    });
+    expect(html).toContain('Treatment A');
+    expect(html).toMatch(/no IRS guidance/i);
+    expect(html).toContain('39');
+    expect(html).toContain('19,990.2');
+    expect(html).toContain('56,803.37');
+    // The limit has to travel with the claim.
+    expect(html).toMatch(/Only the XRP leg is booked/);
+  });
+
+  test('skipped rows are named in the same panel, not left to be inferred', async () => {
+    const html = await window.evaluate(() => {
+      resetLedgerState();
+      ammTreatment = 'A';
+      ammBookedWithdrawals = 29; ammSkippedUnverified = 5;
+      return dataQualityHTML();
+    });
+    expect(html).toMatch(/5 AMM transaction\(s\) were NOT booked/);
+    expect(html).toMatch(/never used to build a basis lot/);
+  });
+
+  test('with the default treatment the panel does not appear at all', async () => {
+    const html = await window.evaluate(() => {
+      resetLedgerState();
+      ammBookedDeposits = 0; ammBookedWithdrawals = 0; ammSkippedUnverified = 0;
+      return dataQualityHTML();
+    });
+    expect(html).not.toContain('Tax position applied');
+  });
+});

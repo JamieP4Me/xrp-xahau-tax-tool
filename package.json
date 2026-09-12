@@ -1,7 +1,7 @@
 {
   "name": "xrp-xahau-tax-tool",
   "productName": "XRP & Xahau Tax Tool",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Local desktop app for full XRP/Xahau transaction history and Form 8949/Schedule D generation, backed by a local SQLite cache with incremental sync.",
   "main": "main.js",
   "author": "XRP & Xahau Tax Tool contributors",
