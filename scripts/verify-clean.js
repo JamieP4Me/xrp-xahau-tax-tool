@@ -61,14 +61,31 @@ function walk(dir, out) {
   return out;
 }
 
-let tracked = null;
+let tracked;   // undefined = not asked yet; array = answer; 'unavailable' = git could not be asked
+// Returns null — NOT an empty list — when git cannot be asked.
+//
+// This used to `catch { tracked = []; }`, which meant that outside a git
+// checkout (or on any git failure at all) both git-based checks below iterated
+// nothing, found nothing, and printed a tick. The whole gate then reported
+// "Clean. Safe to publish." while two of its seven checks had not actually
+// run. That is worse than a failure: a gate that cannot fail is not a gate,
+// and this one was passing vacuously in every working copy that was not a
+// repo — including the one these checks were being developed in.
+//
+// Callers must treat null as "cannot verify" and fail, not as "nothing found".
+//
+// The memo is deliberately not null-based either. `tracked` starts undefined
+// and becomes an array or the string 'unavailable', so "not asked yet" and
+// "asked, no answer" can never collapse into the same value — which is the
+// same class of bug one level down, and it bit this fix on its first run.
 function gitFiles() {
-  if (tracked !== null) return tracked;
-  try {
-    tracked = execSync('git ls-files', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-      .split('\n').filter(Boolean);
-  } catch { tracked = []; }
-  return tracked;
+  if (tracked === undefined) {
+    try {
+      tracked = execSync('git ls-files', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+        .split('\n').filter(Boolean);
+    } catch { tracked = 'unavailable'; }
+  }
+  return tracked === 'unavailable' ? null : tracked;
 }
 
 const files = walk(ROOT, []);
@@ -141,9 +158,59 @@ const isSelf = (f) => SELF.includes(f);
 
 // ── 6. No local database or exports committed ─────────────────────────────
 {
-  const DATA = /\.(sqlite3?|db)$|Holdings-|Form-?8949|Disposal-Destinations|Wallet-Activity|Wallet-Config|Basis-Ledger|Gift-Log|Lost-Wallet|Exchange-Cost-Basis|Koinly-Import|CoinLedger-Import/i;
-  const strays = gitFiles().filter(f => DATA.test(f));
-  if (strays.length) bad('data files are tracked by git:', strays); else ok('no data files tracked');
+  // A database is a database whatever it is called.
+  const ALWAYS = /\.(sqlite3?|db)$/i;
+
+  // These name fragments identify an EXPORT this app writes. They are not
+  // sufficient on their own: `amm[-_.]` used to be, and it failed the whole
+  // gate on `test/amm-real-file.spec.js` — a test file, named after the data
+  // it reads. A false positive here is not harmless. It teaches whoever sees
+  // it that the gate cries wolf, and the next real hit gets waved through.
+  const EXPORT_NAME = /Holdings-|Form-?8949|Disposal-Destinations|Wallet-Activity|Wallet-Config|Basis-Ledger|Gift-Log|Lost-Wallet|Exchange-Cost-Basis|Koinly-Import|CoinLedger-Import|XRPL-Verification|Unvalued-Transactions|Price-History-|amm[-_.]/i;
+
+  // ...so an export name only counts when it is carried on a file that can
+  // actually hold the data. Source that merely mentions an export by name is
+  // how these exports get written in the first place.
+  const DATA_EXT = /\.(csv|tsv|pdf|xlsx?|sqlite3?|db)$/i;
+
+  const t = gitFiles();
+  if (t === null) {
+    bad('cannot ask git what is tracked — this check did not run, so the tree is unverified');
+  } else {
+    const strays = t.filter(f => ALWAYS.test(f) || (EXPORT_NAME.test(f) && DATA_EXT.test(f)));
+    if (strays.length) bad('data files are tracked by git:', strays); else ok('no data files tracked');
+  }
+}
+
+// ── 6b. No CSV anywhere in the tree carries a real address ────────────────
+//
+// Check 6 matches FILENAMES against a list, which only catches exports we
+// thought to name. `verify-xrpl.js --out amm-all.csv` wrote wallet addresses,
+// amounts and transaction hashes into the working copy under a name nobody
+// had added to that list — matched by neither the gate nor .gitignore. One
+// `git add .` and it ships.
+//
+// So this checks CONTENT instead of names: any tracked CSV holding something
+// shaped like a funded r-address fails, whatever it is called. Placeholders
+// (rEXAMPLE…, rTEST…) are how the wallet-config template is allowed to exist.
+{
+  const ADDR = /\br[1-9A-HJ-NP-Za-km-z]{24,34}\b/g;
+  const PLACEHOLDER = /^r(EXAMPLE|TEST|XXXX|SENDER|WALLET)/i;
+  const t = gitFiles();
+  if (t === null) {
+    // Same reasoning as check 6: an unanswerable question is not a pass.
+    bad('cannot ask git what is tracked — this check did not run, so the tree is unverified');
+  } else {
+    const offenders = [];
+    for (const f of t.filter(f => /\.csv$/i.test(f))) {
+      let text = '';
+      try { text = require('fs').readFileSync(f, 'utf8'); } catch (e) { continue; }
+      const real = [...new Set(text.match(ADDR) || [])].filter(a => !PLACEHOLDER.test(a));
+      if (real.length) offenders.push(`${f} (${real.length} address(es), e.g. ${real[0].slice(0, 10)}…)`);
+    }
+    if (offenders.length) bad('tracked CSV files contain real addresses:', offenders);
+    else ok('no real addresses in tracked CSVs');
+  }
 }
 
 console.log('');
