@@ -296,9 +296,12 @@ test('an unknown address with no history is just another address', () => {
   assert.strictEqual(r.disposal, 'sent to another address');
 });
 
-test('a DEX sale outranks every destination rule', () => {
+test('a DEX offer outranks every destination rule', () => {
+  // The route must come from the TYPE, not from where the offer happened to
+  // name a counterparty: an offer to the issuer is still an offer, not a burn.
   const r = classifyRoutes(out({ type: 'OfferCreate', destination: ISSUER }), ctxOf([ISSUER], [ISSUER]));
-  assert.strictEqual(r.disposal, 'sale (DEX)');
+  assert.match(r.disposal, /offered on the DEX/);
+  assert.doesNotMatch(r.disposal, /burn/);
 });
 
 test('AMM legs get their own route, not a destination guess', () => {
@@ -398,6 +401,39 @@ test('pending outranks the own-wallet and issuer rules', () => {
                              destination: ISSUER, issuer: ISSUER }, ctxOf([], [ISSUER], [W]));
   assert.match(r.disposal, /NOT yet disposed/);
   assert.doesNotMatch(r.disposal, /burn/);
+});
+
+
+// ── an offer is not a trade ───────────────────────────────────────────────
+test('REGRESSION: an OfferCreate leg is flagged unverified', () => {
+  // Measured on the real cache: TakerPays is ZERO on all 227 XRPL offers, so
+  // what came back was never captured, and nothing says whether the offer
+  // even filled. 64 "DEX sales" -- the only deductible category -- are offer
+  // terms with no proceeds.
+  const legs = nonNativeLegs({
+    TransactionType: 'OfferCreate',
+    TakerGets_currency: 'XVR', TakerGets_value: '1200',
+  });
+  assert.strictEqual(legs[0].unverified, true);
+  const r = classifyRoutes({ dir: 'out', wallet: W, type: 'OfferCreate' }, ctxOf());
+  assert.match(r.disposal, /UNRECORDED/);
+});
+
+test('a Payment is never flagged unverified — it either delivered or failed', () => {
+  const legs = nonNativeLegs({
+    TransactionType: 'Payment', Amount_currency: 'CX1', Amount_value: '10' });
+  assert.strictEqual(legs[0].unverified, false);
+});
+
+test('an offer still reports BOTH sides when both are present', () => {
+  // The cache lacks TakerPays today, but the parser must not stop reading it.
+  const legs = nonNativeLegs({
+    TransactionType: 'OfferCreate',
+    TakerGets_currency: 'CX1', TakerGets_value: '500',
+    TakerPays_currency: 'XVR', TakerPays_value: '1200',
+  });
+  assert.strictEqual(legs.length, 2);
+  assert.ok(legs.every(l => l.unverified === true));
 });
 
 console.log('');

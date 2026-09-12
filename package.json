@@ -34,7 +34,9 @@
     "iou:inventory": "node scripts/iou-inventory.js",
     "preiou:inventory": "node scripts/check-abi.js node",
     "probe:xahau": "node scripts/probe-xahau-iou.js",
-    "preprobe:xahau": "node scripts/check-abi.js node"
+    "preprobe:xahau": "node scripts/check-abi.js node",
+    "audit:types": "node scripts/audit-types.js",
+    "preaudit:types": "node scripts/check-abi.js node"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.1",

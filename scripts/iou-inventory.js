@@ -150,12 +150,19 @@ function parseArgs(argv) {
 function nonNativeLegs(raw) {
   const legs = [];
   const pending = NON_DELIVERY.has(raw.TransactionType);
+  // An OfferCreate states TERMS. An offer that crosses fills; one that does
+  // not becomes a resting offer and moves nothing, maybe forever, maybe in
+  // part. Nothing in the cache says which happened -- and measured on the
+  // real cache, TakerPays is ZERO on all 227 XRPL offers, so the other side
+  // of every trade is absent too. Quantity here is what was OFFERED UP, with
+  // no execution confirmation and no proceeds.
+  const unverified = raw.TransactionType === 'OfferCreate';
   const add = (cur, iss, val, role) => {
     const c = decodeCurrency(cur);
     if (!c || BOOKED.has(c.toUpperCase())) return;
     const v = parseFloat(val);
     legs.push({ currency: c, issuer: String(iss || '').trim(), qty: Number.isFinite(v) ? v : null,
-                role, pending });
+                role, pending, unverified });
   };
   // `??` falls back only on null/undefined, and WinDB stores EMPTY STRINGS.
   // So `delivered_amount_currency ?? Amount_currency` keeps the empty string
@@ -250,7 +257,10 @@ function classifyRoutes(row, ctx) {
   }
   if (row.dir !== 'out') return out;
   if (row.type === 'AMMDeposit') { out.disposal = 'deposited to AMM pool'; return out; }
-  if (row.type === 'OfferCreate') { out.disposal = 'sale (DEX)'; return out; }
+  if (row.type === 'OfferCreate') {
+    out.disposal = 'offered on the DEX \u2014 fill and proceeds UNRECORDED';
+    return out;
+  }
 
   const dest = row.destination || '';
   if (!dest) return out;
@@ -297,6 +307,7 @@ function main() {
   const rows = [];
   const byAsset = new Map();
   let scanned = 0, failedSkipped = 0, pendingRows = 0;
+  const blind = new Map();         // type -> rows carrying NO figure at all
   const inboundFrom = new Set();   // wallet|counterparty that ever PAID us
   const issuers = new Set();       // every issuing address seen anywhere
   const ownWallets = new Set();    // every wallet in the cache is one of ours
@@ -319,6 +330,19 @@ function main() {
         inboundFrom.add(r.wallet + '|' + raw.Account);
       }
       ownWallets.add(r.wallet);
+      // A row that names this wallet, produced no token leg, AND carries no
+      // native figure either, is a transaction whose contents are simply
+      // absent. Remit is the known case; this finds the others without being
+      // told what to look for.
+      {
+        const legsHere = nonNativeLegs(raw);
+        const native = parseFloat(raw.delivered_amount_XRP) || parseFloat(raw.Amount_XRP) || 0;
+        if (!legsHere.length && !native &&
+            (raw.Account === r.wallet || raw.Destination === r.wallet)) {
+          const t = raw.TransactionType || '(none)';
+          blind.set(t, (blind.get(t) || 0) + 1);
+        }
+      }
       for (const leg of nonNativeLegs(raw)) {
         if (leg.issuer) issuers.add(leg.issuer);
         // A cross-currency Payment to YOURSELF is how a token is bought with
@@ -362,6 +386,7 @@ function main() {
         // not have been read yet.
         rows.push({ chain, wallet: r.wallet, timestamp: r.timestamp, type: raw.TransactionType,
                     role: leg.role, dir, selfPay, pending: !!leg.pending,
+                    unverified: !!leg.unverified,
                     currency: leg.currency, issuer: leg.issuer,
                     qty: leg.qty, source: src, destination: dest,
                     disposal: '', acquisition: '' });
@@ -424,6 +449,24 @@ function main() {
     }
   }
 
+  if (blind.size) {
+    console.log('');
+    console.log('MOVED SOMETHING, RECORDED NOTHING \u2014 rows with no figure at all');
+    console.log('-'.repeat(78));
+    let tot = 0;
+    for (const [t, n] of [...blind].sort((a, b) => b[1] - a[1])) {
+      tot += n;
+      console.log(`  ${String(n).padStart(6)}  ${t}`);
+    }
+    console.log('');
+    console.log(`  ${tot} transaction(s) name one of your wallets, carry neither a token`);
+    console.log('  leg nor a native amount, and therefore appear NOWHERE above. This is');
+    console.log('  not the tool declining to price them; it is the cached row having no');
+    console.log('  figure to read. Remit is the known case: its payload is an ARRAY of');
+    console.log('  amounts and the flattened export has one scalar slot, so the whole');
+    console.log('  payload was dropped upstream. Re-fetching is the only fix.');
+  }
+
   if (pendingRows) {
     const pend = rows.filter(r => r.pending);
     console.log('');
@@ -472,6 +515,18 @@ function main() {
     console.log('');
     console.log('  Either way a loss needs BASIS: a token airdropped free, with no income');
     console.log('  ever recognised on it, has none, and produces no loss however it leaves.');
+    const unv = disposals.filter(r => r.unverified).length;
+    if (unv) {
+      console.log('');
+      console.log(`  ${unv} of these are DEX offers, and an offer is not a trade. It fills`);
+      console.log('  only if it crosses; otherwise it rests on the book, possibly forever,');
+      console.log('  possibly in part. Nothing cached says which happened. Worse, TakerPays');
+      console.log('  is empty on every offer in this cache, so what came BACK was never');
+      console.log('  captured -- there are no proceeds for any of them. Treat the quantity');
+      console.log('  as what was OFFERED UP, and confirm each one against the ledger before');
+      console.log('  claiming a loss on it. These are the deductible ones, so they are');
+      console.log('  exactly the rows worth verifying.');
+    }
   }
 
   // Arrival cadence, because it answers the question that decides the tax
