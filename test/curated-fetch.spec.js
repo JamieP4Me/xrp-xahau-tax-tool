@@ -1850,12 +1850,15 @@ test.describe('the treatment comparison', () => {
       ledgerAdd(wallet, 'XRP', '2024-06-27', 24101.03668, 0.48, 'amm_withdrawal');
       ledgerFIFODetailed(wallet, 'XRP', 9873.6705);   // now covered
       const cured = treatmentSnapshot();
-      return { before: withGap.shortQty, after: cured.shortQty,
-               beforeRows: withGap.shortRows, afterRows: cured.shortRows };
+      return { before: withGap.zero.byTicker.XRP || 0, after: cured.zero.byTicker.XRP || 0,
+               beforeRows: withGap.shortRows, afterRows: cured.shortRows,
+               beforeUsd: withGap.zero.usd, afterUsd: cured.zero.usd };
     }, W_XRPL);
 
     expect(out.before).toBeCloseTo(9873.6705, 4);
     expect(out.after).toBe(0);
+    expect(out.beforeUsd, 'and it is priced, not left as a bare quantity').toBeGreaterThan(0);
+    expect(out.afterUsd).toBe(0);
     expect(out.beforeRows).toBe(1);
     expect(out.afterRows).toBe(0);
   });
@@ -1864,18 +1867,19 @@ test.describe('the treatment comparison', () => {
     const html = await window.evaluate(() => {
       const mk = (gainY) => ({
         byYear: { '2024': { rows: 10, stProceeds: gainY, stBasis: 0, ltProceeds: 0, ltBasis: 0 } },
-        shortQty: 0, shortRows: 0, booked: 0, skipped: 0, unvalued: 40,
+        zero: { byTicker: {}, usd: 0, rows: 0 }, shortRows: 0, booked: 0, skipped: 0, unvalued: 40,
       });
       const before = mk(1000);
-      const after = { ...mk(11556.83), booked: 68, skipped: 5, unvalued: 5, shortQty: 0, shortRows: 0 };
-      before.shortQty = 10010; before.shortRows = 4;
+      const after = { ...mk(11556.83), booked: 68, skipped: 5, unvalued: 5, zero: { byTicker: {}, usd: 0, rows: 0 }, shortRows: 0 };
+      before.zero = { byTicker: { XRP: 10010 }, usd: 13613.60, rows: 4 }; before.shortRows = 4;
       return renderTreatmentCompare(before, after);
     });
 
     expect(html).toContain('2024');
     // The change in gain, not just the two totals.
     expect(html).toMatch(/\+\$10,556\.83/);
-    expect(html).toMatch(/10,010 XRP of zero-basis disposals are cured/);
+    expect(html).toMatch(/10,010 XRP/);
+    expect(html, 'the dollar figure, not a bare quantity').toMatch(/\$13,613\.60/);
     expect(html).toMatch(/5 skipped/);
     expect(html).toMatch(/A rise in reported gain is the expected direction/);
     // The decision it hands back rather than makes.
@@ -1886,9 +1890,9 @@ test.describe('the treatment comparison', () => {
     // Treatment A can create the first disposal in a year that previously had
     // none. Iterating only the "before" years would hide exactly that.
     const html = await window.evaluate(() => renderTreatmentCompare(
-      { byYear: {}, shortQty: 0, shortRows: 0, booked: 0, skipped: 0, unvalued: 39 },
+      { byYear: {}, zero: { byTicker: {}, usd: 0, rows: 0 }, shortRows: 0, booked: 0, skipped: 0, unvalued: 39 },
       { byYear: { '2024': { rows: 39, stProceeds: 10556.83, stBasis: 4000, ltProceeds: 0, ltBasis: 0 } },
-        shortQty: 0, shortRows: 0, booked: 39, skipped: 0, unvalued: 0 }));
+        zero: { byTicker: {}, usd: 0, rows: 0 }, shortRows: 0, booked: 39, skipped: 0, unvalued: 0 }));
     expect(html).toContain('2024');
     expect(html).toMatch(/0 → 39/);
   });

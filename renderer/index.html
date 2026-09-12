@@ -3660,6 +3660,32 @@ function grandTotalRaw() {
 // used to be invisible: a missing price date quietly became NaN, $0.00, or
 // the newest price in the series, and an ambiguous XRPL dust amount was
 // quietly multiplied by a million.
+// Value a zero-basis quantity at the newest price we have, so the cost reads
+// as dollars rather than as a quantity the reader has to price themselves.
+//
+// Extracted so the data-quality panel and the treatment comparison cannot
+// drift apart on it — and, more to the point, so neither can repeat the
+// mistake the comparison shipped with: summing XRP, XAH and EVR quantities
+// into a single number and labelling the total "XRP". Three assets worth
+// wildly different amounts added together is not a quantity of anything.
+function zeroBasisPriceOf(t) {
+  const src = t === 'XRP' ? XRP_PRICES : (t === 'EVR' ? EVR_PRICES : XAH_PRICES);
+  const p = lookupPrice(src, t, toDK(Date.now()), 'high');
+  return Number.isFinite(p) ? p : 0;
+}
+
+// Zero-basis exposure grouped BY ASSET, with a dollar total. Never a bare
+// cross-asset quantity sum.
+function zeroBasisByTicker(shortfalls) {
+  const byTicker = {};
+  let usd = 0;
+  for(const b of shortfalls) {
+    byTicker[b.ticker] = (byTicker[b.ticker] || 0) + b.qty;
+  }
+  for(const [t, qty] of Object.entries(byTicker)) usd += qty * zeroBasisPriceOf(t);
+  return { byTicker, usd, rows: shortfalls.length };
+}
+
 function dataQualityHTML() {
   const parts = [];
   if(basisShortfalls.length) {
@@ -3673,13 +3699,7 @@ function dataQualityHTML() {
     }
     const rows = Object.values(by).sort((a, b) => b.qty - a.qty);
     const label = (w) => (walletLabels && walletLabels[w]) ? `${walletLabels[w]} (${w.slice(0,10)}…)` : w;
-    // Value it at the newest price we have, so the cost is a dollar figure
-    // rather than a quantity the reader has to price themselves.
-    const priceOf = (t) => {
-      const src = t === 'XRP' ? XRP_PRICES : (t === 'EVR' ? EVR_PRICES : XAH_PRICES);
-      const p = lookupPrice(src, t, toDK(Date.now()), 'high');
-      return Number.isFinite(p) ? p : 0;
-    };
+    const priceOf = zeroBasisPriceOf;
     const totalUsd = rows.reduce((sum, r) => sum + r.qty * priceOf(r.ticker), 0);
     parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#fdecea;border:2px solid #8b0000;border-radius:4px;font-size:11px;color:#8b0000">
       <strong>✗ ${rows.reduce((n,r)=>n+r.qty,0).toLocaleString(undefined,{maximumFractionDigits:2})} coin(s) are being reported with ZERO cost basis and no acquisition date.</strong><br>
@@ -5459,7 +5479,10 @@ function treatmentSnapshot() {
   }
   return {
     byYear,
-    shortQty: basisShortfalls.reduce((a, b) => a + b.qty, 0),
+    // Per ASSET. The first version of this summed XRP, XAH and EVR quantities
+    // into one figure and called it XRP — 71,511 "XRP" that was really three
+    // different coins added together. Never do that again.
+    zero: zeroBasisByTicker(basisShortfalls),
     shortRows: basisShortfalls.length,
     booked: ammBookedDeposits + ammBookedWithdrawals,
     skipped: ammSkippedUnverified,
@@ -5539,7 +5562,16 @@ function renderTreatmentCompare(before, after) {
     </tr>`;
   }
 
-  const shortCured = before.shortQty - after.shortQty;
+  // Per asset, and only the assets that actually moved. A cross-asset total
+  // would be meaningless; the dollar figure is the only honest single number.
+  const tickers = [...new Set([...Object.keys(before.zero.byTicker), ...Object.keys(after.zero.byTicker)])]
+    .filter(t => Math.abs((before.zero.byTicker[t] || 0) - (after.zero.byTicker[t] || 0)) > 1e-6)
+    .sort();
+  const curedUsd = before.zero.usd - after.zero.usd;
+  const curedLine = tickers
+    .map(t => `${((before.zero.byTicker[t] || 0) - (after.zero.byTicker[t] || 0))
+      .toLocaleString(undefined,{maximumFractionDigits:2})} ${t}`)
+    .join(' · ');
 
   return `<div style="padding:12px;background:#f7f8fc;border:2px solid #1a2a52;border-radius:4px">
     <div style="font-size:12px;font-weight:700;color:#12224a;margin-bottom:2px">
@@ -5564,11 +5596,17 @@ function renderTreatmentCompare(before, after) {
       </tr>
     </table>
     <div style="font-size:10.5px;color:#333;margin-top:8px;line-height:1.6">
-      ${shortCured > 0.005
-        ? `<b>${shortCured.toLocaleString(undefined,{maximumFractionDigits:2})} XRP of zero-basis disposals are cured</b>
-           (${before.shortRows.toLocaleString()} → ${after.shortRows.toLocaleString()} disposals with no lot to draw on).
+      ${curedLine
+        ? `<b>Zero-basis disposals cured: ${curedLine}</b> &mdash; about <b>$${fmt(curedUsd)}</b> of
+           overstated gain at today's prices, across ${(before.shortRows - after.shortRows).toLocaleString()}
+           of ${before.shortRows.toLocaleString()} such disposals.
            Those were reporting 100% of proceeds as gain, and as short-term, because a missing
-           acquisition date cannot establish a holding period.<br>`
+           acquisition date cannot establish a holding period.
+           <br><span style="color:#8b0000"><b>${after.shortRows.toLocaleString()} zero-basis disposals remain</b>
+           (${Object.entries(after.zero.byTicker).sort((a,b)=>b[1]-a[1])
+              .map(([t,q]) => `${q.toLocaleString(undefined,{maximumFractionDigits:2})} ${t}`).join(' · ')}
+           &mdash; about $${fmt(after.zero.usd)}). Treatment A only cures what the AMM caused;
+           the rest has other causes and is a separate problem.</span><br>`
         : ''}
       ${after.booked ? `${after.booked.toLocaleString()} AMM transaction(s) booked. ` : ''}
       ${after.skipped
@@ -5605,8 +5643,18 @@ function exportTreatmentCompareCSV() {
     }
   }
   lines.push('');
-  lines.push(`"Zero-basis XRP, not booked",${before.shortQty.toFixed(6)}`);
-  lines.push(`"Zero-basis XRP, Treatment A",${after.shortQty.toFixed(6)}`);
+  // By ASSET. A single cross-asset quantity is not a number anyone can use.
+  lines.push('Zero-basis exposure,Treatment,Asset,Quantity,USD at today’s price');
+  const tk = [...new Set([...Object.keys(before.zero.byTicker), ...Object.keys(after.zero.byTicker)])].sort();
+  for(const [label, s] of [['Not booked (current)', before], ['Treatment A', after]]) {
+    for(const t of tk) {
+      const q = s.zero.byTicker[t] || 0;
+      lines.push(['', `"${label}"`, t, q.toFixed(6), (q * zeroBasisPriceOf(t)).toFixed(2)].join(','));
+    }
+  }
+  lines.push('');
+  lines.push(`"Zero-basis disposals, not booked",${before.shortRows}`);
+  lines.push(`"Zero-basis disposals, Treatment A",${after.shortRows}`);
   lines.push(`"AMM transactions booked under Treatment A",${after.booked}`);
   lines.push(`"AMM transactions skipped for want of a ledger-verified amount",${after.skipped}`);
   downloadCSV(lines, `AMM-Treatment-Comparison-${new Date().toISOString().slice(0,10)}.csv`);
