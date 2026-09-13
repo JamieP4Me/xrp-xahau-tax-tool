@@ -436,6 +436,32 @@ test('an offer still reports BOTH sides when both are present', () => {
   assert.ok(legs.every(l => l.unverified === true));
 });
 
+
+// ── a gift is not a sale ──────────────────────────────────────────────────
+test('REGRESSION: a send to a GIFT address is not a disposal', () => {
+  // 19,998 SOLO went to two daughters' addresses on 2025-12-19 and was
+  // reported here as a disposal. Giving property away realises nothing for
+  // the donor; the recipient takes carryover basis under IRC 1015(a).
+  const GIFT = 'rGIFTdaughter11111111111111111111';
+  const ctx = Object.assign(ctxOf([], [ISSUER], [W]), { gifts: new Set([GIFT]) });
+  const r = classifyRoutes(out({ destination: GIFT }), ctx);
+  assert.match(r.disposal, /GIFTED/);
+  assert.doesNotMatch(r.disposal, /sale/);
+});
+
+test('without a gift list, the same send is still reported as leaving', () => {
+  // Silence would be worse than a wrong label: the row must stay visible.
+  const GIFT = 'rGIFTdaughter11111111111111111111';
+  const r = classifyRoutes(out({ destination: GIFT }), ctxOf([], [ISSUER], [W]));
+  assert.strictEqual(r.disposal, 'sent to another address');
+});
+
+test('the own-wallet rule still outranks the gift list', () => {
+  const ctx = Object.assign(ctxOf([], [], [W, W2]), { gifts: new Set([W2]) });
+  const r = classifyRoutes(out({ destination: W2 }), ctx);
+  assert.match(r.disposal, /NOT a disposal/);
+});
+
 console.log('');
 if (failures > 0) {
   console.log(`${failures} test(s) FAILED`);

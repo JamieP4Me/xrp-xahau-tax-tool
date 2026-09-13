@@ -36,7 +36,11 @@
     "probe:xahau": "node scripts/probe-xahau-iou.js",
     "preprobe:xahau": "node scripts/check-abi.js node",
     "audit:types": "node scripts/audit-types.js",
-    "preaudit:types": "node scripts/check-abi.js node"
+    "preaudit:types": "node scripts/check-abi.js node",
+    "evernode": "node scripts/evernode-income.js",
+    "preevernode": "node scripts/check-abi.js node",
+    "wallets": "node scripts/wallets.js",
+    "prewallets": "node scripts/check-abi.js node"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.1",

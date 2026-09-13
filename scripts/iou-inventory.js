@@ -127,13 +127,23 @@ function decodeCurrency(raw) {
 }
 
 function parseArgs(argv) {
-  const out = { db: defaultDbPath(), chain: null, detail: false, csv: null };
+  const out = { db: defaultDbPath(), chain: null, detail: false, csv: null, gifts: new Set() };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--db') out.db = argv[++i];
     else if (a === '--chain') out.chain = argv[++i];
     else if (a === '--detail') out.detail = true;
     else if (a === '--out') out.csv = argv[++i];
+    // Giving property away is NOT a realisation event for the donor: no gain,
+    // no loss, no Form 8949 line. The recipient takes a carryover basis under
+    // IRC 1015(a). The main app models this with a giftAddresses list that is
+    // deliberately NOT part of the owned set and never fetched -- but that
+    // list lives in the app, so a script cannot see it. Without being told,
+    // this tool cannot tell a gift from a sale, and it says so in the output
+    // rather than guessing. Measured: 19,998 SOLO gifted on 2025-12-19 to two
+    // daughters' addresses is currently reported here as a disposal.
+    else if (a === '--gift') String(argv[++i] || '').split(',')
+      .map(x => x.trim()).filter(Boolean).forEach(x => out.gifts.add(x));
     else if (a === '--help' || a === '-h') {
       console.log(fs.readFileSync(__filename, 'utf8').split('*/')[0].replace(/^#!.*\n/, ''));
       process.exit(0);
@@ -238,6 +248,7 @@ function classifyRoutes(row, ctx) {
   const inboundFrom = (ctx && ctx.inboundFrom) || new Set();
   const issuers = (ctx && ctx.issuers) || new Set();
   const own = (ctx && ctx.ownWallets) || new Set();
+  const gifts = (ctx && ctx.gifts) || new Set();
 
   // Locked, not delivered. Neither side has anything to report yet: the
   // sender still owns it, the destination has not received it.
@@ -272,6 +283,10 @@ function classifyRoutes(row, ctx) {
   // liquidity-pool deposits. One stray row poisoned the whole set.
   if (own.has(dest)) {
     out.disposal = 'moved to your own wallet (NOT a disposal)';
+    return out;
+  }
+  if (gifts.has(dest)) {
+    out.disposal = 'GIFTED \u2014 not a disposal (IRC 1015 carryover basis)';
     return out;
   }
   const roundTrip = inboundFrom.has(row.wallet + '|' + dest);
@@ -399,7 +414,7 @@ function main() {
   // holder address into that field often enough to matter, and the issuer
   // rules are what decide burn-versus-deposit.
   for (const w of ownWallets) issuers.delete(w);
-  const ctx = { inboundFrom, issuers, ownWallets };
+  const ctx = { inboundFrom, issuers, ownWallets, gifts: args.gifts };
   for (const row of rows) {
     const c = classifyRoutes(row, ctx);
     row.disposal = c.disposal;
@@ -446,6 +461,22 @@ function main() {
     }
     if (a.noQty) {
       console.log(pad('', 29) + `${a.noQty} row(s) carry no quantity`);
+    }
+  }
+
+  if (!args.gifts.size) {
+    const out3 = rows.filter(r => r.dir === 'out' && r.destination && !ownWallets.has(r.destination));
+    if (out3.length) {
+      console.log('');
+      console.log('NO GIFT ADDRESSES SUPPLIED \u2014 every outbound row is assumed to be a sale');
+      console.log('-'.repeat(78));
+      console.log(`  ${out3.length} row(s) leave for an address that is not yours. This tool cannot`);
+      console.log('  tell a GIFT from a SALE, and the difference is total: a gift realises');
+      console.log('  nothing for the donor -- no gain, no loss, no Form 8949 line -- while');
+      console.log('  the recipient takes your basis under IRC 1015(a) and may need a Form');
+      console.log('  709. Pass the addresses so they stop being reported as disposals:');
+      console.log('');
+      console.log('      npm run iou:inventory -- --gift rAAA...,rBBB...');
     }
   }
 
