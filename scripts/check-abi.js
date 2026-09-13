@@ -96,6 +96,10 @@ try {
     execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm',
       ['rebuild', 'better-sqlite3'], { cwd: ROOT, stdio: 'inherit' });
   }
+  // A locally compiled addon is unsigned, and Electron's hardened runtime
+  // will not load an unsigned library -- macOS kills the process with SIGKILL
+  // and no error at all. See scripts/sign-native.js for the whole story.
+  require('./sign-native.js');
 } catch (e) {
   console.error(
     `\n  Automatic rebuild failed. Run this by hand:\n\n` +

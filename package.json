@@ -47,7 +47,9 @@
     "cache:optimise": "node scripts/optimise-cache.js",
     "precache:optimise": "node scripts/check-abi.js node",
     "probe:remit": "node scripts/probe-remit-raw.js",
-    "preprobe:remit": "node scripts/check-abi.js node"
+    "preprobe:remit": "node scripts/check-abi.js node",
+    "postrebuild": "node scripts/sign-native.js",
+    "sign:native": "node scripts/sign-native.js"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.1",
