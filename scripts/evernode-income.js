@@ -88,11 +88,18 @@ for (const r of db.prepare(
   const yr = String(r.timestamp).slice(0, 4);
   if (raw.Account === r.wallet) {
     signed++;
-    for (const k of ['Fee_XRP', 'Fee', 'fee', 'Fee_XAH']) {
+    // Fee_Drops, from DESCRIBE TABLE. The first cut of this guessed at
+    // 'Fee_XRP' / 'Fee' an hour after running the schema probe that named the
+    // real column, so it reported "the cache stores NO fee field" against a
+    // cache that had just been re-synced to include it. Same mistake the
+    // renderer made with 'Fee', and with Asset_currency before that: the
+    // safeCols guard silently drops a column name that does not exist, so a
+    // wrong guess looks exactly like an absent field.
+    for (const k of ['Fee_Drops']) {
       if (raw[k] == null || String(raw[k]).trim() === '') continue;
       feeKeyFound = true;
       const e = feeByYear.get(yr) || { n: 0, fee: 0, key: k };
-      e.n++; e.fee += num(raw[k]);
+      e.n++; e.fee += num(raw[k]) / 1e6;   // drops -> whole XAH
       feeByYear.set(yr, e);
       break;
     }
@@ -228,7 +235,7 @@ if (!feeKeyFound) {
   console.log('  expense of the hosting business and it is invisible here — it needs a');
   console.log('  re-fetch or a ledger query to quantify.');
 } else {
-  console.log('  year         signed             fee');
+  console.log('  year         signed         fee (XAH)');
   let tf = 0, nf = 0;
   for (const y of [...feeByYear.keys()].sort()) {
     const e = feeByYear.get(y); tf += e.fee; nf += e.n;

@@ -61,18 +61,43 @@ test('insertRows stores rows and getAllRows returns them sorted by timestamp asc
   db.close();
 });
 
-test('duplicate tx_hash for the same wallet+chain is silently ignored (INSERT OR IGNORE dedup)', () => {
+test('REGRESSION: a re-fetch REPLACES a cached row rather than discarding it', () => {
+  // This test previously asserted the opposite -- that the original copy wins
+  // -- on the reasoning that "a re-fetch never corrupts what is cached". That
+  // reasoning was wrong in the case that matters: when a column is added to
+  // the SELECT list, the re-fetched row is RICHER than the cached one, and
+  // keeping the original throws the new data away.
+  //
+  // Measured before the fix: a Force Full Re-sync pulled 5,593,824 Xahau rows,
+  // paid the Payment-Claim for all of them, and kept the new columns on 13,820
+  // -- only the rows that were new transactions anyway. 171 of 174 Remits
+  // still carried no amounts. The re-sync could not do the one job it exists
+  // for.
   const db = createDb(tmpDbPath());
-  const r = { tx_hash: 'DUP', timestamp: '2024-01-01 00:00:00', raw_json: JSON.stringify(row('2024-01-01 00:00:00', { v: 'first' })) };
+  const r = { tx_hash: 'DUP', timestamp: '2024-01-01 00:00:00',
+              raw_json: JSON.stringify(row('2024-01-01 00:00:00', { v: 'first' })) };
   db.insertRows('rWALLET', 'XRPL', [r]);
-  // Re-fetch the same row (simulating an overlapping incremental window) with different payload —
-  // the ORIGINAL stored copy should win, since this proves a re-fetch never corrupts what's cached.
-  const rAgain = { tx_hash: 'DUP', timestamp: '2024-01-01 00:00:00', raw_json: JSON.stringify(row('2024-01-01 00:00:00', { v: 'second' })) };
-  const insertedSecondTime = db.insertRows('rWALLET', 'XRPL', [rAgain]);
-  assert.strictEqual(insertedSecondTime, 0, 'duplicate insert should report 0 newly-inserted rows');
+
+  const richer = { tx_hash: 'DUP', timestamp: '2024-01-01 00:00:00',
+                   raw_json: JSON.stringify(row('2024-01-01 00:00:00', { v: 'second', Fee_Drops: '12' })) };
+  const written = db.insertRows('rWALLET', 'XRPL', [richer]);
+  assert.strictEqual(written, 1, 'a changed row counts as written');
   const all = db.getAllRows('rWALLET', 'XRPL');
-  assert.strictEqual(all.length, 1);
-  assert.strictEqual(all[0].v, 'first');
+  assert.strictEqual(all.length, 1, 'still one row — the key still dedupes');
+  assert.strictEqual(all[0].v, 'second', 'the NEWER fetch wins');
+  assert.strictEqual(all[0].Fee_Drops, '12', 'and the column that was missing is now there');
+  db.close();
+});
+
+test('an identical re-fetch is still a no-op, so a routine sync reports nothing', () => {
+  // The guard against churn: without it, every incremental sync would rewrite
+  // fetched_at across millions of unchanged rows and report them all as work.
+  const db = createDb(tmpDbPath());
+  const r = { tx_hash: 'SAME', timestamp: '2024-01-01 00:00:00',
+              raw_json: JSON.stringify(row('2024-01-01 00:00:00', { v: 'x' })) };
+  assert.strictEqual(db.insertRows('rWALLET', 'XRPL', [r]), 1);
+  assert.strictEqual(db.insertRows('rWALLET', 'XRPL', [r]), 0, 'byte-identical re-fetch writes nothing');
+  assert.strictEqual(db.getAllRows('rWALLET', 'XRPL').length, 1);
   db.close();
 });
 

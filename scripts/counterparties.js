@@ -40,9 +40,21 @@ const fs = require('fs');
 const { parseArgs, openCache, decodeCurrency } = require('./iou-inventory');
 
 let min = 0;
+// addr -> recipient NAME. The annual exclusion is measured per PERSON per
+// year, not per address, and one person can hold several: two daughters here
+// have an XRPL address each AND a Xaman Tangem card each. Grouping by address
+// would show four recipients under the limit where there are two over it.
+const giftOf = new Map();
 const argv = [];
 for (let i = 0; i < process.argv.length; i++) {
   if (process.argv[i] === '--min') { min = parseFloat(process.argv[++i]) || 0; continue; }
+  if (process.argv[i] === '--gift') {
+    for (const pair of String(process.argv[++i] || '').split(',')) {
+      const [a, who] = pair.split('=').map(x => (x || '').trim());
+      if (a) giftOf.set(a, who || a.slice(0, 10) + '…');
+    }
+    continue;
+  }
   argv.push(process.argv[i]);
 }
 const args = parseArgs(argv);
@@ -60,6 +72,7 @@ const pick = (...v) => { for (const x of v) { const s = String(x ?? '').trim(); 
 
 // dest -> { assets: Map(asset -> {qty,n}), first, last, paidUsBack, chains:Set }
 const out = new Map();
+const giftYear = new Map();   // "recipient|year" -> what they were given
 let scanned = 0;
 
 for (const chain of chains) {
@@ -74,7 +87,8 @@ for (const chain of chains) {
     if (raw.Destination === r.wallet && raw.Account && !own.has(raw.Account)) {
       const e = out.get(raw.Account);
       if (e) e.paidUsBack++;
-      else out.set(raw.Account, { assets: new Map(), first: '', last: '', paidUsBack: 1, chains: new Set([chain]) });
+      else out.set(raw.Account, { assets: new Map(), first: '', last: '', paidUsBack: 1,
+                                  chains: new Set([chain]), tags: new Map() });
     }
     if (raw.Account !== r.wallet) continue;
     const dest = raw.Destination || '';
@@ -86,8 +100,31 @@ for (const chain of chains) {
     const asset = cur || native;
     if (!qty) continue;
 
+    // A gift realises nothing for the donor, so it never belongs in the
+    // disposal list -- but it DOES need tracking by recipient and year for
+    // the annual exclusion.
+    if (giftOf.has(dest)) {
+      const who = giftOf.get(dest);
+      const yr = String(r.timestamp).slice(0, 4);
+      const k = who + '|' + yr;
+      const g = giftYear.get(k) || { who, yr, assets: new Map(), n: 0, addrs: new Set() };
+      g.n++; g.addrs.add(dest);
+      const ga = g.assets.get(cur || native) || { qty: 0, n: 0 };
+      ga.qty += qty; ga.n++;
+      g.assets.set(cur || native, ga);
+      giftYear.set(k, g);
+      continue;
+    }
+
     let e = out.get(dest);
-    if (!e) { e = { assets: new Map(), first: '', last: '', paidUsBack: 0, chains: new Set() }; out.set(dest, e); }
+    if (!e) { e = { assets: new Map(), first: '', last: '', paidUsBack: 0, chains: new Set(),
+                    tags: new Map() }; out.set(dest, e); }
+    // A shared exchange address serves many accounts; the destination tag is
+    // what says WHOSE. Two sends to one Coinbase address can be one deposit to
+    // yourself and one gift to a relative, and only the tag separates them.
+    const tag = String(raw.DestinationTag ?? '').trim();
+    if (!e.tags) e.tags = new Map();
+    if (tag && tag !== '0') e.tags.set(tag, (e.tags.get(tag) || 0) + 1);
     e.chains.add(chain);
     const a = e.assets.get(asset) || { qty: 0, n: 0 };
     a.qty += qty; a.n++;
@@ -98,6 +135,30 @@ for (const chain of chains) {
   }
 }
 db.close();
+
+if (giftYear.size) {
+  console.log('\n' + '='.repeat(74));
+  console.log('GIFTS BY RECIPIENT AND YEAR — the unit the annual exclusion measures');
+  console.log('='.repeat(74));
+  const EXCLUSION = { 2021: 15000, 2022: 16000, 2023: 17000, 2024: 18000, 2025: 19000, 2026: 19000 };
+  for (const g of [...giftYear.values()].sort((a, b) => a.who.localeCompare(b.who) || a.yr.localeCompare(b.yr))) {
+    console.log(`\n  ${g.who} — ${g.yr}   (${g.n} payment(s) across ${g.addrs.size} address(es))`);
+    for (const [a, v] of [...g.assets].sort((x, y) => y[1].qty - x[1].qty)) {
+      console.log(`      ${v.qty.toLocaleString(undefined, { maximumFractionDigits: 6 }).padStart(20)}  ${a}`);
+    }
+    const lim = EXCLUSION[g.yr];
+    if (lim) console.log(`      annual exclusion for ${g.yr}: $${lim.toLocaleString()} per recipient`);
+  }
+  console.log('\n  This tool does NOT price any of it — a made-up price is worse than');
+  console.log('  none. Value each line at FMV on its own date and compare the RECIPIENT');
+  console.log('  YEAR TOTAL, not any single transfer, against the exclusion above.');
+  console.log('  Over it, a Form 709 is required: a filing, not a tax bill, drawing');
+  console.log('  against the lifetime exemption. Gift-splitting with a spouse doubles');
+  console.log('  the exclusion and is not modelled here.');
+  console.log('\n  None of these are disposals. You realise no gain giving property away;');
+  console.log('  the recipient takes your basis under IRC 1015(a) and your holding');
+  console.log('  period tacks onto theirs.');
+}
 
 const rows = [...out].filter(([, e]) => e.assets.size);
 // Rank by the largest single-asset quantity, so a 20,000 XRP send cannot hide
@@ -123,17 +184,25 @@ for (const [d, e] of rows) {
     console.log(`    ${f(v.qty).padStart(22)}  ${a.padEnd(18)} in ${v.n} payment(s)`);
   }
   if (big.length > 6) console.log(`    ...and ${big.length - 6} more asset(s)`);
+  if (e.tags && e.tags.size) {
+    const tg = [...e.tags].sort((x, y) => y[1] - x[1]);
+    console.log(`    destination tag(s): ` +
+      tg.slice(0, 6).map(([t, n]) => `${t} (x${n})`).join('  ') +
+      (tg.length > 6 ? `  ...and ${tg.length - 6} more` : ''));
+    if (tg.length > 1) console.log(`      >1 tag = MORE THAN ONE ACCOUNT behind this address. Split it before classifying.`);
+  }
   console.log('');
 }
 console.log(`${shown} shown${min ? ` (min ${min})` : ''}.`);
 
 if (args.csv) {
   const esc = (v) => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-  const lines = ['Destination,Chains,Asset,Quantity,Payments,First,Last,Round Trip Payments Back'];
+  const lines = ['Destination,Chains,Asset,Quantity,Payments,First,Last,Round Trip Payments Back,Destination Tags'];
   for (const [d, e] of rows) {
     for (const [a, v] of e.assets) {
       lines.push([d, [...e.chains].join('+'), a, v.qty, v.n,
-                  e.first.slice(0, 19), e.last.slice(0, 19), e.paidUsBack].map(esc).join(','));
+                  e.first.slice(0, 19), e.last.slice(0, 19), e.paidUsBack,
+                  e.tags ? [...e.tags.keys()].join(' ') : ''].map(esc).join(','));
     }
   }
   fs.writeFileSync(args.csv, lines.join('\n') + '\n');

@@ -54,3 +54,6 @@ Claude outputs/
 # counterparties.js --out. Addresses and amounts.
 Counterparties-*.csv
 counterparties*.csv
+
+# Gift register worksheet. Recipient names, addresses, amounts.
+Gift-Register*.xlsx

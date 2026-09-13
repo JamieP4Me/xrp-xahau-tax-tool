@@ -146,9 +146,31 @@ function makeApi(db) {
       VALUES (@wallet, @chain, NULL, @last_synced_at)
       ON CONFLICT(wallet, chain) DO UPDATE SET last_synced_at = excluded.last_synced_at
     `),
+    // UPSERT, not INSERT OR IGNORE.
+    //
+    // OR IGNORE silently discarded any row already cached, which made a
+    // "Force Full Re-sync" incapable of the one job it exists for: backfilling
+    // columns added to the SELECT list after the cache was built. Measured on
+    // the real cache: a full re-sync fetched 5,593,824 Xahau rows, paid the
+    // Payment-Claim for every one of them, and kept the new columns on only
+    // 13,820 — the rows that happened to be new transactions. 171 of 174
+    // Remits still carried no amounts, and fees existed for 2026 alone.
+    //
+    // The WHERE clause keeps it a no-op when the content is byte-identical, so
+    // an ordinary incremental sync still reports only genuinely changed rows
+    // and does not churn fetched_at across millions of rows.
+    //
+    // Safe on the primary key because makeTxHash() is deterministic: a real
+    // TransactionHash where one exists, and a stable (timestamp + wallet)
+    // otherwise. The same transaction always lands on the same key.
     insertRow: db.prepare(`
-      INSERT OR IGNORE INTO raw_transactions (wallet, chain, tx_hash, timestamp, raw_json, fetched_at)
+      INSERT INTO raw_transactions (wallet, chain, tx_hash, timestamp, raw_json, fetched_at)
       VALUES (@wallet, @chain, @tx_hash, @timestamp, @raw_json, @fetched_at)
+      ON CONFLICT(wallet, chain, tx_hash) DO UPDATE SET
+        timestamp  = excluded.timestamp,
+        raw_json   = excluded.raw_json,
+        fetched_at = excluded.fetched_at
+      WHERE raw_transactions.raw_json <> excluded.raw_json
     `),
     getAllRows: db.prepare(`
       SELECT raw_json FROM raw_transactions
@@ -240,6 +262,9 @@ function makeApi(db) {
   // would write every row with wallet='XRPL' and chain='rXXXX…'. No error, no
   // constraint violation, and the existing tests would still pass, because
   // they read back through the same swapped convention.
+  // Returns rows WRITTEN — inserted plus updated — not rows newly created.
+  // A re-sync that refreshes a cached row with richer columns has done real
+  // work and must not report zero.
   const insertRowsTxn = db.transaction((wallet, chain, rows, nowIso) => {
     let inserted = 0;
     for (const r of rows) {
