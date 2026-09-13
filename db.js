@@ -128,39 +128,39 @@ function openDb(dbPath) {
 function makeApi(db) {
   // ── tx_type: the filter that stops the ledger reading rows it discards ──
   //
-  // The FIFO build pages over EVERY row for a chain, JSON.parses each one, and
-  // ships it across the Electron IPC boundary — 6,346,236 objects on this
-  // cache. Only then does it decide what to do with them. Two large groups are
-  // thrown away after all that work:
+  // ADD COLUMN is O(1) on a virtual generated column: SQLite records the
+  // expression in the schema and computes it on read. It is safe to run at
+  // startup on a cache of any size.
   //
-  //   749,529  URITokenBuy, removed from FETCH_TYPES_XAHAU after measuring
-  //            that not one carries a recoverable amount. They stay in the
-  //            cache from earlier runs and are parsed on every single build.
-  //   varies   rows whose wallet is not a fetchable own wallet, dropped by
-  //            isFetchableOwnWallet() after being parsed and marshalled.
+  // CREATING THE INDEX IS NOT, AND MUST NOT HAPPEN HERE.
   //
-  // SQLite has JSON1 built in, so the transaction type can be a generated
-  // column. ALTER TABLE cannot add a STORED one, but a VIRTUAL column can be
-  // INDEXED, and building that index materialises the values — so filtering
-  // becomes an index seek instead of 6.3M json_extract calls at query time.
+  // The first version of this built the index at startup. better-sqlite3 is
+  // synchronous, so that blocked the Electron main process while SQLite ran
+  // json_extract over 6,348,182 rows — and the app opened to a blank window
+  // because main never got far enough to load the renderer. "Tens of seconds"
+  // was a guess, stated as if measured, in a startup path where being wrong
+  // means the application does not start.
   //
-  // Nothing is deleted and no row becomes unreachable: the unfiltered page
-  // query is still there, and the caller chooses.
+  // So the index is built by an explicit offline step (npm run cache:optimise)
+  // and this only ever looks to see whether it is there. No index, no filter:
+  // getChainRowsPage falls back to reading everything, exactly as before.
   try {
     const cols = db.prepare('PRAGMA table_info(raw_transactions)').all().map(c => c.name);
     if (!cols.includes('tx_type')) {
       db.exec(`ALTER TABLE raw_transactions ADD COLUMN tx_type TEXT
                GENERATED ALWAYS AS (json_extract(raw_json, '$.TransactionType')) VIRTUAL`);
     }
-    // On a 6M-row cache this builds once, at first launch after upgrading, and
-    // takes tens of seconds. Every later launch finds it already there.
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_raw_tx_chain_type_ts
-             ON raw_transactions(chain, tx_type, timestamp, wallet, tx_hash)`);
   } catch (e) {
-    // An older SQLite without generated-column support must still open the
-    // cache. The filtered path simply stays unavailable.
     if (!/generated|syntax|duplicate column/i.test(String(e && e.message))) throw e;
   }
+
+  // Present only after the offline optimise step has run.
+  let hasTypeIndex = false;
+  try {
+    hasTypeIndex = !!db.prepare(
+      `SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_raw_tx_chain_type_ts'`
+    ).get();
+  } catch (e) { hasTypeIndex = false; }
 
   const stmts = {
     getMeta: db.prepare('SELECT value FROM app_meta WHERE key = ?'),
@@ -438,11 +438,24 @@ function makeApi(db) {
 
     /** @returns {number} total cached rows for one chain, across every wallet */
     countForChain(chain, types) {
-      if (!Array.isArray(types) || types.length === 0) return stmts.countForChain.get(chain).n;
+      if (!hasTypeIndex || !Array.isArray(types) || types.length === 0) {
+        return stmts.countForChain.get(chain).n;
+      }
       const holes = types.map(() => '?').join(',');
       return db.prepare(
         `SELECT COUNT(*) AS n FROM raw_transactions WHERE chain = ? AND tx_type IN (${holes})`
       ).get(chain, ...types).n;
+    },
+
+    /** Whether the offline optimise step has run on this cache. */
+    hasTypeIndex() { return hasTypeIndex; },
+
+    /** Build the type index. Minutes on a large cache — never call at startup. */
+    buildTypeIndex() {
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_raw_tx_chain_type_ts
+               ON raw_transactions(chain, tx_type, timestamp, wallet, tx_hash)`);
+      hasTypeIndex = true;
+      return true;
     },
 
     /** Rows by transaction type, so a filter can show its own working. */
@@ -477,7 +490,10 @@ function makeApi(db) {
      * changes the set of rows the tax engine sees unless a caller asks.
      */
     getChainRowsPage(chain, limit, cursor, types) {
-      const useFilter = Array.isArray(types) && types.length > 0;
+      // Without the index, `tx_type IN (...)` means json_extract on every row
+      // at query time — slower than reading everything. Refuse rather than
+      // make it worse.
+      const useFilter = hasTypeIndex && Array.isArray(types) && types.length > 0;
       let raw;
       if (useFilter) {
         const holes = types.map(() => '?').join(',');

@@ -103,6 +103,32 @@ test('an identical re-fetch is still a no-op, so a routine sync reports nothing'
 
 
 // ── the type filter that stops the ledger reading rows it discards ────────
+
+test('REGRESSION: the type filter is REFUSED until its index exists', () => {
+  // Without the index, tx_type IN (...) runs json_extract over every row at
+  // query time — slower than no filter at all. And the index cannot be built
+  // at startup: doing so blocked the Electron main process across 6.3M rows
+  // and the app opened to a blank window. So the filter must degrade to the
+  // old behaviour rather than quietly become the slow path.
+  const db = createDb(tmpDbPath());
+  const mk = (h, ts, type) => ({ tx_hash: h, timestamp: ts,
+    raw_json: JSON.stringify(row(ts, { TransactionType: type })) });
+  db.insertRows('rW', 'Xahau', [
+    mk('A', '2024-01-01 00:00:01', 'Payment'),
+    mk('B', '2024-01-01 00:00:02', 'URITokenBuy'),
+  ]);
+  assert.strictEqual(db.hasTypeIndex(), false, 'a fresh cache is not optimised');
+  assert.strictEqual(db.getChainRowsPage('Xahau', 100, null, ['Payment']).rows.length, 2,
+    'the filter is ignored, so nothing is lost — it is only not faster');
+  assert.strictEqual(db.countForChain('Xahau', ['Payment']), 2, 'the count agrees with it');
+
+  db.buildTypeIndex();
+  assert.strictEqual(db.hasTypeIndex(), true);
+  assert.strictEqual(db.getChainRowsPage('Xahau', 100, null, ['Payment']).rows.length, 1,
+    'and now it filters');
+  db.close();
+});
+
 test('getChainRowsPage with a type list reads ONLY those types', () => {
   const db = createDb(tmpDbPath());
   const mk = (h, ts, type) => ({ tx_hash: h, timestamp: ts,
@@ -114,6 +140,7 @@ test('getChainRowsPage with a type list reads ONLY those types', () => {
     mk('D', '2024-01-01 00:00:04', 'URITokenBuy'),
   ]);
   assert.strictEqual(db.countForChain('Xahau'), 4, 'everything is still cached');
+  db.buildTypeIndex();   // the filter is refused until this has run
   assert.strictEqual(db.countForChain('Xahau', ['Payment', 'Remit']), 2);
 
   const page = db.getChainRowsPage('Xahau', 100, null, ['Payment', 'Remit']);
@@ -147,6 +174,7 @@ test('the filtered page keeps its global chronological order and paginates', () 
                                 mk('C', '2024-01-01 00:00:03', 'Payment')]);
   db.insertRows('rB', 'Xahau', [mk('B', '2024-01-01 00:00:02', 'Payment'),
                                 mk('X', '2024-01-01 00:00:02', 'URITokenBuy')]);
+  db.buildTypeIndex();
   const seen = [];
   let cursor = null;
   for(;;) {
