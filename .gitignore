@@ -50,3 +50,7 @@ IOU-Inventory-*.csv
 
 # Screenshots and scratch dropped in by hand.
 Claude outputs/
+
+# counterparties.js --out. Addresses and amounts.
+Counterparties-*.csv
+counterparties*.csv

@@ -2941,6 +2941,49 @@ async function fetchXahauWinDB(claim, year) {
     'TransactionResult', // tesSUCCESS filter
     'Flags',
     'DestinationTag',
+    // ── Added 2026-09-13, after asking the schema instead of guessing ──
+    // Every one of these answers a question this project could not answer
+    // from the data it had. `npm run windb:schema` confirmed each exists
+    // before it was added here; the last time a column went in on a guess
+    // (Asset_currency) it cost a full overnight re-sync and recovered
+    // nothing.
+    'Fee_Drops',        // THE transaction fee. 4,768,506 signed transactions
+                        // across 54 Evernode hosts, every one costing XAH,
+                        // and it is the hosting business's largest countable
+                        // operating expense. Nothing in the cache measured it.
+    'SourceTag',        // with DestinationTag, splits a shared exchange
+                        // address between "my own deposit" and "a gift to
+                        // someone else". Without it a 10,000 XRP gift to a
+                        // relative at a Coinbase address is indistinguishable
+                        // from a transfer to yourself — and both are
+                        // currently booked as taxable sales at market value.
+    'CTID',             // stable per-transaction identity. TransactionHash is
+                        // 64 NUL bytes on whole classes of cached rows, so
+                        // there is presently no way to look one up on a
+                        // ledger explorer or to key a cache row reliably.
+    'Memos',            // frequently carries the purpose of a transfer, which
+                        // is exactly what separates a gift from a sale.
+    'InvoiceID',        // sometimes used as a destination tag substitute.
+    'SendMax_XRP',      // what a cross-currency payment COST. Buying a token
+    'SendMax_value',    // with XRP moves the XRP out via SendMax, not Amount,
+    'SendMax_currency', // so the cost basis of every such purchase — and the
+    'SendMax_issuer',   // matching XRP disposal — was invisible.
+    'Amount2_XRP',      // AMM two-asset deposits and withdrawals move TWO
+    'Amount2_value',    // assets. Only Amount was ever read, so a two-sided
+    'Amount2_currency', // operation was recorded at half its size.
+    'Amount2_issuer',
+    'LPTokenIn_value',  // AMM LP tokens in and out — what a deposit bought
+    'LPTokenIn_currency',
+    'LPTokenOut_value', // and what a withdrawal surrendered.
+    'LPTokenOut_currency',
+    'Amounts',          // XAHAU ONLY. Remit's payload is an ARRAY of amounts,
+    'Amounts_count',    // and the flattened export has one scalar slot, so all
+    'AmountEntry',      // 171 Remits carry NO figure at all. Every acquisition
+                        // on the onexah platform arrived this way and has no
+                        // recorded date, quantity or basis.
+    'URITokenID',       // XAHAU ONLY. Evernode lease and reputation tokens —
+    'URITokenIDs',      // 749,529 URITokenBuys are the reputation mechanism,
+    'MintURIToken_URI', // and nothing identified WHICH token each one bought.
     // Columns read only by derivableAmount(), spliced in from one shared list
     // so this query and the XRPL one below cannot drift apart. The first cut
     // of the curated fetch omitted them, and every AMMDeposit and Import
@@ -4186,8 +4229,49 @@ async function fetchXRPLWinDB(claim) {
     // skips XRPL DEX trades entirely (see buildRelevantTaxRows) — rows already
     // cached before this was added still lack them, so a Force Full Re-sync is
     // what backfills them.
-    'TakerGets_XRP','TakerGets_value','TakerGets_currency',
-    'TakerPays_XRP','TakerPays_value','TakerPays_currency',
+    'TakerGets_XRP','TakerGets_value','TakerGets_currency','TakerGets_issuer',
+    'TakerPays_XRP','TakerPays_value','TakerPays_currency','TakerPays_issuer',
+    'Flags',
+    // DestinationTag was in the Xahau list but NOT here, and the gift that
+    // needs it — 10,000 XRP to a relative's Coinbase account — is an XRPL
+    // transaction. The XRPL table has the column; this query just never
+    // asked for it.
+    'DestinationTag',
+    // ── Added 2026-09-13, after asking the schema instead of guessing ──
+    // Every one of these answers a question this project could not answer
+    // from the data it had. `npm run windb:schema` confirmed each exists
+    // before it was added here; the last time a column went in on a guess
+    // (Asset_currency) it cost a full overnight re-sync and recovered
+    // nothing.
+    'Fee_Drops',        // THE transaction fee. 4,768,506 signed transactions
+                        // across 54 Evernode hosts, every one costing XAH,
+                        // and it is the hosting business's largest countable
+                        // operating expense. Nothing in the cache measured it.
+    'SourceTag',        // with DestinationTag, splits a shared exchange
+                        // address between "my own deposit" and "a gift to
+                        // someone else". Without it a 10,000 XRP gift to a
+                        // relative at a Coinbase address is indistinguishable
+                        // from a transfer to yourself — and both are
+                        // currently booked as taxable sales at market value.
+    'CTID',             // stable per-transaction identity. TransactionHash is
+                        // 64 NUL bytes on whole classes of cached rows, so
+                        // there is presently no way to look one up on a
+                        // ledger explorer or to key a cache row reliably.
+    'Memos',            // frequently carries the purpose of a transfer, which
+                        // is exactly what separates a gift from a sale.
+    'InvoiceID',        // sometimes used as a destination tag substitute.
+    'SendMax_XRP',      // what a cross-currency payment COST. Buying a token
+    'SendMax_value',    // with XRP moves the XRP out via SendMax, not Amount,
+    'SendMax_currency', // so the cost basis of every such purchase — and the
+    'SendMax_issuer',   // matching XRP disposal — was invisible.
+    'Amount2_XRP',      // AMM two-asset deposits and withdrawals move TWO
+    'Amount2_value',    // assets. Only Amount was ever read, so a two-sided
+    'Amount2_currency', // operation was recorded at half its size.
+    'Amount2_issuer',
+    'LPTokenIn_value',  // AMM LP tokens in and out — what a deposit bought
+    'LPTokenIn_currency',
+    'LPTokenOut_value', // and what a withdrawal surrendered.
+    'LPTokenOut_currency',
     // Read only by derivableAmount() — see the note in the Xahau column list.
     ...DERIVED_AMOUNT_COLS].filter(c => {
       const schema = window._windbSchema || [];
