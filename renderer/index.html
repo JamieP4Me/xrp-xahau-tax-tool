@@ -2305,7 +2305,7 @@ const UNVALUED_REASON = {
   PaymentChannelCreate: 'payment channel funded — locked, not yet transferred',
   PaymentChannelFund:   'payment channel topped up — locked, not yet transferred',
   PaymentChannelClaim:  'payment channel claimed — this is where value actually moves',
-  Remit:                'Xahau multi-purpose transfer — amounts are in a nested field',
+  Remit:                'Xahau multi-purpose transfer — the nested payload IS now read: native XAH legs are counted above, and token legs are itemised under “assets moved” below. The tokens are not booked, because an LP receipt token’s basis is the value of what was deposited to get it, and that lives in a separate transaction this one does not name',
   Import:               'XRP burned on XRPL, XAH minted on Xahau',
   URITokenBuy:          'URIToken purchased — consideration when priced',
 };
@@ -2352,6 +2352,11 @@ function recordUnvalued(chain, wallet, row, txId, dk, dateStr, yr, knownQty, kno
     src: row.Account ?? '', dest: row.Destination ?? '',
     qty: (knownQty != null && isFinite(knownQty) && knownQty > 0) ? knownQty : null,
     ticker: knownTicker || null,
+    // What this transaction moved BESIDES any native leg. Empty for every
+    // type but Remit today. Without it the table reports "no amount" on ~140
+    // rows that moved real quantities of real tokens -- true of XAH, and
+    // thoroughly misleading about the transaction.
+    legs: t === 'Remit' ? remitLegs(row.Amounts).tokens : [],
     amountSrc: measured ? 'ledger' : (knownQty != null ? 'windb' : ''),
     submitted: measured && imported.submitted != null ? imported.submitted : null,
     reason: noXrpLeg
@@ -2390,6 +2395,11 @@ function recordUnvalued(chain, wallet, row, txId, dk, dateStr, yr, knownQty, kno
 // Amount_issuer instead. That single fact replaces the whole guard.
 const DERIVED_AMOUNT_COLS = [
   'win_Import_MintedXAH',  // Import: XAH minted on this chain
+  'Amounts',               // Remit: the nested STArray payload. Xahau only --
+                           // the XRPL query filters it against the live schema
+                           // -- but it belongs here rather than in the Xahau
+                           // list alone, because this is the list the column
+                           // test checks against what derivableAmount() reads.
 ];
 
 // Best-effort amount, from the columns proven — by inspecting real cached
@@ -2405,6 +2415,53 @@ const DERIVED_AMOUNT_COLS = [
 // Returns null where nothing holds the amount. Never 0: a zero would read as
 // "nothing moved", which is the one answer that is actively wrong rather than
 // merely absent.
+// A Remit's Amounts array, split into the two things it can carry.
+//
+// Xahau's Remit (XLS-55d) puts its payload in an STArray, not in the flat
+// Amount_* slots every other type uses. WinDB exports it as a real nested
+// array under `Amounts`, and the flat columns are all zero on these rows --
+// which is why 174 Remits reported no amount while the figures sat in the
+// cache the whole time.
+//
+// TWO THINGS MEASURED ON THE REAL ROWS, both of which a plausible
+// implementation gets wrong:
+//
+//   THE KEYS ARE NOT THE XRPL ONES. An entry reads
+//     {"XRP":0,"token_value":999.997655,"token_issuer":"r...","token_currency":"LXH"}
+//   -- token_value / token_currency / token_issuer, NOT value / currency /
+//   issuer. Reading the XRPL names returns undefined on every row, which is
+//   indistinguishable from "this Remit moved nothing". That is the same
+//   failure as TakerPays_* and Asset_currency before it.
+//
+//   ONE ROW CAN CARRY SEVERAL ENTRIES. 36 of the 174 do; 234 entries across
+//   174 rows. Reading Amounts[0] would drop 60 legs and look correct.
+//
+// Native and token legs are kept APART deliberately. What derivableAmount()
+// returns is priced as XAH downstream, so folding a token quantity into it
+// would report 999.997655 LXH as 999.997655 XAH -- the same species of error
+// as the four already fixed: reading a number without checking what it
+// denominates.
+function remitLegs(amounts) {
+  const out = { native: 0, tokens: [] };
+  let arr = amounts;
+  // The value survives IPC as a real array. A path that stringifies on the
+  // way through would hand over text instead, and the difference is invisible
+  // until it silently yields nothing. Parsing is cheap; assuming is not.
+  if(typeof arr === 'string') { try { arr = JSON.parse(arr); } catch(e) { return out; } }
+  if(!Array.isArray(arr)) return out;
+  for(const e of arr) {
+    if(!e || typeof e !== 'object') continue;
+    const xrp = parseFloat(e.XRP);
+    if(Number.isFinite(xrp) && xrp > 0) { out.native += xrp; continue; }
+    const qty = parseFloat(e.token_value);
+    const cur = String(e.token_currency ?? '').trim();
+    if(Number.isFinite(qty) && qty > 0 && cur) {
+      out.tokens.push({ currency: cur, issuer: String(e.token_issuer ?? '').trim(), qty });
+    }
+  }
+  return out;
+}
+
 function derivableAmount(row) {
   const t = row.TransactionType ?? '';
   const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) && n > 0 ? n : null; };
@@ -2430,6 +2487,12 @@ function derivableAmount(row) {
       return num(row.delivered_amount_XRP);
     case 'Import':
       return num(row.win_Import_MintedXAH);
+    // ONLY the native legs. A Remit's token legs are real movements but they
+    // are not XAH, and this function's result is priced as XAH -- see
+    // remitLegs(). row.Amounts is named here rather than hidden behind the
+    // helper so the column test can still see which column this reads.
+    case 'Remit':
+      return num(remitLegs(row.Amounts).native);
     default:
       return null;
   }
@@ -2991,9 +3054,12 @@ async function fetchXahauWinDB(claim, year) {
     ...DERIVED_AMOUNT_COLS,
   ];
   // Only include columns that actually exist in schema
-  const safeCols = cols
+  // Deduped: 'Amounts' appears in the documented list above AND arrives again
+  // via DERIVED_AMOUNT_COLS, because derivableAmount() reads it. Asking for
+  // the same column twice is noise at best.
+  const safeCols = [...new Set(cols
     ? wantCols.filter(c => cols.includes(c))
-    : wantCols;
+    : wantCols)];
   window._lastSelectedCols = safeCols;
   log(`Selecting ${safeCols.length} cols: ${safeCols.join(', ')}`, 'in');
 
@@ -3907,6 +3973,15 @@ function dataQualityHTML() {
     }
     const order = Object.entries(byType).sort((a,b) => b[1].n - a[1].n);
     const withAmount = unvaluedRows.filter(r => r.qty != null).length;
+    // Token legs carried by rows that are not booked. "140 transactions with
+    // no amount" and "3,328 XXX and 29,887 ELP arrived" are different facts,
+    // and only the second one is any use to a preparer.
+    const byAsset = {};
+    for(const r of unvaluedRows) for(const l of (r.legs || [])) {
+      const e = byAsset[l.currency] || (byAsset[l.currency] = { n: 0, qty: 0, issuers: new Set() });
+      e.n++; e.qty += l.qty; if(l.issuer) e.issuers.add(l.issuer);
+    }
+    const assets = Object.entries(byAsset).sort((a,b) => b[1].n - a[1].n);
     parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#fff3e0;border:2px solid #b06000;border-radius:4px;font-size:11px;color:#5a3200">
       <strong>⚠ ${unvaluedRows.length.toLocaleString()} transaction(s) are in your history but NOT on Form 8949.</strong><br>
       These are transaction types this tool now fetches but does not yet book — each one has tax treatment
@@ -3928,6 +4003,20 @@ function dataQualityHTML() {
           <td style="padding:3px 6px">${UNVALUED_REASON[t] || 'type not yet handled by the tax engine'}</td>
         </tr>`).join('')}
       </table>
+      ${assets.length ? `<div style="margin-top:8px"><strong>Assets these transactions moved</strong> —
+        the quantities and dates are recorded; what they were worth is not, and this tool does not guess it.</div>
+      <table style="margin:6px 0;border-collapse:collapse;font-size:10px;width:100%">
+        <tr style="background:#f3e0c8"><th style="text-align:left;padding:3px 6px">Asset</th>
+          <th style="text-align:right;padding:3px 6px">Legs</th>
+          <th style="text-align:right;padding:3px 6px">Units</th>
+          <th style="text-align:right;padding:3px 6px">Issuers</th></tr>
+        ${assets.map(([c,v]) => `<tr style="border-top:1px solid #e0cba8">
+          <td style="padding:3px 6px"><code>${c}</code></td>
+          <td style="padding:3px 6px;text-align:right">${v.n.toLocaleString()}</td>
+          <td style="padding:3px 6px;text-align:right">${v.qty.toLocaleString(undefined,{maximumFractionDigits:6})}</td>
+          <td style="padding:3px 6px;text-align:right">${v.issuers.size}</td>
+        </tr>`).join('')}
+      </table>` : ''}
       <strong>Give this list to your preparer.</strong> It is the complete set of activity the reported figures
       leave out, which is exactly what a return needs disclosed rather than discovered later.
       <div style="margin-top:6px"><button class="sml" style="background:#b06000;color:#fff;border-color:#b06000" onclick="exportUnvaluedCSV()">⬇ Not-on-8949 Transactions (CSV)</button></div>
@@ -5969,13 +6058,16 @@ function exportUnvaluedCSV() {
   // this file has to be able to tell the two apart, and to see the gap where
   // both exist.
   const lines = [
-    'Date,Year,Chain,Type,Amount,Ticker,Amount Source,Submitted Amount,From,To,Wallet,TX Hash,Why not on Form 8949',
+    'Date,Year,Chain,Type,Amount,Ticker,Amount Source,Submitted Amount,Assets Moved,From,To,Wallet,TX Hash,Why not on Form 8949',
     ...rows.map(r => [
       `"${r.dateStr}"`, r.year, r.chain, r.type,
       r.qty != null ? r.qty : '',
       r.qty != null ? (r.ticker || '') : '',
       r.amountSrc === 'ledger' ? 'XRP Ledger metadata' : (r.amountSrc === 'windb' ? 'WinDB (requested)' : ''),
       r.submitted != null ? r.submitted : '',
+      // Token legs, semicolon-separated. A Remit that moved LP tokens and no
+      // XAH has a blank Amount, and everything it actually did lives here.
+      `"${(r.legs || []).map(l => `${l.qty} ${l.currency}`).join('; ')}"`,
       `"${r.src}"`, `"${r.dest}"`, `"${r.wallet}"`, `"${r.hash}"`,
       `"${r.reason}"`,
     ].join(','))

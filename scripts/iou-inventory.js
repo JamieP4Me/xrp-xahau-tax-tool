@@ -189,8 +189,23 @@ function nonNativeLegs(raw) {
   } else if (t === 'OfferCreate') {
     add(raw.TakerGets_currency, raw.TakerGets_issuer, raw.TakerGets_value, 'sold (TakerGets)');
     add(raw.TakerPays_currency, raw.TakerPays_issuer, raw.TakerPays_value, 'bought (TakerPays)');
+  } else if (t === 'Remit') {
+    // Xahau's Remit carries an STArray, not the flat Amount_* slots. The
+    // catch-all below reads Amount_currency, which is EMPTY on all 174 real
+    // Remits -- so every one of them produced no leg at all and the whole
+    // onexah LP position was invisible to this inventory.
+    //
+    // The entry keys are token_value / token_currency / token_issuer, NOT
+    // value / currency / issuer, and 36 of the 174 rows carry more than one
+    // entry (234 entries in total), so Amounts[0] silently drops 60 legs.
+    let arr = raw.Amounts;
+    if (typeof arr === 'string') { try { arr = JSON.parse(arr); } catch (e) { arr = null; } }
+    for (const e of (Array.isArray(arr) ? arr : [])) {
+      if (!e || typeof e !== 'object') continue;
+      add(e.token_currency, e.token_issuer, e.token_value, 'remit');
+    }
   } else {
-    // Any other type that carries an Amount — AMM, escrow, check, remit.
+    // Any other type that carries an Amount — AMM, escrow, check.
     add(raw.Amount_currency, raw.Amount_issuer, raw.Amount_value, t);
   }
   return legs;

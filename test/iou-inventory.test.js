@@ -136,6 +136,88 @@ test('a type the engine never books still reports its IOU amount', () => {
   assert.strictEqual(legs[0].role, 'CheckCash');
 });
 
+
+// ── Remit: the STArray payload ────────────────────────────────────────────
+//
+// These fixtures are the shape the real cache stores, copied from a verbatim
+// dump of rows in the live cache rather than from the XLS-55d spec: the entry
+// keys are token_value / token_currency / token_issuer, and a native leg puts
+// its figure under XRP. Reading the XRPL names (value / currency / issuer)
+// returns undefined on every one, which is indistinguishable from a Remit
+// that moved nothing — which is precisely how 174 of them stayed invisible.
+
+test('a Remit token leg is read from the nested Amounts array', () => {
+  const legs = nonNativeLegs({
+    TransactionType: 'Remit',
+    Amount_currency: '', Amount_issuer: '', Amount_value: 0,   // empty, as WinDB stores it
+    Amounts: [{ XRP: 0, token_value: 999.997655,
+                token_issuer: 'rTESTissuerXAHAU11111111111111111',
+                token_currency: 'LXH' }],
+  });
+  assert.strictEqual(legs.length, 1, 'the flat Amount_* columns are empty; the figure is nested');
+  assert.strictEqual(legs[0].currency, 'LXH');
+  assert.strictEqual(legs[0].qty, 999.997655);
+  assert.strictEqual(legs[0].issuer, 'rTESTissuerXAHAU11111111111111111');
+});
+
+test('EVERY entry is read, not just the first', () => {
+  // 36 of 174 real rows carry more than one entry, 234 entries in total.
+  // Amounts[0] would drop 60 legs and look entirely correct doing it.
+  const legs = nonNativeLegs({
+    TransactionType: 'Remit',
+    Amounts: [
+      { XRP: 0, token_value: 100, token_issuer: 'rTESTissuerONE111111111111111111', token_currency: 'LEV' },
+      { XRP: 0, token_value: 112.021319, token_issuer: 'rTESTissuerTWO111111111111111111', token_currency: 'ELP' },
+      { XRP: 0, token_value: 7, token_issuer: 'rTESTissuerTRE111111111111111111', token_currency: 'RLP' },
+    ],
+  });
+  assert.strictEqual(legs.length, 3, 'all three entries, not Amounts[0]');
+  assert.deepStrictEqual(legs.map(l => l.currency).sort(), ['ELP', 'LEV', 'RLP']);
+});
+
+test('a native XAH leg inside a Remit is NOT reported as a token', () => {
+  // The whole point of the split. XAH is in BOOKED, so the engine already
+  // handles it; emitting it here would double-count it, and emitting it with
+  // a token label would price it against the wrong asset.
+  const legs = nonNativeLegs({
+    TransactionType: 'Remit',
+    Amounts: [{ XRP: 606.5, token_value: 0, token_issuer: '', token_currency: '' }],
+  });
+  assert.strictEqual(legs.length, 0, 'a native leg is not a non-native leg');
+});
+
+test('a mixed Remit yields only its token legs', () => {
+  const legs = nonNativeLegs({
+    TransactionType: 'Remit',
+    Amounts: [
+      { XRP: 606.5, token_value: 0, token_issuer: '', token_currency: '' },
+      { XRP: 0, token_value: 42.5, token_issuer: 'rTESTissuerXAHAU11111111111111111', token_currency: 'XXX' },
+    ],
+  });
+  assert.strictEqual(legs.length, 1);
+  assert.strictEqual(legs[0].currency, 'XXX');
+  assert.strictEqual(legs[0].qty, 42.5);
+});
+
+test('a Remit with no Amounts array produces nothing, and does not throw', () => {
+  // The pre-v1.9.0 cache has no Amounts column at all. Old rows must not
+  // crash the inventory, and must not invent a leg either.
+  assert.deepStrictEqual(nonNativeLegs({ TransactionType: 'Remit' }), []);
+  assert.deepStrictEqual(nonNativeLegs({ TransactionType: 'Remit', Amounts: null }), []);
+  assert.deepStrictEqual(nonNativeLegs({ TransactionType: 'Remit', Amounts: '[object Object]' }), []);
+});
+
+test('a stringified Amounts array is still read', () => {
+  // Defensive: the value survives IPC as a real array today, but a path that
+  // stringifies on the way through would otherwise silently yield nothing.
+  const legs = nonNativeLegs({
+    TransactionType: 'Remit',
+    Amounts: JSON.stringify([{ XRP: 0, token_value: 5, token_issuer: 'rTESTissuerXAHAU11111111111111111', token_currency: 'RVN' }]),
+  });
+  assert.strictEqual(legs.length, 1);
+  assert.strictEqual(legs[0].currency, 'RVN');
+});
+
 // ── against a real SQLite cache ───────────────────────────────────────────
 test('END-TO-END: a synthetic cache is inventoried correctly', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iou-test-'));

@@ -265,6 +265,82 @@ test('an IOU-denominated row yields no amount, because Amount_XRP is how native 
   expect(amt).toBeNull();
 });
 
+// ── Remit's nested payload ────────────────────────────────────────────────
+//
+// For two versions the engine reported `Remit | 173 | 0 with amount`, and the
+// stated reason — "amounts are in a nested field" — was read as "the data is
+// not here". It was here. A verbatim dump of the stored JSON showed all 174
+// rows carrying a real array; what hid it was a probe that printed
+// String(value), which renders both a live array and a dead
+// "[object Object]" string identically.
+//
+// These fixtures are copied from that dump, not from the XLS-55d spec.
+
+test('remitLegs reads the keys the cache actually uses, not the XRPL ones', async () => {
+  const got = await window.evaluate(() => remitLegs(
+    [{ XRP: 0, token_value: 999.997655, token_issuer: 'rTESTissuerXAHAU11111111111111111', token_currency: 'LXH' }]));
+  expect(got.native).toBe(0);
+  expect(got.tokens).toHaveLength(1);
+  expect(got.tokens[0].currency).toBe('LXH');
+  expect(got.tokens[0].qty).toBeCloseTo(999.997655, 6);
+});
+
+test('remitLegs sums EVERY entry — 36 real rows carry more than one', async () => {
+  // 234 entries across 174 rows. Reading Amounts[0] drops 60 legs silently,
+  // which is the failure mode this whole file exists to prevent.
+  const got = await window.evaluate(() => remitLegs([
+    { XRP: 606.5, token_value: 0, token_issuer: '', token_currency: '' },
+    { XRP: 400.25, token_value: 0, token_issuer: '', token_currency: '' },
+    { XRP: 0, token_value: 42.5, token_issuer: 'rTESTissuerXAHAU11111111111111111', token_currency: 'XXX' },
+  ]));
+  expect(got.native).toBeCloseTo(1006.75, 6);
+  expect(got.tokens).toHaveLength(1);
+});
+
+test('a Remit token leg NEVER reaches derivableAmount', async () => {
+  // derivableAmount's result is priced as XAH downstream. Returning a token
+  // quantity here would report 999.997655 LXH as 999.997655 XAH — the same
+  // mistake as the four amount bugs already fixed, in a new place.
+  const got = await window.evaluate(() => derivableAmount({
+    TransactionType: 'Remit',
+    Amounts: [{ XRP: 0, token_value: 999.997655, token_issuer: 'rTESTissuerXAHAU11111111111111111', token_currency: 'LXH' }],
+  }));
+  expect(got, 'a token-only Remit moved no XAH, so there is no native amount to report').toBeNull();
+});
+
+test('a Remit native leg DOES reach derivableAmount, summed across entries', async () => {
+  const got = await window.evaluate(() => derivableAmount({
+    TransactionType: 'Remit',
+    Amounts: [
+      { XRP: 606.5, token_value: 0, token_issuer: '', token_currency: '' },
+      { XRP: 400.25, token_value: 0, token_issuer: '', token_currency: '' },
+    ],
+  }));
+  expect(got).toBeCloseTo(1006.75, 6);
+});
+
+test('a Remit from a pre-v1.9.0 cache row does not throw or invent an amount', async () => {
+  const got = await window.evaluate(() => ({
+    missing: derivableAmount({ TransactionType: 'Remit' }),
+    nulled:  derivableAmount({ TransactionType: 'Remit', Amounts: null }),
+    corpse:  derivableAmount({ TransactionType: 'Remit', Amounts: '[object Object]' }),
+    empty:   derivableAmount({ TransactionType: 'Remit', Amounts: [] }),
+  }));
+  expect(got.missing).toBeNull();
+  expect(got.nulled).toBeNull();
+  expect(got.corpse, 'the stringified corpse must not become a phantom amount').toBeNull();
+  expect(got.empty).toBeNull();
+});
+
+test('the Amounts column is actually fetched on the Xahau query, and asked for once', async () => {
+  // 'Amounts' is named in the documented Xahau list AND arrives via
+  // DERIVED_AMOUNT_COLS. Both are wanted; asking twice is not.
+  // HTML is already read once at the top of this file.
+  expect(HTML.includes("'Amounts',"), 'the Xahau column list must still document it').toBe(true);
+  const deduped = await window.evaluate(() => DERIVED_AMOUNT_COLS.includes('Amounts'));
+  expect(deduped, 'derivableAmount reads row.Amounts, so the shared list must carry it').toBe(true);
+});
+
 test('derivableAmount reads the right column for the types that do have one', async () => {
   const got = await window.evaluate(() => ({
     escrowCreate:  derivableAmount({ TransactionType: 'EscrowCreate', Amount_XRP: '40' }),
