@@ -49,7 +49,9 @@
     "probe:remit": "node scripts/probe-remit-raw.js",
     "preprobe:remit": "node scripts/check-abi.js node",
     "postrebuild": "node scripts/sign-native.js",
-    "sign:native": "node scripts/sign-native.js"
+    "sign:native": "node scripts/sign-native.js",
+    "gaps": "node scripts/gaps.js",
+    "pregaps": "node scripts/check-abi.js node"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.1",
