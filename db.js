@@ -102,6 +102,20 @@ function openDb(dbPath) {
   const db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  // Read-side tuning. The ledger build streams millions of rows in timestamp
+  // order, so the wins here are cache residency and avoiding an fsync per
+  // transaction during a multi-million-row sync.
+  //
+  //   synchronous=NORMAL  WAL already makes this crash-safe; FULL costs an
+  //                       fsync per commit and buys durability against OS
+  //                       crash only, which a re-syncable cache does not need.
+  //   cache_size          negative = KiB, so this is 256 MB of page cache.
+  //   mmap_size           256 MB mapped, so hot pages skip the read() syscall.
+  //   temp_store=MEMORY   index builds and sorts stay off disk.
+  db.pragma('synchronous = NORMAL');
+  db.pragma('cache_size = -262144');
+  db.pragma('mmap_size = 268435456');
+  db.pragma('temp_store = MEMORY');
   db.exec(SCHEMA);
   const row = db.prepare('SELECT value FROM app_meta WHERE key = ?').get('schema_version');
   if (!row) {
@@ -112,6 +126,42 @@ function openDb(dbPath) {
 
 // ── Statements are prepared once per DB handle for speed ───────────────────
 function makeApi(db) {
+  // ── tx_type: the filter that stops the ledger reading rows it discards ──
+  //
+  // The FIFO build pages over EVERY row for a chain, JSON.parses each one, and
+  // ships it across the Electron IPC boundary — 6,346,236 objects on this
+  // cache. Only then does it decide what to do with them. Two large groups are
+  // thrown away after all that work:
+  //
+  //   749,529  URITokenBuy, removed from FETCH_TYPES_XAHAU after measuring
+  //            that not one carries a recoverable amount. They stay in the
+  //            cache from earlier runs and are parsed on every single build.
+  //   varies   rows whose wallet is not a fetchable own wallet, dropped by
+  //            isFetchableOwnWallet() after being parsed and marshalled.
+  //
+  // SQLite has JSON1 built in, so the transaction type can be a generated
+  // column. ALTER TABLE cannot add a STORED one, but a VIRTUAL column can be
+  // INDEXED, and building that index materialises the values — so filtering
+  // becomes an index seek instead of 6.3M json_extract calls at query time.
+  //
+  // Nothing is deleted and no row becomes unreachable: the unfiltered page
+  // query is still there, and the caller chooses.
+  try {
+    const cols = db.prepare('PRAGMA table_info(raw_transactions)').all().map(c => c.name);
+    if (!cols.includes('tx_type')) {
+      db.exec(`ALTER TABLE raw_transactions ADD COLUMN tx_type TEXT
+               GENERATED ALWAYS AS (json_extract(raw_json, '$.TransactionType')) VIRTUAL`);
+    }
+    // On a 6M-row cache this builds once, at first launch after upgrading, and
+    // takes tens of seconds. Every later launch finds it already there.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_raw_tx_chain_type_ts
+             ON raw_transactions(chain, tx_type, timestamp, wallet, tx_hash)`);
+  } catch (e) {
+    // An older SQLite without generated-column support must still open the
+    // cache. The filtered path simply stays unavailable.
+    if (!/generated|syntax|duplicate column/i.test(String(e && e.message))) throw e;
+  }
+
   const stmts = {
     getMeta: db.prepare('SELECT value FROM app_meta WHERE key = ?'),
     setMeta: db.prepare(`
@@ -226,6 +276,13 @@ function makeApi(db) {
     `),
     countForChain: db.prepare(`
       SELECT COUNT(*) AS n FROM raw_transactions WHERE chain = ?
+    `),
+    // What is actually in the cache, by type. The honest way to show what a
+    // filter excludes rather than asserting it excludes nothing important.
+    countByType: db.prepare(`
+      SELECT COALESCE(tx_type, '(none)') AS t, COUNT(*) AS n
+      FROM raw_transactions WHERE chain = ?
+      GROUP BY t ORDER BY n DESC
     `),
     // Re-importing a corrected CSV must REPLACE, not accumulate. An UPSERT
     // rather than INSERT OR IGNORE because the second run of the verifier is
@@ -380,8 +437,17 @@ function makeApi(db) {
     },
 
     /** @returns {number} total cached rows for one chain, across every wallet */
-    countForChain(chain) {
-      return stmts.countForChain.get(chain).n;
+    countForChain(chain, types) {
+      if (!Array.isArray(types) || types.length === 0) return stmts.countForChain.get(chain).n;
+      const holes = types.map(() => '?').join(',');
+      return db.prepare(
+        `SELECT COUNT(*) AS n FROM raw_transactions WHERE chain = ? AND tx_type IN (${holes})`
+      ).get(chain, ...types).n;
+    },
+
+    /** Rows by transaction type, so a filter can show its own working. */
+    countByType(chain) {
+      return stmts.countByType.all(chain).map(r => ({ type: r.t, n: r.n }));
     },
 
     /**
@@ -398,10 +464,43 @@ function makeApi(db) {
      * @param {number} limit rows per page
      * @param {{ts:string, wallet:string, tx_hash:string}|null} cursor
      */
-    getChainRowsPage(chain, limit, cursor) {
-      const raw = cursor
-        ? stmts.chainRowsNextPage.all({ chain, limit, ts: cursor.ts, wallet: cursor.wallet, tx_hash: cursor.tx_hash })
-        : stmts.chainRowsFirstPage.all(chain, limit);
+    /**
+     * Rows for a chain, in one global chronological order, one page at a time.
+     *
+     * `types` is optional. When given, only those transaction types are
+     * returned and the rest never leave SQLite -- they are not read, not
+     * JSON.parsed, and not marshalled across the IPC boundary. That is the
+     * whole speed-up: the cost was never the query, it was parsing 6.3M
+     * objects and cloning them into the renderer to discard most of them.
+     *
+     * Omit it and the behaviour is exactly as before, so nothing silently
+     * changes the set of rows the tax engine sees unless a caller asks.
+     */
+    getChainRowsPage(chain, limit, cursor, types) {
+      const useFilter = Array.isArray(types) && types.length > 0;
+      let raw;
+      if (useFilter) {
+        const holes = types.map(() => '?').join(',');
+        const sql = cursor
+          ? `SELECT wallet, timestamp, tx_hash, raw_json FROM raw_transactions
+             WHERE chain = ? AND tx_type IN (${holes})
+               AND ( timestamp > ?
+                  OR (timestamp = ? AND wallet > ?)
+                  OR (timestamp = ? AND wallet = ? AND tx_hash > ?) )
+             ORDER BY timestamp, wallet, tx_hash LIMIT ?`
+          : `SELECT wallet, timestamp, tx_hash, raw_json FROM raw_transactions
+             WHERE chain = ? AND tx_type IN (${holes})
+             ORDER BY timestamp, wallet, tx_hash LIMIT ?`;
+        const args = cursor
+          ? [chain, ...types, cursor.ts, cursor.ts, cursor.wallet,
+             cursor.ts, cursor.wallet, cursor.tx_hash, limit]
+          : [chain, ...types, limit];
+        raw = db.prepare(sql).all(...args);
+      } else {
+        raw = cursor
+          ? stmts.chainRowsNextPage.all({ chain, limit, ts: cursor.ts, wallet: cursor.wallet, tx_hash: cursor.tx_hash })
+          : stmts.chainRowsFirstPage.all(chain, limit);
+      }
       if (raw.length === 0) return { rows: [], cursor: null };
       const last = raw[raw.length - 1];
       return {

@@ -101,6 +101,81 @@ test('an identical re-fetch is still a no-op, so a routine sync reports nothing'
   db.close();
 });
 
+
+// ── the type filter that stops the ledger reading rows it discards ────────
+test('getChainRowsPage with a type list reads ONLY those types', () => {
+  const db = createDb(tmpDbPath());
+  const mk = (h, ts, type) => ({ tx_hash: h, timestamp: ts,
+    raw_json: JSON.stringify(row(ts, { TransactionType: type })) });
+  db.insertRows('rW', 'Xahau', [
+    mk('A', '2024-01-01 00:00:01', 'Payment'),
+    mk('B', '2024-01-01 00:00:02', 'URITokenBuy'),
+    mk('C', '2024-01-01 00:00:03', 'Remit'),
+    mk('D', '2024-01-01 00:00:04', 'URITokenBuy'),
+  ]);
+  assert.strictEqual(db.countForChain('Xahau'), 4, 'everything is still cached');
+  assert.strictEqual(db.countForChain('Xahau', ['Payment', 'Remit']), 2);
+
+  const page = db.getChainRowsPage('Xahau', 100, null, ['Payment', 'Remit']);
+  assert.strictEqual(page.rows.length, 2, 'the URITokenBuys never left SQLite');
+  assert.deepStrictEqual(page.rows.map(r => r.row.TransactionType), ['Payment', 'Remit']);
+  db.close();
+});
+
+test('no type list means the old behaviour, exactly', () => {
+  // The filter must never narrow what the tax engine sees unless a caller
+  // asks for it. A silent narrowing is how a whole row class goes missing.
+  const db = createDb(tmpDbPath());
+  const mk = (h, ts, type) => ({ tx_hash: h, timestamp: ts,
+    raw_json: JSON.stringify(row(ts, { TransactionType: type })) });
+  db.insertRows('rW', 'Xahau', [
+    mk('A', '2024-01-01 00:00:01', 'Payment'),
+    mk('B', '2024-01-01 00:00:02', 'URITokenBuy'),
+  ]);
+  assert.strictEqual(db.getChainRowsPage('Xahau', 100, null).rows.length, 2);
+  assert.strictEqual(db.getChainRowsPage('Xahau', 100, null, []).rows.length, 2, 'empty list = no filter');
+  db.close();
+});
+
+test('the filtered page keeps its global chronological order and paginates', () => {
+  // Chronological order across wallets is the whole reason this query exists;
+  // a filter that broke it would silently reorder a FIFO ledger.
+  const db = createDb(tmpDbPath());
+  const mk = (h, ts, type) => ({ tx_hash: h, timestamp: ts,
+    raw_json: JSON.stringify(row(ts, { TransactionType: type, marker: h })) });
+  db.insertRows('rA', 'Xahau', [mk('A', '2024-01-01 00:00:01', 'Payment'),
+                                mk('C', '2024-01-01 00:00:03', 'Payment')]);
+  db.insertRows('rB', 'Xahau', [mk('B', '2024-01-01 00:00:02', 'Payment'),
+                                mk('X', '2024-01-01 00:00:02', 'URITokenBuy')]);
+  const seen = [];
+  let cursor = null;
+  for(;;) {
+    const p = db.getChainRowsPage('Xahau', 1, cursor, ['Payment']);
+    if (!p.rows.length) break;
+    seen.push(...p.rows.map(r => r.row.marker));
+    cursor = p.cursor;
+    if (!cursor) break;
+  }
+  assert.deepStrictEqual(seen, ['A', 'B', 'C'], 'chronological, across wallets, one page at a time');
+  db.close();
+});
+
+test('countByType shows what a filter would leave behind', () => {
+  const db = createDb(tmpDbPath());
+  const mk = (h, ts, type) => ({ tx_hash: h, timestamp: ts,
+    raw_json: JSON.stringify(row(ts, { TransactionType: type })) });
+  db.insertRows('rW', 'Xahau', [
+    mk('A', '2024-01-01 00:00:01', 'Payment'),
+    mk('B', '2024-01-01 00:00:02', 'URITokenBuy'),
+    mk('C', '2024-01-01 00:00:03', 'URITokenBuy'),
+  ]);
+  const byType = db.countByType('Xahau');
+  const m = Object.fromEntries(byType.map(r => [r.type, r.n]));
+  assert.strictEqual(m.URITokenBuy, 2);
+  assert.strictEqual(m.Payment, 1);
+  db.close();
+});
+
 test('the same tx_hash under two different wallets is stored twice (one cache row per wallet perspective)', () => {
   const db = createDb(tmpDbPath());
   const r = (wallet) => ({ tx_hash: 'SHARED', timestamp: '2024-01-01 00:00:00', raw_json: JSON.stringify(row('2024-01-01 00:00:00', { wallet })) });

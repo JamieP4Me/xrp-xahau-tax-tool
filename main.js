@@ -330,10 +330,11 @@ function registerIpcHandlers(db, dbPath) {
 
   ipcMain.handle('db:listCachedWallets', () => db.listCachedWallets());
 
-  ipcMain.handle('db:countForChain', (_evt, chain) => db.countForChain(chain));
+  ipcMain.handle('db:countForChain', (_evt, chain, types) => db.countForChain(chain, types));
+  ipcMain.handle('db:countByType', (_evt, chain) => db.countByType(chain));
 
-  ipcMain.handle('db:getChainRowsPage', (_evt, chain, limit, cursor) =>
-    db.getChainRowsPage(chain, limit, cursor));
+  ipcMain.handle('db:getChainRowsPage', (_evt, chain, limit, cursor, types) =>
+    db.getChainRowsPage(chain, limit, cursor, types));
 
   // Ledger-verified AMM amounts. The renderer parses the verifier's CSV (it
   // already has a CSV parser, and parsing there keeps it testable under

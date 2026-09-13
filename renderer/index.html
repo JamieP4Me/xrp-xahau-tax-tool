@@ -6428,12 +6428,45 @@ async function verifyScannedRowCount() {
 async function streamChainIntoLedger(chain, walletSet) {
   const processRow = chain === 'Xahau' ? processOneXahauRow : processOneXRPLRow;
   const helpers = chain === 'Xahau' ? makeXahauPriceHelpers() : makeXrplPriceHelpers();
-  const total = await window.taxDB.countForChain(chain);
-  if(total === 0) return 0;
+
+  // Read only the types this engine actually books. The cache still holds
+  // every row ever fetched, including types since removed from the fetch list
+  // — 749,529 URITokenBuys among them, none carrying a recoverable amount —
+  // and every build was JSON.parsing all of them and marshalling them into
+  // this renderer before deciding to ignore them.
+  //
+  // The filter is the SAME list the fetch uses, so it cannot quietly narrow
+  // what the engine sees relative to what it asks the network for. And it
+  // prints what it left behind, because a filter that hides its own effect is
+  // how a row class goes missing from a tax return without anyone noticing.
+  const types = chain === 'Xahau' ? FETCH_TYPES_XAHAU : FETCH_TYPES_XRPL;
+  const totalAll = await window.taxDB.countForChain(chain);
+  if(totalAll === 0) return 0;
+  let total = totalAll;
+  try {
+    const filtered = await window.taxDB.countForChain(chain, types);
+    if(Number.isFinite(filtered) && filtered > 0) {
+      total = filtered;
+      if(filtered < totalAll) {
+        const skipped = totalAll - filtered;
+        log(`\n${chain}: reading ${filtered.toLocaleString()} of ${totalAll.toLocaleString()} cached row(s) — ` +
+            `skipping ${skipped.toLocaleString()} whose type this engine does not book.`, 'in');
+        try {
+          const byType = await window.taxDB.countByType(chain);
+          const excluded = byType.filter(r => !types.includes(r.type));
+          if(excluded.length) {
+            log(`  not read: ${excluded.map(r => `${r.type} ${r.n.toLocaleString()}`).join(', ')}`, 'in');
+          }
+        } catch(e) { /* the breakdown is a courtesy, not a requirement */ }
+      }
+    }
+  } catch(e) {
+    log(`  (type filter unavailable — reading every row: ${e.message})`, 'wa');
+  }
   log(`\nBuilding ${chain} FIFO ledger from ${total.toLocaleString()} cached row(s), in true chronological order…`, 'hd');
   let cursor = null, done = 0;
   for(;;) {
-    const page = await window.taxDB.getChainRowsPage(chain, LEDGER_PAGE_ROWS, cursor);
+    const page = await window.taxDB.getChainRowsPage(chain, LEDGER_PAGE_ROWS, cursor, types);
     if(!page.rows.length) break;
     for(const { wallet, row } of page.rows) {
       // Every cached row is a PERSPECTIVE: "this is wallet W's view of

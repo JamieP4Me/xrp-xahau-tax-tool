@@ -43,7 +43,8 @@ contextBridge.exposeInMainWorld('taxDB', {
   listCachedWallets: () => ipcRenderer.invoke('db:listCachedWallets'),
 
   /** @returns {Promise<number>} total cached rows for one chain */
-  countForChain: (chain) => ipcRenderer.invoke('db:countForChain', chain),
+  countForChain: (chain, types) => ipcRenderer.invoke('db:countForChain', chain, types),
+  countByType: (chain) => ipcRenderer.invoke('db:countByType', chain),
 
   /**
    * One page of a chain's rows in true global chronological order across all
@@ -52,8 +53,11 @@ contextBridge.exposeInMainWorld('taxDB', {
    * rows in order without ever holding more than one page.
    * @returns {Promise<{rows:{wallet:string,row:object}[], cursor:object|null}>}
    */
-  getChainRowsPage: (chain, limit, cursor) =>
-    ipcRenderer.invoke('db:getChainRowsPage', chain, limit, cursor),
+  // `types` is optional. With it, rows of every other type never cross this
+  // boundary -- which is the point, since marshalling 6.3M objects into the
+  // renderer to discard most of them was the cost.
+  getChainRowsPage: (chain, limit, cursor, types) =>
+    ipcRenderer.invoke('db:getChainRowsPage', chain, limit, cursor, types),
 
   /**
    * Ledger-verified AMM amounts, from scripts/verify-xrpl.js --amm.
