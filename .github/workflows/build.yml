@@ -45,7 +45,7 @@ jobs:
 
       - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
 
       # A tag of v1.0.1 against a package.json still saying 1.0.0 builds three
       # installers all named 1.0.0 and publishes them under a 1.0.1 release —

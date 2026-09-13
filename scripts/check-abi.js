@@ -8,16 +8,23 @@
  * better-sqlite3 is a native addon, so it is compiled against one ABI at a
  * time. Two things in this project need different ones:
  *
- *   - the app and the Playwright suite need Electron's   (NODE_MODULE_VERSION 130)
- *   - db.test.js, verify-xrpl.test.js and verify-xrpl.js need plain Node's (115)
+ *   - the app and the Playwright suite need Electron's bundled Node ABI
+ *   - db.test.js, verify-xrpl.test.js and verify-xrpl.js need the ABI of
+ *     whatever Node is on PATH
+ *
+ * The two NODE_MODULE_VERSION numbers are deliberately not written down here.
+ * They change with every Electron and Node major -- they were 130 and 115
+ * under Electron 33 and Node 20 -- and a comment naming the wrong pair is
+ * worse than one naming none, because the next person checks their error
+ * message against it and concludes the check is broken.
  *
  * Switching was a manual dance — `npm rebuild better-sqlite3` one way,
  * `npm run rebuild` the other — and forgetting produces an error that names
  * two version numbers and no remedy:
  *
  *     The module '…/better_sqlite3.node' was compiled against a different
- *     Node.js version using NODE_MODULE_VERSION 115. This version of Node.js
- *     requires NODE_MODULE_VERSION 130.
+ *     Node.js version using NODE_MODULE_VERSION <one>. This version of
+ *     Node.js requires NODE_MODULE_VERSION <another>.
  *
  * In the app that arrives as a startup crash dialog, which reads like the
  * install is broken rather than like one command is needed. Nobody should

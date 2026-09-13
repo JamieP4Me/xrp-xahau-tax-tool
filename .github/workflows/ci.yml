@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
 
       # The privacy gate runs first: nothing else matters if the tree carries
       # somebody's wallet list.

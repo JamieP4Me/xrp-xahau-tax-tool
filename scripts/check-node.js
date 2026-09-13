@@ -27,8 +27,12 @@
  */
 'use strict';
 
-// 20 is what CI runs and what Electron 33 bundles. 22 is known to build.
-const SUPPORTED = [20, 22];
+// Node 20 was supported while Electron 33 bundled it. Electron 33 went
+// end-of-life on 2025-04-29 -- 33.4.11 was its final release, and it was
+// still what this app shipped 17 months later. Electron 44 bundles Node 24,
+// and better-sqlite3 13 declares engines >=22, so 20 can no longer build
+// this project at all. @electron/rebuild additionally wants >=22.12.
+const SUPPORTED = [22, 24];
 const major = Number(process.versions.node.split('.')[0]);
 
 if (SUPPORTED.includes(major) || process.env.XRPTAX_SKIP_NODE_CHECK === '1') {
