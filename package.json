@@ -45,7 +45,9 @@
     "precounterparties": "node scripts/check-abi.js node",
     "windb:schema": "node scripts/windb-schema.js",
     "cache:optimise": "node scripts/optimise-cache.js",
-    "precache:optimise": "node scripts/check-abi.js node"
+    "precache:optimise": "node scripts/check-abi.js node",
+    "probe:remit": "node scripts/probe-remit-raw.js",
+    "preprobe:remit": "node scripts/check-abi.js node"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.1",
