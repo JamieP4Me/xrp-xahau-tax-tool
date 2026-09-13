@@ -48,12 +48,27 @@ test('Electron app launches, has no menu bar, and the local DB round-trips throu
     // The OS-level window/taskbar title is a separate property (BrowserWindow
     // .getTitle()), which main.js pins via page-title-updated preventDefault()
     // so it doesn't flip away from the app's real name.
-    const { nativeTitle, isMenuBarVisible } = await app.evaluate(({ BrowserWindow }) => {
+    const { nativeTitle, isMenuBarVisible, hasAppMenu } = await app.evaluate(({ BrowserWindow, Menu }) => {
       const win = BrowserWindow.getAllWindows()[0];
-      return { nativeTitle: win.getTitle(), isMenuBarVisible: win.isMenuBarVisible() };
+      return { nativeTitle: win.getTitle(), isMenuBarVisible: win.isMenuBarVisible(),
+               hasAppMenu: !!Menu.getApplicationMenu() };
     });
     expect(nativeTitle).toBe('XRP & Xahau Tax Tool');
-    expect(isMenuBarVisible).toBe(false);
+    // setMenuBarVisibility() and isMenuBarVisible() are documented Windows/Linux
+    // only. On macOS the menu bar belongs to the APPLICATION, not the window, so
+    // main.js's setMenuBarVisibility(false) is a no-op there and this reads true
+    // however the app is configured. Asserting false unconditionally made this
+    // test unpassable on a Mac while passing on Linux CI — a platform bug in the
+    // test, not in the app.
+    //
+    // And the macOS behaviour is the one to keep: removing the application menu
+    // would take Cmd-Q, Cmd-C and Cmd-V with it. So each platform is asserted
+    // for what it should actually do.
+    if (process.platform === 'darwin') {
+      expect(hasAppMenu, 'macOS needs an application menu for Cmd-Q/Cmd-C/Cmd-V').toBe(true);
+    } else {
+      expect(isMenuBarVisible).toBe(false);
+    }
 
     // ── Served over http://127.0.0.1, not file:// ──────────────────────
     const url = window.url();
