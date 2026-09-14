@@ -32,12 +32,42 @@ const { test, expect, _electron: electron } = require('@playwright/test');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const net = require('net');
 
 const APP_DIR = path.join(__dirname, '..');
 
+// Claim a port nobody else holds, and make BOTH launches use it.
+//
+// The app pins itself to 47821 so the renderer's origin never changes and
+// localStorage survives a restart -- which is precisely what this test
+// checks. But if a real copy of the app is running, it owns 47821, and
+// main.js quietly falls back to an OS-assigned port. Each launch below then
+// gets a DIFFERENT origin, launch 2 sees no wallet list, the cache rebuild
+// has nothing to scan, and this test times out after 30 seconds pointing at
+// the rebuild -- which is entirely innocent.
+//
+// That cost a real debugging session: the failure was reproducible, survived
+// isolation, and looked exactly like a regression in freshly changed code.
+// The actual cause was that the app was open in another window.
+//
+// So the test no longer competes for the shared port. It takes its own.
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
 test('after a real restart: cached data shows in Form 8949 with no fetch, and localStorage survives', async () => {
   const sharedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'xrp-xahau-restart-e2e-'));
-  const env = { ...process.env, HOME: sharedHome };
+  // One port, held by neither a running app nor another test, used by BOTH
+  // launches so the origin -- and therefore localStorage -- is stable.
+  const port = await freePort();
+  const env = { ...process.env, HOME: sharedHome, XRPTAX_LOCAL_PORT: String(port) };
   // Both launches must land on the SAME profile — that is the whole point
   // of this test — so the directory is fixed once here. See the note in
   // tax-correctness.spec.js for why HOME alone does not isolate it.

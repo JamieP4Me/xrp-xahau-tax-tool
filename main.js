@@ -122,7 +122,19 @@ const MIME = {
 // restarting" — the wallets you'd need to re-select to view them had been
 // forgotten, not the cached data itself. A fixed port fixes this exactly
 // the way closing and reopening a real installed app is supposed to work.
-const FIXED_LOCAL_SERVER_PORT = 47821;
+// The renderer's origin is http://127.0.0.1:<this>, and localStorage is
+// scoped per origin, so this port has to be the SAME on every launch or the
+// wallet list and term overrides vanish on restart. Hence fixed, not
+// OS-assigned.
+//
+// Overridable from the environment for one reason: the test suite. A running
+// copy of the app holds this port, and the EADDRINUSE fallback below then
+// gives each test launch a DIFFERENT origin -- which silently defeats the
+// very thing restart-persistence.spec.js exists to verify. That failure
+// surfaced as a 30-second timeout waiting on the cache rebuild, which is
+// innocent, and cost a real debugging session before anyone thought to check
+// whether the app was simply open.
+const FIXED_LOCAL_SERVER_PORT = Number(process.env.XRPTAX_LOCAL_PORT) || 47821;
 
 function startLocalServer() {
   return new Promise((resolve, reject) => {
@@ -196,6 +208,13 @@ function startLocalServer() {
     // before this fix existed.
     localServer.once('error', (err) => {
       if (err && err.code === 'EADDRINUSE') {
+        // Say so. Falling back silently is what made a held port look like a
+        // broken cache rebuild: the app still starts, but on a different
+        // origin, so localStorage appears wiped and nothing explains why.
+        console.warn(
+          `[xrp-xahau] port ${FIXED_LOCAL_SERVER_PORT} is already in use - another copy of ` +
+          `this app is probably running. Falling back to a random port: the wallet list and ` +
+          `term overrides are stored per-origin and will NOT carry over from other launches.`);
         localServer.removeAllListeners('error');
         localServer.once('error', reject);
         bind(0);
