@@ -38,6 +38,73 @@ async function launch(env = {}) {
   return { app, win, home };
 }
 
+
+const round2 = (n) => Math.round(n * 100) / 100;
+// ── The statement must foot ───────────────────────────────────────────────
+//
+// A real 2025 PDF, before this was fixed:
+//
+//     Part I total        printed $531.45   its rows add to $531.46
+//     Part II total       printed $350.74   its rows add to $350.73
+//     Schedule D line 16  printed $882.20   Part I + Part II = $882.19
+//     Total proceeds      printed $2,311.74 the parts add to $2,311.75
+//
+// Every figure was arithmetically correct and independently rounded from a
+// full-precision value, so no printed line could be derived from any other
+// printed line. Nothing in the suite noticed, because every assertion tested
+// a number against what the code computed rather than against the other
+// numbers on the same page.
+test('every printed money figure is a whole number of cents, and the parts add to the total', async () => {
+  const { app, win, home } = await launch();
+  try {
+    const r = await win.evaluate(() => {
+      resetLedgerState();
+      const w = 'rTESTfootingXAHAU1111111111111111';
+      // Quantities and prices chosen to land on thirds of a cent, which is
+      // where independent rounding drifts apart.
+      ledgerAdd(w, 'XAH', '2024-01-02', 333.333333, 0.123456, 'received');
+      ledgerAdd(w, 'XAH', '2025-02-03', 166.666667, 0.234567, 'received');
+      pushDisposal(w, 'XAH', 111.111111, '2025-06-01', '6/1/2025', 2025,
+                   'tTESTfoot1', 0.345678, 0.234567, '', 'rTESTcounterparty111111111111111');
+      pushDisposal(w, 'XAH', 222.222222, '2025-07-01', '7/1/2025', 2025,
+                   'tTESTfoot2', 0.456789, 0.345678, '', 'rTESTcounterparty111111111111111');
+
+      const rows = allDisposalsHigh.map(x => ({
+        proceeds: x.proceeds, basis: x.basis, gain: x.gain, term: x.term,
+      }));
+      const isCents = (n) => Math.abs(n * 100 - Math.round(n * 100)) < 1e-6;
+      const sum = (list, k) => Math.round(list.reduce((s, x) => s + x[k], 0) * 100) / 100;
+      const st = rows.filter(x => x.term === 'ST');
+      const lt = rows.filter(x => x.term === 'LT');
+      return {
+        n: rows.length,
+        allCents: rows.every(x => isCents(x.proceeds) && isCents(x.basis) && isCents(x.gain)),
+        // Each row must foot on its own face: what is printed in column (d)
+        // minus column (e) has to equal column (h).
+        rowsFoot: rows.every(x => Math.abs((x.proceeds - x.basis) - x.gain) < 0.005),
+        stGain: sum(st, 'gain'), ltGain: sum(lt, 'gain'),
+        stProceeds: sum(st, 'proceeds'), ltProceeds: sum(lt, 'proceeds'),
+        stBasis: sum(st, 'basis'), ltBasis: sum(lt, 'basis'),
+        grandGain: sum(rows, 'gain'), grandProceeds: sum(rows, 'proceeds'),
+      };
+    });
+
+    expect(r.n).toBeGreaterThan(1);
+    expect(r.allCents, 'a money figure carried fractions of a cent into the report').toBe(true);
+    expect(r.rowsFoot, 'a printed row did not satisfy proceeds - basis = gain').toBe(true);
+
+    // Schedule D line 16 must equal Part I + Part II, to the cent.
+    expect(round2(r.stGain + r.ltGain)).toBe(r.grandGain);
+    expect(round2(r.stProceeds + r.ltProceeds)).toBe(r.grandProceeds);
+    // And each part must equal its own proceeds minus its own basis.
+    expect(round2(r.stProceeds - r.stBasis)).toBe(r.stGain);
+    expect(round2(r.ltProceeds - r.ltBasis)).toBe(r.ltGain);
+  } finally {
+    await app.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('timestamps are read as UTC, so a late-evening 31 Dec sale stays in the right tax year', async () => {
   // Runs in US Eastern. A WinDB timestamp is UTC; parsing it without a 'Z'
   // makes the engine treat it as LOCAL time and then read it back with

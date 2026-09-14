@@ -3462,16 +3462,54 @@ function pushDisposal(wallet, ticker, totalQty, dk, ds, yr, hash, priceH, priceL
   }
   if(consumed.length === 1) singleLotDate = consumed[0].acqDate;
 
+// Money, rounded to the cent, exactly once.
+//
+// WHY THIS EXISTS, and why it is applied HERE rather than at display time.
+//
+// Every figure on Form 8949 used to be rounded independently from a
+// full-precision internal value: each row when it was drawn, each subtotal
+// when it was summed, the grand total when it was summed again. The
+// arithmetic was right every time and the printed document still did not
+// foot. From a real 2025 statement:
+//
+//     Part I total        printed $531.45   rows add to $531.46
+//     Part II total       printed $350.74   rows add to $350.73
+//     Schedule D line 16  printed $882.20   Part I + Part II = $882.19
+//     Total proceeds      printed $2,311.74 parts add to $2,311.75
+//
+// Not one printed line could be derived from the other printed lines. The
+// tax effect is a cent; the credibility effect is not. A statement whose
+// lines do not add is the first thing a preparer or an examiner challenges,
+// and it puts every other figure on the page in question.
+//
+// Rounding at display time cannot fix this -- that is what it already did.
+// The subtotals have to be sums of the SAME numbers the reader can see, so
+// the rounding has to happen once, here, before anything sums anything.
+// Quantities stay at full precision; only dollars round.
+//
+// Half-away-from-zero, symmetric across the sign. Math.round() alone rounds
+// -10.5 to -10 and 10.5 to 11, which would treat a loss and a gain of the
+// same size differently.
+const cents = (n) => {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return 0;
+  return Math.sign(x) * Math.round(Math.abs(x) * 100 + Number.EPSILON) / 100;
+};
+
   const makeRow = (qty, cost, term, box, acqLabel) => {
     if(qty <= 0) return null;
     const share = qty / totalQty;
+    // Rounded once, then the gains are derived FROM the rounded figures, so
+    // that proceeds - basis = gain holds on the printed row as well as in
+    // the arithmetic behind it.
+    const pH = cents(qty*priceH), pL = cents(qty*priceL), b = cents(cost);
     return {
       wallet, dateStr:ds, dk, year:yr, ticker, chain: ticker==='XRP'?'XRPL':'XAH',
       qty, term, box, dateAcquired: acqLabel,
       priceH, priceL,
-      proceedsH: qty*priceH, proceedsL: qty*priceL,
-      basis: cost,
-      gainH: qty*priceH - cost, gainL: qty*priceL - cost,
+      proceedsH: pH, proceedsL: pL,
+      basis: b,
+      gainH: cents(pH - b), gainL: cents(pL - b),
       txHash: hash, counterparty: counterparty || '', description: `${qty.toFixed(4)} ${ticker}${descSuffix||''}`,
       rowKey: `${wallet}_${hash}_${ticker}_${term}`
     };
