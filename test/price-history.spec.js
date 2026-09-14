@@ -69,7 +69,16 @@ test('nothing in the page loads script from an external origin', async () => {
   // The whole point of vendoring. If a future edit reintroduces a CDN tag,
   // the CSP in main.js would block it at runtime and the failure would show
   // up as a mystery missing feature; this names it instead.
-  const html = fs.readFileSync(path.join(APP_DIR, 'renderer/index.html'), 'utf8');
+  //
+  // HTML COMMENTS ARE STRIPPED FIRST, and that is not a convenience. The
+  // first version of this test scanned the raw file and failed immediately --
+  // on the comment directly above the vendored <script> tag, which quotes the
+  // old cdnjs URL to explain why it is gone. A tag inside a comment is not
+  // loaded by anything, so counting it is simply wrong, and rewording the
+  // comment to appease the test would have left the test still wrong and
+  // silently ready to fire again on the next person who documents a URL.
+  const raw = fs.readFileSync(path.join(APP_DIR, 'renderer/index.html'), 'utf8');
+  const html = raw.replace(/<!--[\s\S]*?-->/g, '');
   const external = [...html.matchAll(/<script[^>]*\ssrc\s*=\s*["']([^"']+)["']/gi)]
     .map(m => m[1])
     .filter(src => /^(https?:)?\/\//i.test(src));
