@@ -1633,7 +1633,15 @@ test.describe('Treatment A — what it books', () => {
     expect(out.rows).toHaveLength(1);
     expect(out.rows[0].qty).toBeCloseTo(992.165079, 6);
     // Basis came from the real 2021 lot, so the holding period is long-term.
-    expect(out.rows[0].basis).toBeCloseTo(992.165079 * 0.50, 4);
+    // Money is rounded to the cent when the row is built, so the basis here
+    // is 496.08 and not 992.165079 x 0.50 = 496.0825395. That is the point:
+    // a fraction of a cent carried into column (e) is what made the printed
+    // Part I, Part II and Schedule D totals disagree with their own rows.
+    // See the `cents` note in pushDisposal().
+    const expectedBasis = Math.round(992.165079 * 0.50 * 100) / 100;
+    expect(out.rows[0].basis).toBeCloseTo(expectedBasis, 2);
+    expect(out.rows[0].basis * 100, 'basis carried a fraction of a cent')
+      .toBeCloseTo(Math.round(out.rows[0].basis * 100), 6);
     expect(out.rows[0].term).toBe('LT');
     expect(out.rows[0].year).toBe(2024);
     expect(out.rows[0].desc).toContain('deposited to AMM pool');
