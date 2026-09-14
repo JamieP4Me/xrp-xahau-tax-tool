@@ -62,6 +62,43 @@ let localServerPort = 0;
 let db = null;
 
 // ── Tiny static file server for the renderer (no dependencies) ─────────────
+// Content-Security-Policy, served as a HEADER rather than a <meta> tag: a
+// header cannot be displaced by markup injected into the document, and it
+// covers every file this server hands out rather than just the one page.
+//
+// WHAT THIS ACTUALLY BUYS, stated honestly.
+//
+// `script-src 'self'` is the point. Until now the page pulled jsPDF from
+// cdnjs.cloudflare.com with no integrity hash -- a third party permitted to
+// run arbitrary JavaScript in a document holding every wallet address, a
+// complete financial history, and a Payment-Claim. jsPDF is vendored now,
+// and this makes that a rule rather than a habit: no external origin can
+// serve script to this page, whatever a future edit does.
+//
+// `connect-src` pins network access to the one endpoint the app calls --
+// WinDB at run.api.dhali.io. Everything else is denied by `default-src
+// 'none'`, so an injected exfiltration attempt has nowhere to send to.
+//
+// WHAT IT DOES NOT BUY. 'unsafe-inline' is present and cannot be removed
+// today: the page carries 86 inline event handlers (78 onclick, 7 onchange,
+// 1 oninput) plus one large inline <script>, and CSP blocks inline handlers
+// regardless of any nonce. Removing 'unsafe-inline' therefore means moving
+// every handler to addEventListener first. Worth doing; not worth pretending
+// is already done. So this policy stops a compromised or swapped external
+// origin, and does not stop injected inline script.
+const CSP = [
+  "default-src 'none'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "font-src 'self' data:",
+  "connect-src 'self' https://run.api.dhali.io",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+].join('; ');
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -126,7 +163,15 @@ function startLocalServer() {
               return;
             }
             const ext = path.extname(filePath).toLowerCase();
-            res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+            res.writeHead(200, {
+              'Content-Type': MIME[ext] || 'application/octet-stream',
+              'Content-Security-Policy': CSP,
+              // Belt and braces for a local-only server: no sniffing a .js
+              // into something else, and no referrer leaking the loopback
+              // origin to an external link the user clicks.
+              'X-Content-Type-Options': 'nosniff',
+              'Referrer-Policy': 'no-referrer',
+            });
             res.end(data);
           } catch (_) { /* client went away mid-response */ }
         });

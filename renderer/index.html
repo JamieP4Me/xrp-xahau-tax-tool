@@ -72,10 +72,22 @@ a:hover{text-decoration:underline}
 footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px;font-family:'Arial',sans-serif;margin-top:20px}
 .empty{text-align:center;color:#999;padding:70px;font-size:15px}
 </style>
-<!-- PDF generation (client-side only, loaded from cdnjs — needs internet
-     access the same way this page needs WinDB access; nothing is uploaded
-     anywhere, the PDF is built entirely in your browser). -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/4.2.1/jspdf.umd.min.js"></script>
+<!-- PDF generation: client-side only, and now offline-capable.-->
+<!-- jsPDF, VENDORED rather than loaded from cdnjs.
+     It used to be <script src="https://cdnjs.cloudflare.com/.../jspdf.umd.min.js">,
+     with no integrity hash. That is a third party able to execute arbitrary
+     JavaScript in a page holding a complete financial history, every wallet
+     address, and a Payment-Claim -- on any day they, or DNS, or the network
+     between here and them, has a bad one.
+
+     It also made PDF export the one feature that silently required internet,
+     in a tool whose whole premise is that a report rebuilds from the local
+     cache with no network at all.
+
+     The file is copied verbatim from node_modules/jspdf at the pinned
+     version; test/price-history.spec.js asserts the copy still matches, so
+     it cannot drift from the dependency. -->
+<script src="vendor/jspdf.umd.min.js"></script>
 </head>
 <body>
 
@@ -5141,7 +5153,8 @@ function renderPriceHistory(){
 
 // The same monthly figures as the on-screen Price History page, exported as a
 // standalone PDF via jsPDF (see the note above exportForm8949PDF() — same
-// library, loaded from cdnjs, entirely client-side, needs no Payment-Claim).
+// library, vendored into renderer/vendor, entirely client-side, needs no
+// Payment-Claim and no internet).
 // Uses the shared pdfTable() helper (defined below, but function declarations
 // hoist so the forward reference is fine) for automatic pagination with a
 // repeated header row per year.
@@ -5154,7 +5167,7 @@ function renderPriceHistory(){
 // page also means what you print is what you were looking at.
 function exportPriceHistoryPDF(){
   if(typeof window.jspdf === 'undefined' || !window.jspdf.jsPDF) {
-    alert('The PDF library did not load — this needs one-time internet access to cdnjs.cloudflare.com (separate from your Payment-Claim/WinDB access). Check your connection and try again.');
+    alert('The PDF library did not load. This needs no internet: jsPDF ships with the app at renderer/vendor/jspdf.umd.min.js. If you are seeing this, that file is missing from the build — please report it.');
     return;
   }
   const doc = buildPriceHistoryPDF(priceAssetTab);
@@ -6076,7 +6089,7 @@ function exportUnvaluedCSV() {
 }
 
 // ── PDF export (Form 8949-style statement + summary + Schedule D) ─────────
-// Entirely client-side, via jsPDF loaded from cdnjs (see <head>) — nothing
+// Entirely client-side, via the vendored jsPDF (see <head>) — nothing
 // is uploaded anywhere, the PDF is built in your browser from data already
 // on this page. This is NOT the IRS's actual fillable PDF (irs.gov wasn't
 // reachable while building this tool); it's a lookalike statement matching
@@ -6198,7 +6211,7 @@ const PDF_DISPOSAL_COLS = [
 
 function exportForm8949PDF() {
   if(typeof window.jspdf === 'undefined' || !window.jspdf.jsPDF) {
-    alert('The PDF library did not load — this needs one-time internet access to cdnjs.cloudflare.com (separate from your Payment-Claim/WinDB access). Check your connection and try again.');
+    alert('The PDF library did not load. This needs no internet: jsPDF ships with the app at renderer/vendor/jspdf.umd.min.js. If you are seeing this, that file is missing from the build — please report it.');
     return;
   }
   if(highRows.length === 0 && lowRows.length === 0) {
@@ -7638,7 +7651,7 @@ async function rebuildAfterOwnershipChange() {
 
 // A standalone Holdings statement, same jsPDF path as the Price History and
 // Form 8949 exports — client-side, no Payment-Claim, no internet beyond the
-// one-time cdnjs load.
+// the vendored jsPDF.
 //
 // The three categories are kept visually separate here for the same reason
 // they are separate on screen: self-custody, sent-to-an-exchange, and stranded
@@ -7647,7 +7660,7 @@ async function rebuildAfterOwnershipChange() {
 // tool has spent its life trying to stop producing.
 function exportHoldingsPDF() {
   if(typeof window.jspdf === 'undefined' || !window.jspdf.jsPDF) {
-    alert('The PDF library did not load — this needs one-time internet access to cdnjs.cloudflare.com (separate from your Payment-Claim/WinDB access). Check your connection and try again.');
+    alert('The PDF library did not load. This needs no internet: jsPDF ships with the app at renderer/vendor/jspdf.umd.min.js. If you are seeing this, that file is missing from the build — please report it.');
     return;
   }
   const all = computeHoldings();

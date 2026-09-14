@@ -13,6 +13,7 @@
 
 const { test, expect, _electron: electron } = require('@playwright/test');
 const path = require('path');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 
@@ -34,10 +35,10 @@ test.beforeAll(async () => {
   window = await app.firstWindow();
   await window.waitForLoadState('domcontentloaded');
 
-  // The app loads jsPDF from cdnjs, which a CI runner (or an offline machine)
-  // may not reach — and a silently skipped PDF test is how an export stays
-  // broken for months. Inject the same pinned build from node_modules when the
-  // CDN copy did not arrive, so the export is exercised either way.
+  // jsPDF is vendored into renderer/vendor now, served from the app's own
+  // origin, so it loads offline and no CDN is involved. The fallback injection
+  // stays only as a safety net for a build where the vendored file is missing:
+  // a silently skipped PDF test is how an export stays broken for months.
   const loaded = await window.evaluate(() => !!(window.jspdf && window.jspdf.jsPDF));
   if (!loaded) {
     const umd = path.join(APP_DIR, 'node_modules/jspdf/dist/jspdf.umd.min.js');
@@ -47,16 +48,32 @@ test.beforeAll(async () => {
   }
 });
 
-// The injected copy is only equivalent to the shipped one while the two
-// versions agree. They are declared in different files, so nothing but this
-// keeps them together.
-test('the jsPDF version in the page matches the one the tests inject', async () => {
-  const pkg = JSON.parse(fs.readFileSync(path.join(APP_DIR, 'package.json'), 'utf8'));
-  const declared = (pkg.devDependencies.jspdf || '').replace(/^[\^~]/, '');
+// A vendored copy is a copy, and copies rot. Nothing but this keeps
+// renderer/vendor/jspdf.umd.min.js identical to the dependency it was taken
+// from -- and a stale vendored library is worse than a CDN one, because it
+// never gets a security fix and nothing announces that.
+test('the vendored jsPDF is byte-identical to the pinned dependency', async () => {
+  const vendored = path.join(APP_DIR, 'renderer/vendor/jspdf.umd.min.js');
+  const source = path.join(APP_DIR, 'node_modules/jspdf/dist/jspdf.umd.min.js');
+  expect(fs.existsSync(vendored),
+    'renderer/vendor/jspdf.umd.min.js is missing — PDF export ships broken').toBe(true);
+  expect(fs.existsSync(source), 'jspdf is not installed; cannot verify the copy').toBe(true);
+
+  const a = crypto.createHash('sha256').update(fs.readFileSync(vendored)).digest('hex');
+  const b = crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex');
+  expect(a, 'the vendored copy has drifted from node_modules/jspdf. ' +
+    'Re-copy it: cp node_modules/jspdf/dist/jspdf.umd.min.js renderer/vendor/').toBe(b);
+});
+
+test('nothing in the page loads script from an external origin', async () => {
+  // The whole point of vendoring. If a future edit reintroduces a CDN tag,
+  // the CSP in main.js would block it at runtime and the failure would show
+  // up as a mystery missing feature; this names it instead.
   const html = fs.readFileSync(path.join(APP_DIR, 'renderer/index.html'), 'utf8');
-  const cdn = html.match(/cdnjs\.cloudflare\.com\/ajax\/libs\/jspdf\/([\d.]+)\//);
-  expect(cdn, 'no pinned jsPDF URL found in renderer/index.html').not.toBeNull();
-  expect(cdn[1]).toBe(declared);
+  const external = [...html.matchAll(/<script[^>]*\ssrc\s*=\s*["']([^"']+)["']/gi)]
+    .map(m => m[1])
+    .filter(src => /^(https?:)?\/\//i.test(src));
+  expect(external, 'external <script src> found: ' + external.join(', ')).toEqual([]);
 });
 
 test.afterAll(async () => {
