@@ -74,7 +74,8 @@
       "preload.js",
       "db.js",
       "renderer/**/*",
-      "package.json"
+      "package.json",
+      "!node_modules/better-sqlite3/prebuilds/{linux,linuxmusl,win32}-*.node"
     ],
     "directories": {
       "buildResources": "build",
@@ -92,7 +93,8 @@
         }
       ],
       "hardenedRuntime": true,
-      "gatekeeperAssess": false
+      "gatekeeperAssess": false,
+      "x64ArchFiles": "**/better-sqlite3/prebuilds/*.node"
     },
     "win": {
       "icon": "build/icon.ico",
