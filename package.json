@@ -53,7 +53,9 @@
     "gaps": "node scripts/gaps.js",
     "pregaps": "node scripts/check-abi.js node",
     "lp:pairing": "node scripts/lp-pairing.js",
-    "prelp:pairing": "node scripts/check-abi.js node"
+    "prelp:pairing": "node scripts/check-abi.js node",
+    "xahau:basis": "node scripts/xahau-basis.js",
+    "prexahau:basis": "node scripts/check-abi.js node"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.1",
