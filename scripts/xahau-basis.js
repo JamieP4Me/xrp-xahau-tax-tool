@@ -10,9 +10,20 @@
  *   with XXX, LXH with XAH.
  *
  *   XXX (and any other token with no dollar market) is valued through the
- *   XAH rate observed in the user's OWN swaps on the protocol -- e.g. 1,000
- *   XAH for 84.23 XXX on 2026-06-11, so 1 XXX = 11.87 XAH that day -- times
- *   XAH's dollar price. Every such value cites the swap it came from.
+ *   XAH rate observed in the user's OWN PURCHASES of it -- e.g. 1,000 XAH
+ *   for 84.23 XXX on 2026-06-11, so 1 XXX = 11.87 XAH that day -- times
+ *   XAH's dollar price. Every such value cites the purchase it came from.
+ *
+ *   PURCHASES ONLY, NOT SALES. The first version also took "reverse swaps"
+ *   -- token sent, XAH back from the same address within the window -- as
+ *   rates. On the real cache every one of them was wrong: XXX bought at
+ *   8.14-11.87 XAH, "sold" at 30.46-38.57, a 3x gap no pool spread
+ *   explains. The three "sales" summed to exactly 7,961.74 XAH, every XAH
+ *   the XLP pool ever sent back: liquidity WITHDRAWN, landing beside an
+ *   unrelated small XXX payment. Those rates inflated XXX reward income
+ *   from about $620 to $1,108 and XLP basis from about $264 to $547. The
+ *   same rule produced an EVR rate of 0.0000. Nothing in the cache tells a
+ *   sale from a coincidentally timed withdrawal, so the rule is gone.
  *
  *   A token that arrived with nothing paid for it is a reward: ordinary
  *   income at fair market value on receipt, and that value is its basis.
@@ -183,16 +194,9 @@ for (const wallet of wallets) {
       obs(tokens[0].asset, r.ms, xah / tokens[0].qty, `${qtyS(xah)} XAH -> ${qtyS(tokens[0].qty)} ${tokens[0].asset}`);
     }
   }
-  // Reverse swap: one token given (not already paying for a receipt), XAH back
-  // from the same counterparty within the window -> also an XAH rate.
-  for (const o of events.filter(e => e.dir === 'out' && !e.used && e.legs.length === 1 && e.legs[0].asset !== 'XAH')) {
-    const back = events.find(e => e.dir === 'in' && e.peer === o.peer && e.ms >= o.ms && e.ms - o.ms <= W &&
-                                  e.legs.length && e.legs.every(l => l.asset === 'XAH'));
-    if (back) {
-      const xah = back.legs.reduce((s, l) => s + l.qty, 0);
-      obs(o.legs[0].asset, o.ms, xah / o.legs[0].qty, `${qtyS(o.legs[0].qty)} ${o.legs[0].asset} -> ${qtyS(xah)} XAH`);
-    }
-  }
+  // No "reverse swap" rates. A token sent and XAH received soon after looks
+  // like a sale and, on this cache, never was one -- see the header. Rates
+  // come only from purchases above, where the pairing itself is evidence.
 }
 db.close();
 
@@ -212,10 +216,10 @@ function valueLeg(leg, ms) {
              note: `${qtyS(leg.qty)} ${leg.asset} x $${p.usd} (${leg.asset} high ${p.used}${p.days ? ', ' + p.days + 'd from ' + dk : ''})` };
   }
   const r = rateFor(leg.asset, ms);
-  if (!r) return { usd: null, stale: false, farRate: false, note: `no XAH rate for ${leg.asset} in your own swaps` };
+  if (!r) return { usd: null, stale: false, farRate: false, note: `no XAH rate for ${leg.asset}: you never bought it with XAH` };
   const p = priceOf('XAH', dk);
   return { usd: leg.qty * r.xahPerUnit * p.usd, stale: p.stale, farRate: r.days > 14,
-           note: `${qtyS(leg.qty)} ${leg.asset} x ${r.xahPerUnit.toFixed(6)} XAH (own swap ${r.dk}: ${r.how}` +
+           note: `${qtyS(leg.qty)} ${leg.asset} x ${r.xahPerUnit.toFixed(6)} XAH (own purchase ${r.dk}: ${r.how}` +
                  `${r.days ? ', ' + r.days + 'd away' : ''}) x $${p.usd} (XAH high ${p.used})` };
 }
 
@@ -304,13 +308,22 @@ for (const [k, a] of Object.entries(byAsset).sort((x, y) => y[1].basis + y[1].in
 }
 console.log(`  ${'TOTAL'.padEnd(6)} ${''.padStart(15)} ${''.padStart(10)} ${money(tB).padStart(13)} ${''.padStart(10)} ${money(tI).padStart(13)}`);
 
-console.log('\n--- XAH rates taken from your own swaps (what XXX, RVN and others are valued by) ---');
+console.log('\n--- XAH rates taken from your own purchases (what XXX, RVN and others are valued by) ---');
 if (!Object.keys(rateObs).length) console.log('  (none observed)');
 for (const [k, list] of Object.entries(rateObs).sort()) {
   const rs = list.map(o => o.xahPerUnit);
   const ds = list.map(o => o.dk).sort();
-  console.log(`  ${k.padEnd(6)} ${String(list.length).padStart(3)} swap(s)  ${ds[0]} .. ${ds[ds.length - 1]}  ` +
+  console.log(`  ${k.padEnd(6)} ${String(list.length).padStart(3)} purchase(s)  ${ds[0]} .. ${ds[ds.length - 1]}  ` +
               `${Math.min(...rs).toFixed(4)} - ${Math.max(...rs).toFixed(4)} XAH per unit`);
+  // The guard that would have caught the reverse-swap error on its first
+  // run: a 3x spread between rates for one asset was sitting in plain sight
+  // in the summary, and nothing said so. A real token can move 2x in a few
+  // weeks; when its own observed rates disagree by more, look before using.
+  const spread = Math.max(...rs) / Math.min(...rs);
+  if (rs.length > 1 && spread > 2) {
+    console.log(`         WARNING: ${k} rates differ ${spread.toFixed(1)}x. Check these purchases ` +
+                `before relying on anything valued by them (see the CSV notes).`);
+  }
 }
 
 const fl = {};
