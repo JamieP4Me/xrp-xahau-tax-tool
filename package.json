@@ -1,7 +1,7 @@
 {
   "name": "xrp-xahau-tax-tool",
   "productName": "XRP & Xahau Tax Tool",
-  "version": "1.10.1",
+  "version": "1.10.2",
   "description": "Local desktop app for full XRP/Xahau transaction history and Form 8949/Schedule D generation, backed by a local SQLite cache with incremental sync.",
   "main": "main.js",
   "author": "XRP & Xahau Tax Tool contributors",
@@ -13,7 +13,7 @@
   "scripts": {
     "preinstall": "node scripts/check-node.js",
     "start": "electron .",
-    "test:db": "node test/db.test.js && node test/verify-xrpl.test.js && node test/iou-inventory.test.js && node test/sign-native.test.js",
+    "test:db": "node test/db.test.js && node test/verify-xrpl.test.js && node test/iou-inventory.test.js && node test/sign-native.test.js && node test/supply-chain.test.js",
     "test:e2e": "playwright test test/*.spec.js --reporter=line",
     "test": "npm run test:db && npm run test:e2e",
     "pack": "electron-builder --dir",
@@ -56,7 +56,7 @@
   "devDependencies": {
     "@electron/rebuild": "^4.0.1",
     "@playwright/test": "^1.56.0",
-    "electron": "^44.3.0",
+    "electron": "^44.10.2",
     "electron-builder": "^26.15.3",
     "jspdf": "^4.2.1",
     "playwright": "^1.56.0"
