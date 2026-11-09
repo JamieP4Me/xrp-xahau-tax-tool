@@ -51,7 +51,9 @@
     "postrebuild": "node scripts/sign-native.js",
     "sign:native": "node scripts/sign-native.js",
     "gaps": "node scripts/gaps.js",
-    "pregaps": "node scripts/check-abi.js node"
+    "pregaps": "node scripts/check-abi.js node",
+    "lp:pairing": "node scripts/lp-pairing.js",
+    "prelp:pairing": "node scripts/check-abi.js node"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.1",
