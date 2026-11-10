@@ -14,6 +14,12 @@
 // this line is what stops it recurring.
 //
 // Run db.test.js via `npm run test:db`.
+// The app rebuilds the report a second time in the background after every
+// build to keep the AMM treatment comparison current. In the suite those
+// extra builds would race the assertions, so they are off here; specs spread
+// process.env into electron.launch, so this reaches every app instance.
+process.env.XRPTAX_BACKGROUND_COMPARE = process.env.XRPTAX_BACKGROUND_COMPARE || 'off';
+
 module.exports = {
   testDir: './test',
   testMatch: '**/*.spec.js',

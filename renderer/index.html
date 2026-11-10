@@ -231,12 +231,18 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
       <div id="ammTreatmentNote" style="font-size:10px;color:#888;line-height:1.5"></div>
       <div class="row" style="margin-top:8px">
         <button class="sml" style="background:#1a2a52;color:#fff;border-color:#1a2a52"
-                id="cmpTreatmentBtn" onclick="compareTreatmentsUI()">⚖ What would Treatment A change?</button>
+                id="cmpTreatmentBtn" onclick="compareTreatmentsUI()">⚖ Rebuild the comparison now</button>
       </div>
+      <label style="display:flex;gap:6px;align-items:center;font-size:11px;margin-top:6px;font-weight:normal">
+        <input type="checkbox" id="autoCompareChk" onchange="setAutoCompare(this.checked)" checked>
+        Keep this comparison up to date automatically
+      </label>
       <div style="font-size:10px;color:#888;margin-top:4px;line-height:1.5">
-        Builds the whole report twice — once each way — and shows the difference in reported
-        proceeds, basis and gain, year by year. Changes nothing: your setting is restored when it
-        finishes. It re-reads the entire local cache twice, so it takes a few minutes.
+        After every fetch and rebuild, the report is built once more under the other treatment, in the
+        background, and the year-by-year difference in proceeds, basis and gain is saved here, along with a
+        Form 8949 under the other treatment. Your setting is never changed. The app stays usable meanwhile;
+        exports wait until it finishes so a file can never mix the two. Turn it off once your preparer has
+        decided on a treatment.
       </div>
       <div id="treatmentCompare" style="margin-top:10px"></div>
     </div>
@@ -4772,7 +4778,11 @@ async function runFetch(){
     if(logEl) { logEl.style.display='block'; }
     log(`Waiting for the running ${_ledgerLockHeld} to finish before fetching…`, 'wa');
   }
-  return withLedgerLock('fetch', _runFetchLocked);
+  // A fetch builds the ledger by its own path. The comparison is always made
+  // from two CACHE builds, so both sides come from the same code; clearing
+  // the base makes the background run rebuild your side from the cache first.
+  await withLedgerLock('fetch', async () => { await _runFetchLocked(); _lastBuildBase = null; });
+  if(USE_LOCAL_DB && !abortFlag) refreshCompareAfterBuild('fetch');
 }
 async function _runFetchLocked(){
   abortFlag=false; allTxs=[];
@@ -4883,6 +4893,10 @@ function doStop(){abortFlag=true;}
 
 // ── Render results ─────────────────────────────────────────────────────────
 function renderResults(){
+  // While the background comparison holds the lock, the live arrays hold the
+  // OTHER treatment's figures part of the time. Don't paint them; the run
+  // repaints when it hands the report back.
+  if(_ledgerLockHeld === 'background treatment comparison') return;
   // highRows and lowRows already built by processWalletRows during fetch
   // Just sort them if not already sorted
   if(highRows.length && !highRows[0]._sorted) {
@@ -5485,7 +5499,13 @@ async function buildReportFromCache(opts = {}) {
     return _ledgerBuildInFlight;
   }
   if(_ledgerLockHeld && !opts.silent) log(`Waiting for the running ${_ledgerLockHeld} to finish before rebuilding…`, 'wa');
-  return withLedgerLock('rebuild', () => _runLedgerBuild(opts));
+  const ok = await withLedgerLock('rebuild', async () => {
+    const r = await _runLedgerBuild(opts);
+    if(r) await captureBuildBase();
+    return r;
+  });
+  if(ok) refreshCompareAfterBuild('rebuild');
+  return ok;
 }
 
 // The build itself, for callers that already hold the lock. Never call this
@@ -5748,10 +5768,11 @@ async function setAmmTreatmentUI(value) {
     renderAmmTreatmentNote();
     // A figure produced under one treatment must never sit alongside a figure
     // produced under another, so this is not optional and not deferred.
-    if(USE_LOCAL_DB) await _runLedgerBuild({ silent: true });
+    if(USE_LOCAL_DB) { await _runLedgerBuild({ silent: true }); await captureBuildBase(); }
   });
   renderResults();
   renderDataSummary();
+  if(USE_LOCAL_DB) refreshCompareAfterBuild('treatment change');
 }
 
 function syncAmmTreatmentSelect() {
@@ -5808,54 +5829,264 @@ function treatmentSnapshot() {
   };
 }
 
+// ── The treatment comparison: built in the background, kept, shown instantly ──
+//
+// The comparison used to be a button that rebuilt the whole report twice
+// while you watched. It now runs by itself after every fetch and every
+// rebuild, stores the result, and shows it the moment Setup opens. The
+// Treatment A Form 8949 is kept from the same run, ready to download.
+//
+// Correctness rules, in order of importance:
+//   1. Everything happens inside ONE turn of the ledger lock. Nothing can run
+//      between its builds; it cannot start during a fetch.
+//   2. The on-screen report is restored to YOUR treatment before the turn
+//      ends, by a full rebuild. Exports are paused while the lock is held
+//      (ledgerBusy), so a file can never be cut from the other treatment's
+//      arrays mid-run.
+//   3. A stored result is shown only while it still describes the data: the
+//      cache row count, the app version, the price tables, the AMM ledger
+//      import AND the current treatment's own figures must all match what it
+//      was built from. Anything else marks it out of date and queues a rerun.
+//   4. A build that fails either consistency check aborts the comparison
+//      rather than storing figures from it.
+const BG_COMPARE_KEY = 'ammCompareCacheV1';
+const BG_COMPARE_ROWS_KEY = 'ammCompareRowsV1';
+const BG_COMPARE_AUTO_KEY = 'ammAutoCompare';
+let _lastBuildBase = null;        // { treatment, snap, stamp } from the latest build
+let _otherTreatmentRows = null;   // { treatment, rows, stamp } for the Treatment-A/standard PDF
+let _bgCompareQueued = false;
+let _compareState = 'none';       // none | stored | current | stale | running | failed
+
+function autoCompareEnabled() {
+  // The Playwright suite turns it off (playwright.config.js): extra builds
+  // after every startup would race the assertions. Its own logic is tested in
+  // test/ledger-lock.test.js.
+  if(window.appInfo && window.appInfo.backgroundCompare === false) return false;
+  try { return localStorage.getItem(BG_COMPARE_AUTO_KEY) !== 'off'; } catch(e) { return true; }
+}
+function setAutoCompare(on) {
+  try { localStorage.setItem(BG_COMPARE_AUTO_KEY, on ? 'on' : 'off'); } catch(e) {}
+  if(on) scheduleBackgroundCompare('setting switched on');
+  renderStoredCompare();
+}
+
+// Exports read the live ledger arrays. While anything holds the ledger lock
+// those arrays are being rebuilt, possibly under the other treatment.
+function ledgerBusy() {
+  if(!_ledgerLockHeld) return false;
+  alert(`The report is being recalculated (${_ledgerLockHeld}).\n\n` +
+        'Exports are paused until it finishes, so a file can never mix two calculations. ' +
+        'Try again in a minute.');
+  return true;
+}
+
+// Everything except the figures themselves that decides them.
+async function dataStamp() {
+  let amm = null;
+  try { amm = (USE_LOCAL_DB && window.taxDB.getAmmStats) ? await window.taxDB.getAmmStats() : null; } catch(e) {}
+  let ver = '';
+  try { ver = (window.appInfo && window.appInfo.getVersion) ? await window.appInfo.getVersion() : ''; } catch(e) {}
+  const last = (t) => { const k = Object.keys(t); return k.length ? k.sort()[k.length - 1] : ''; };
+  return JSON.stringify({
+    rows: rowsStreamedThisBuild, ver,
+    prices: [last(XRP_PRICES), last(XAH_PRICES), last(EVR_PRICES)],
+    amm: amm ? [amm.rows, amm.withDelivered, amm.importedAt || ''] : null,
+  });
+}
+const snapKey = (snap) => JSON.stringify(Object.keys(snap.byYear).sort().map(y => {
+  const v = snap.byYear[y];
+  return [y, v.rows, v.stProceeds.toFixed(2), v.stBasis.toFixed(2), v.ltProceeds.toFixed(2), v.ltBasis.toFixed(2)];
+}));
+const buildIsConsistent = () => !futureLotRows && !ledgerCountMismatch;
+
+// Called inside the lock at the end of every ordinary build or fetch.
+async function captureBuildBase() {
+  if(!buildIsConsistent()) { _lastBuildBase = null; return; }
+  _lastBuildBase = { treatment: ammTreatment, snap: treatmentSnapshot(), stamp: await dataStamp() };
+}
+
+function loadStoredCompare() {
+  try { const s = localStorage.getItem(BG_COMPARE_KEY); return s ? JSON.parse(s) : null; } catch(e) { return null; }
+}
+function storedCompareMatches(stored, base) {
+  if(!stored || !base || stored.stamp !== base.stamp) return false;
+  const side = base.treatment === 'A' ? stored.after : stored.before;
+  return !!side && snapKey(side) === snapKey(base.snap);
+}
+
+// The comparison proper. MUST be called with the lock held.
+async function _compareInsideLock(onProgress) {
+  const cur = ammTreatment;
+  const other = cur === 'A' ? 'none' : 'A';
+  const say = (m) => { if(onProgress) onProgress(m); };
+  let base = _lastBuildBase;
+  if(!base || base.treatment !== cur) {
+    say(`Building with your current setting (${cur === 'A' ? 'Treatment A' : 'not booked'})…`);
+    await _runLedgerBuild({ silent: true });
+    if(!buildIsConsistent()) throw new Error('the build with your current setting failed its consistency check');
+    await captureBuildBase();
+    base = _lastBuildBase;
+  }
+  let otherSnap, otherRows;
+  try {
+    say(`Building with ${other === 'A' ? 'Treatment A' : 'the standard (not booked) setting'}…`);
+    ammTreatment = other;
+    await _runLedgerBuild({ silent: true });
+    if(!buildIsConsistent()) throw new Error(`the ${other === 'A' ? 'Treatment A' : 'not-booked'} build failed its consistency check`);
+    otherSnap = treatmentSnapshot();
+    otherRows = allDisposalsHigh.slice();   // the row objects outlive the next reset
+  } finally {
+    // Restore in `finally`: leaving the app holding a treatment nobody chose,
+    // because a build threw halfway, is the one outcome this must not allow.
+    ammTreatment = cur;
+    say('Restoring your report…');
+    await _runLedgerBuild({ silent: true });
+    await captureBuildBase();
+  }
+  const result = {
+    before: cur === 'none' ? base.snap : otherSnap,
+    after:  cur === 'A'    ? base.snap : otherSnap,
+    at: new Date().toISOString(),
+    stamp: base.stamp,
+  };
+  _lastTreatmentCompare = result;
+  _otherTreatmentRows = { treatment: other, rows: otherRows, stamp: base.stamp };
+  try { localStorage.setItem(BG_COMPARE_KEY, JSON.stringify(result)); } catch(e) {}
+  try { localStorage.setItem(BG_COMPARE_ROWS_KEY, JSON.stringify(_otherTreatmentRows)); }
+  catch(e) { try { localStorage.removeItem(BG_COMPARE_ROWS_KEY); } catch(_) {} }  // too big: session only
+  return result;
+}
+
+function scheduleBackgroundCompare(reason) {
+  if(!USE_LOCAL_DB || !autoCompareEnabled() || _bgCompareQueued) return;
+  _bgCompareQueued = true;
+  withLedgerLock('background treatment comparison', async () => {
+    _bgCompareQueued = false;
+    const stored = loadStoredCompare();
+    if(storedCompareMatches(stored, _lastBuildBase)) {
+      _lastTreatmentCompare = stored;
+      _compareState = 'current';
+      renderStoredCompare();
+      return;
+    }
+    _compareState = 'running';
+    renderStoredCompare();
+    try {
+      await _compareInsideLock((m) => {
+        const el = document.getElementById('treatmentCompareStatus');
+        if(el) el.textContent = 'Updating in the background: ' + m;
+      });
+      _compareState = 'current';
+      log(`✓ Treatment comparison updated in the background (${reason}).`, 'ok');
+    } catch(e) {
+      _compareState = 'failed';
+      log(`Treatment comparison not updated: ${e.message}`, 'wa');
+    }
+  }).catch(() => { _bgCompareQueued = false; }).finally(() => {
+    // Outside the lock: renderResults/renderDataSummary refuse to paint while
+    // the background run holds it.
+    renderResults();
+    renderDataSummary();
+    renderStoredCompare();
+  });
+}
+
+// What the Setup panel shows, without building anything.
+function renderStoredCompare() {
+  const box = document.getElementById('treatmentCompare');
+  if(!box) return;
+  const auto = document.getElementById('autoCompareChk');
+  if(auto) auto.checked = autoCompareEnabled();
+  const stored = _lastTreatmentCompare || loadStoredCompare();
+  if(stored && !_lastTreatmentCompare) _lastTreatmentCompare = stored;
+  if(stored && _compareState === 'none') _compareState = 'stored';
+  const when = stored ? new Date(stored.at).toLocaleString() : '';
+  const status = {
+    none:    autoCompareEnabled() ? 'Not built yet — it will run in the background after the next build.' : 'Not built yet.',
+    stored:  `Saved result from ${when}. Checking it against the current data…`,
+    current: `Up to date — built ${when} from the data now loaded.`,
+    stale:   `Out of date: built ${when}, before the data changed.` + (autoCompareEnabled() ? ' Updating in the background…' : ' Click the button to rebuild it.'),
+    running: 'Updating in the background… the app stays usable; exports wait until it finishes.',
+    failed:  'The last background update failed its consistency check, so nothing was stored from it. See the log.',
+  }[_compareState] || '';
+  const colour = _compareState === 'current' ? '#1a5c2a' : (_compareState === 'failed' ? '#8b0000' : '#7a4a00');
+  box.innerHTML = `<div id="treatmentCompareStatus" style="font-size:11px;color:${colour};margin-bottom:6px">${status}</div>` +
+    (stored && stored.before && stored.after && _compareState !== 'none'
+      ? `<div style="${_compareState === 'stale' || _compareState === 'failed' ? 'opacity:.55' : ''}">${renderTreatmentCompare(stored.before, stored.after)}</div>`
+      : '');
+}
+
+// After every ordinary build: is the stored comparison still true?
+function refreshCompareAfterBuild(reason) {
+  const stored = loadStoredCompare();
+  if(stored) {
+    _compareState = storedCompareMatches(stored, _lastBuildBase) ? 'current' : 'stale';
+    if(_compareState === 'current') _lastTreatmentCompare = stored;
+  } else if(_compareState !== 'running') {
+    _compareState = 'none';
+    _lastTreatmentCompare = null;
+  }
+  renderStoredCompare();
+  if(_compareState !== 'current') scheduleBackgroundCompare(reason);
+  else if(!_otherTreatmentRows && stored) {
+    try {
+      const r = JSON.parse(localStorage.getItem(BG_COMPARE_ROWS_KEY) || 'null');
+      if(r && r.stamp === stored.stamp) _otherTreatmentRows = r;
+    } catch(e) {}
+  }
+}
+
+function otherTreatmentPdfReady() {
+  return !!(_otherTreatmentRows && _lastTreatmentCompare && _otherTreatmentRows.stamp === _lastTreatmentCompare.stamp &&
+            _compareState === 'current' && _otherTreatmentRows.treatment !== ammTreatment);
+}
+function exportOtherTreatmentPDF() {
+  if(!otherTreatmentPdfReady()) {
+    alert('The comparison copy is not available for the data now loaded. It is rebuilt in the background after each build; try again when the panel says "Up to date".');
+    return;
+  }
+  const t = _otherTreatmentRows.treatment;
+  exportForm8949PDF({
+    rows: _otherTreatmentRows.rows,
+    label: t === 'A' ? 'Treatment-A' : 'Standard',
+    title: (AMM_TREATMENTS[t] || AMM_TREATMENTS.none).short + ' — COMPARISON COPY, not your current setting',
+  });
+}
+
 async function compareTreatmentsUI() {
   if(!USE_LOCAL_DB) { alert('This needs the local cache.'); return; }
   const btn = document.getElementById('cmpTreatmentBtn');
   const box = document.getElementById('treatmentCompare');
-  const original = ammTreatment;
-
-  if(!confirm('Build the report twice to measure the difference?\n\n' +
-              'This reads the entire local cache once per treatment, so it will take a few ' +
-              'minutes. Your current setting is restored when it finishes — nothing is changed ' +
-              'and nothing is saved.')) return;
-
+  if(!confirm('Rebuild the comparison now?\n\n' +
+              'It normally updates itself in the background after every fetch and rebuild. ' +
+              'This forces a fresh run, which reads the whole local cache twice and takes a few ' +
+              'minutes. Your setting is restored when it finishes.')) return;
   if(btn) { btn.disabled = true; btn.textContent = '⏳ Building…'; }
   if(_ledgerLockHeld) {
     box.innerHTML = `<div style="font-size:11px;color:#555">Waiting for the running ${_ledgerLockHeld} to finish first…</div>`;
   }
-  // The whole comparison is ONE turn of the ledger lock: nothing may run
-  // between its builds, and it may not start while a fetch is running.
+  // ONE turn of the ledger lock for the whole comparison.
   await withLedgerLock('treatment comparison', async () => {
-  box.innerHTML = '<div style="font-size:11px;color:#555">Building with the current default (not booked)…</div>';
-  try {
-    ammTreatment = 'none';
-    await _runLedgerBuild({ silent: true });
-    const before = treatmentSnapshot();
-    if(futureLotRows || ledgerCountMismatch) throw new Error('the "not booked" build failed its consistency check');
-
-    box.innerHTML = '<div style="font-size:11px;color:#555">Building again with Treatment A…</div>';
-    ammTreatment = 'A';
-    await _runLedgerBuild({ silent: true });
-    const after = treatmentSnapshot();
-    if(futureLotRows || ledgerCountMismatch) throw new Error('the Treatment A build failed its consistency check');
-
-    box.innerHTML = renderTreatmentCompare(before, after);
-    _lastTreatmentCompare = { before, after, at: new Date().toISOString() };
-  } catch(e) {
-    box.innerHTML = `<div style="font-size:11px;color:#8b0000">Comparison failed: ${e.message}. ` +
-                    `Your setting was restored; rebuild to be sure the figures on screen match it.</div>`;
-  } finally {
-    // The restore is in `finally` on purpose. Leaving the app holding a
-    // treatment the user never chose — because a build threw halfway — is the
-    // one outcome this feature must not be able to produce.
-    ammTreatment = original;
-    syncAmmTreatmentSelect();
-    renderAmmTreatmentNote();
-    await _runLedgerBuild({ silent: true });
-    renderResults();
-    renderDataSummary();
-    if(btn) { btn.disabled = false; btn.textContent = '⚖ What would Treatment A change?'; }
-  }
+    _lastBuildBase = null;   // forced: build both sides fresh
+    _compareState = 'running';
+    renderStoredCompare();
+    try {
+      await _compareInsideLock((m) => {
+        const el = document.getElementById('treatmentCompareStatus');
+        if(el) el.textContent = m;
+      });
+      _compareState = 'current';
+    } catch(e) {
+      _compareState = 'failed';
+      log(`Treatment comparison failed: ${e.message}`, 'er');
+    } finally {
+      syncAmmTreatmentSelect();
+      renderAmmTreatmentNote();
+      renderResults();
+      renderDataSummary();
+      renderStoredCompare();
+      if(btn) { btn.disabled = false; btn.textContent = '⚖ Rebuild the comparison now'; }
+    }
   });
 }
 
@@ -5957,6 +6188,9 @@ function renderTreatmentCompare(before, after) {
     </div>
     <div style="margin-top:8px">
       <button class="sml" onclick="exportTreatmentCompareCSV()">⬇ Comparison (CSV)</button>
+      ${otherTreatmentPdfReady()
+        ? `<button class="sml" style="background:#7a1a1a;color:#fff;border-color:#7a1a1a" onclick="exportOtherTreatmentPDF()">⬇ Form 8949 ${taxYear()} under ${_otherTreatmentRows.treatment === 'A' ? 'Treatment A' : 'the standard setting'} (PDF)</button>`
+        : ''}
     </div>
   </div>`;
 }
@@ -5991,7 +6225,7 @@ function exportTreatmentCompareCSV() {
   lines.push(`"Zero-basis disposals, Treatment A",${after.shortRows}`);
   lines.push(`"AMM transactions booked under Treatment A",${after.booked}`);
   lines.push(`"AMM transactions skipped for want of a ledger-verified amount",${after.skipped}`);
-  downloadCSV(lines, `AMM-Treatment-Comparison-${new Date().toISOString().slice(0,10)}.csv`);
+  downloadCSV(lines, `AMM-Treatment-Comparison-${(_lastTreatmentCompare.at || new Date().toISOString()).slice(0,10)}.csv`);
 }
 
 async function clearAmmLedgerUI() {
@@ -6003,6 +6237,7 @@ async function clearAmmLedgerUI() {
 }
 
 function renderDataSummary() {
+  if(_ledgerLockHeld === 'background treatment comparison') return;   // see renderResults
   const total = grandTotalRaw();
   if(total === 0) return;
 
@@ -6180,6 +6415,7 @@ async function downloadCSVChunked(header, rows, rowToLine, filename, onProgress)
 }
 
 function exportCSV() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   // Key includes box so a disposal split into ST+LT portions exports as two
   // distinct rows (exactly how they appear on the actual Form 8949 pages).
   const map = {};
@@ -6204,6 +6440,7 @@ function exportCSV() {
 // Amount is deliberately blank rather than 0 where no column carries it — a
 // zero here would read as "nothing moved", which is the one wrong answer.
 function exportUnvaluedCSV() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   const rows = [...unvaluedRows].sort((a,b) =>
     (a.dk < b.dk ? -1 : a.dk > b.dk ? 1 : 0) || a.type.localeCompare(b.type));
   // "Amount Source" and "Submitted Amount" are not padding. An AMM figure read
@@ -6350,13 +6587,20 @@ const PDF_DISPOSAL_COLS = [
   {key:'term',     label:'Term',               w:34},
 ];
 
-function exportForm8949PDF() {
+function exportForm8949PDF(source) {
+  // `source` is the comparison copy kept by the background run: immutable
+  // rows, so it may be exported while the lock is held. Without it, the live
+  // arrays are read and must not be mid-rebuild.
+  const src = (source && Array.isArray(source.rows)) ? source : null;
+  if(!src && ledgerBusy()) return;
   if(typeof window.jspdf === 'undefined' || !window.jspdf.jsPDF) {
     alert('The PDF library did not load. This needs no internet: jsPDF ships with the app at renderer/vendor/jspdf.umd.min.js. If you are seeing this, that file is missing from the build — please report it.');
     return;
   }
-  if(highRows.length === 0 && lowRows.length === 0) {
-    alert('No data loaded. Run a full history fetch first.');
+  const yrSel = taxYear();
+  const srcHigh = src ? src.rows.filter(r => r.year === yrSel).sort((a,b)=>a.dk.localeCompare(b.dk)) : null;
+  if(src ? srcHigh.length === 0 : (highRows.length === 0 && lowRows.length === 0)) {
+    alert(src ? `The comparison copy has no Form 8949 rows for ${yrSel}.` : 'No data loaded. Run a full history fetch first.');
     return;
   }
   const { jsPDF } = window.jspdf;
@@ -6365,7 +6609,9 @@ function exportForm8949PDF() {
   const pageW = doc.internal.pageSize.getWidth();
   const pageH = doc.internal.pageSize.getHeight();
   const yr = taxYear();
-  const rows = pm==='high' ? highRows : lowRows;
+  const rows = src
+    ? (pm==='high' ? srcHigh : srcHigh.map(r => ({...r, proceeds: r.proceedsL, gain: r.gainL})))
+    : (pm==='high' ? highRows : lowRows);
   const stRows = rows.filter(r=>effectiveTerm(r)!=='LT').slice().sort((a,b)=>a.dk.localeCompare(b.dk));
   const ltRows = rows.filter(r=>effectiveTerm(r)==='LT').slice().sort((a,b)=>a.dk.localeCompare(b.dk));
   const sumOf = list => ({
@@ -6384,8 +6630,12 @@ function exportForm8949PDF() {
   doc.text(`Summary Statement — Tax Year ${yr} — Digital Assets (XRP / XAH / EVR)`, margin, y+34);
   doc.setFontSize(8.5); doc.setTextColor(90,90,90);
   doc.text(`Proceeds/Gain use Daily ${pm==='high'?'High':'Low'} price mode (switch on the Price Comparison tab and re-download to use the other).`, margin, y+50);
+  // Which AMM treatment produced these figures. Two exports that differ only
+  // in this used to be told apart by their file names alone.
+  if(src) doc.setTextColor(139,0,0);
+  doc.text(`AMM deposits and withdrawals: ${src ? src.title : ammTreatmentLabel()}`, margin, y+62);
   doc.setTextColor(20,20,30);
-  y += 74;
+  y += 80;
 
   doc.setFont('helvetica','normal'); doc.setFontSize(9);
   doc.text('Name(s) shown on return: _______________________________________', margin, y); y += 18;
@@ -6470,10 +6720,11 @@ function exportForm8949PDF() {
     doc.text(`Page ${p} of ${pageCount}  ·  Generated ${new Date().toLocaleDateString()}  ·  Not an official IRS document`, margin, pageH - 14);
   }
 
-  doc.save(`Form8949-Statement-${yr}.pdf`);
+  doc.save(`Form8949-Statement-${yr}-${src ? src.label : (ammTreatment === 'A' ? 'Treatment-A' : 'Standard')}.pdf`);
 }
 
 function exportIncome() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   const yr = taxYear();
   const lines = [
     'Description,Date Received,FMV (USD),Quantity,Ticker,Wallet,TX Hash,Tax Treatment',
@@ -6499,6 +6750,7 @@ function allTxCsvLine(r) {
 }
 
 async function exportAllTx() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   const btn = document.getElementById('exportAllTxBtn');
   if(btn) { btn.disabled = true; btn.textContent = '⏳ Exporting…'; }
   try {
@@ -6953,6 +7205,7 @@ function coinLedgerRow(e) {
 }
 
 async function exportKoinlyCSV() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   const btn = document.getElementById('exportKoinlyBtn');
   if(btn) { btn.disabled = true; btn.textContent = '⏳ Building…'; }
   try {
@@ -6983,6 +7236,7 @@ async function exportKoinlyCSV() {
 }
 
 async function exportCoinLedgerCSV() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   const btn = document.getElementById('exportCoinLedgerBtn');
   if(btn) { btn.disabled = true; btn.textContent = '⏳ Building…'; }
   try {
@@ -7259,6 +7513,7 @@ function walletActivityHTML(yr) {
 }
 
 function exportWalletActivityCSV() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   const yr = taxYear();
   const acts = computeWalletActivity(yr);
   if(acts.length === 0) { alert('No disposals for this tax year — build the report first.'); return; }
@@ -7624,6 +7879,7 @@ function lostWalletHTML(lostHoldings) {
 }
 
 function exportLostWalletCSV() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   if(lostWallets.length === 0) { alert('No wallets marked as lost yet.'); return; }
   const lostHoldings = computeHoldings().filter(h => isLostWallet(h.wallet));
   const lines = ['LOST WALLET BASIS REPORT — documentation only, not a deduction'];
@@ -7744,6 +8000,7 @@ function giftSummaryHTML() {
 }
 
 function exportGiftsCSV() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   if(allGiftRows.length === 0) { alert('No gifts recorded. Mark a destination as a gift, then rebuild.'); return; }
   const lines = ['Date,Recipient,Recipient Address,From Wallet,Asset,Quantity,Price USD,Value When Given USD,Your Cost Basis (carryover for gain),Basis If They Sell At A Loss,Dual Basis Applies,Your Holding Period,Earliest Lot Acquired,Tx Hash'];
   for(const g of [...allGiftRows].sort((a,b)=> (a.dk<b.dk?-1:a.dk>b.dk?1:0))) {
@@ -7800,6 +8057,7 @@ async function rebuildAfterOwnershipChange() {
 // and a single "total" that blends them is the misleading number this whole
 // tool has spent its life trying to stop producing.
 function exportHoldingsPDF() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   if(typeof window.jspdf === 'undefined' || !window.jspdf.jsPDF) {
     alert('The PDF library did not load. This needs no internet: jsPDF ships with the app at renderer/vendor/jspdf.umd.min.js. If you are seeing this, that file is missing from the build — please report it.');
     return;
@@ -7914,6 +8172,7 @@ function exportHoldingsPDF() {
 // 1 Jan 2025, which is precisely what this ledger does — so this file is also
 // the substantiation for that allocation.
 function exportExchangeBasisCSV() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   const rows = [];
   for(const [wallet, tickers] of Object.entries(walletLedger)) {
     if(!isTransferOnly(wallet)) continue;
@@ -7972,6 +8231,7 @@ function exportExchangeBasisCSV() {
 }
 
 function exportHoldingsCSV() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   const rows = computeHoldings();
   if(rows.length === 0) { alert('No holdings to export — build the report first.'); return; }
   const lines = ['Wallet,Description,Type,Asset,Quantity,Cost Basis USD,Unit Price USD,Price As Of,Current Value USD'];
@@ -7982,6 +8242,7 @@ function exportHoldingsCSV() {
 }
 
 async function exportDestinationsCSV() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   const yr = taxYear();
   const dests = computeDisposalDestinations(yr);
   if(dests.length === 0) { alert('No disposals for this tax year — build the report first.'); return; }
@@ -8017,6 +8278,7 @@ async function exportDestinationsCSV() {
 }
 
 function exportLedger() {
+  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
   if(Object.keys(walletLedger).length === 0) {
     alert('No basis ledger built. Run a full history fetch first.');
     return;
@@ -8065,6 +8327,7 @@ reconcileClassification();
 loadSelected();
 loadTermOverrides();
 loadAmmTreatment();
+try { renderStoredCompare(); } catch(e) {}
 logEl = document.getElementById('logSetup'); // so log() works even before the first Fetch click (e.g. the silent cache-load below)
 document.getElementById('xrpBasis')?.addEventListener('input', function() {
   document.getElementById('xrpBasisDisplay').textContent = this.value;

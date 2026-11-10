@@ -78,4 +78,6 @@ contextBridge.exposeInMainWorld('appInfo', {
   // Resolved from the main process's app.getVersion() — see the note on the
   // 'app:getVersion' handler in main.js.
   getVersion: () => ipcRenderer.invoke('app:getVersion'),
+  // false only when XRPTAX_BACKGROUND_COMPARE=off, which the test suite sets.
+  backgroundCompare: process.env.XRPTAX_BACKGROUND_COMPARE !== 'off',
 });

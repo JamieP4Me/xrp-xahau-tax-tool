@@ -73,16 +73,52 @@ test('the treatment switch changes the setting inside the lock', () => {
   assert.ok(!/buildReportFromCache\(/.test(b), 'calls the locking build from inside the lock: deadlock');
 });
 
-test('the comparison holds the lock across all three of its builds', () => {
-  const b = body('async function compareTreatmentsUI(');
-  assert.ok(/withLedgerLock\('treatment comparison'/.test(b));
-  assert.ok(!/buildReportFromCache\(/.test(b), 'calls the locking build from inside the lock: deadlock');
+test('both comparison entry points run it inside one turn of the lock', () => {
+  const ui = body('async function compareTreatmentsUI(');
+  assert.ok(/withLedgerLock\('treatment comparison'[\s\S]*_compareInsideLock\(/.test(ui));
+  const bg = body('function scheduleBackgroundCompare(');
+  assert.ok(/withLedgerLock\('background treatment comparison'[\s\S]*_compareInsideLock\(/.test(bg));
+  for (const b of [ui, bg]) assert.ok(!/buildReportFromCache\(/.test(b), 'locking build inside the lock: deadlock');
+  const callers = html.split('\n').filter((l) => /_compareInsideLock\(/.test(l) && !/async function _compareInsideLock/.test(l));
+  assert.strictEqual(callers.length, 2, callers.join('\n'));
+});
+
+test('the comparison builds both sides and always restores your treatment', () => {
+  const b = body('async function _compareInsideLock(');
+  assert.ok(!/withLedgerLock\(|buildReportFromCache\(/.test(b), 'would deadlock: it is called with the lock held');
   assert.strictEqual((b.match(/_runLedgerBuild\(/g) || []).length, 3);
+  const fin = b.indexOf('} finally {');
+  assert.ok(fin > 0 && b.indexOf('ammTreatment = cur;', fin) > fin, 'restore is not in finally');
+  assert.ok(/buildIsConsistent\(\)/.test(b), 'stores figures without checking the build');
+});
+
+test('a stored comparison is trusted only for the data and figures it was built from', () => {
+  const grab = (n) => { const i = html.indexOf(n); return html.slice(i, html.indexOf('\n}', i) + 2); };
+  const sk = html.slice(html.indexOf('const snapKey ='), html.indexOf('const buildIsConsistent'));
+  const f = new Function(sk + grab('function storedCompareMatches(') + '; return storedCompareMatches;')();
+  const snap = (g) => ({ byYear: { 2025: { rows: 3, stProceeds: 10, stBasis: 5, ltProceeds: 1, ltBasis: 0.5 + g } } });
+  const stored = { stamp: 'S', before: snap(0), after: snap(9) };
+  assert.strictEqual(f(stored, { treatment: 'none', stamp: 'S', snap: snap(0) }), true);
+  assert.strictEqual(f(stored, { treatment: 'A', stamp: 'S', snap: snap(9) }), true, 'switching treatment should reuse it');
+  assert.strictEqual(f(stored, { treatment: 'none', stamp: 'T', snap: snap(0) }), false, 'data changed');
+  assert.strictEqual(f(stored, { treatment: 'none', stamp: 'S', snap: snap(1) }), false, 'figures changed');
+  assert.strictEqual(f(null, { treatment: 'none', stamp: 'S', snap: snap(0) }), false);
+  assert.strictEqual(f(stored, null), false);
+});
+
+test('every export that reads the live arrays waits for the lock', () => {
+  for (const n of ['exportCSV', 'exportUnvaluedCSV', 'exportIncome', 'exportAllTx', 'exportKoinlyCSV',
+    'exportCoinLedgerCSV', 'exportWalletActivityCSV', 'exportLostWalletCSV', 'exportGiftsCSV', 'exportHoldingsPDF',
+    'exportExchangeBasisCSV', 'exportHoldingsCSV', 'exportDestinationsCSV', 'exportLedger']) {
+    const re = new RegExp('function ' + n + '\\(\\) ?\\{\\n  if\\(ledgerBusy\\(\\)\\) return;');
+    assert.ok(re.test(html), n + ' does not check ledgerBusy() first');
+  }
+  assert.ok(/if\(!src && ledgerBusy\(\)\) return;/.test(body('function exportForm8949PDF(')));
 });
 
 test('no caller outside the lock-holders reaches the raw build', () => {
   const calls = html.split('\n').filter((l) => /_runLedgerBuild\(/.test(l) && !/function _runLedgerBuild/.test(l));
-  assert.strictEqual(calls.length, 1 + 1 + 3, calls.join('\n'));   // buildReportFromCache + treatment + comparison
+  assert.strictEqual(calls.length, 1 + 1 + 3, calls.join('\n'));   // buildReportFromCache + treatment + _compareInsideLock
 });
 
 test('a sale matched to a lot acquired after it is a filing-blocking error', () => {
