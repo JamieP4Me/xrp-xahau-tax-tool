@@ -3434,6 +3434,8 @@ function resetLedgerState() {
   ledgerCountMismatch = null;
   rowsStreamedThisBuild = 0;
   rowsSkippedNotOwned = 0;
+  futureLotRows = 0;
+  futureLotSample = null;
   rowsSkippedStaleType = 0;
   // Counted during the build, same as the rest of this block. The map itself
   // is NOT cleared here — it is loaded from the cache once per rebuild by the
@@ -3478,6 +3480,10 @@ function pushDisposal(wallet, ticker, totalQty, dk, ds, yr, hash, priceH, priceL
   const consumed = ledgerFIFODetailed(wallet, ticker, totalQty);
   let stQty=0, stCost=0, ltQty=0, ltCost=0, stEarliest=null, ltEarliest=null, singleLotDate=null;
   for(const c of consumed) {
+    if(c.acqDate && dk && String(c.acqDate).slice(0, 10) > dk) {
+      futureLotRows++;
+      if(!futureLotSample) futureLotSample = { ticker, qty: c.qty, acquired: String(c.acqDate).slice(0, 10), sold: dk };
+    }
     if(isLongTerm(c.acqDate, dk)) {
       ltQty += c.qty; ltCost += c.qty*c.unitCost;
       if(!ltEarliest || (c.acqDate && c.acqDate < ltEarliest)) ltEarliest = c.acqDate;
@@ -3743,6 +3749,14 @@ const inferredBasisRows = [];
 // is somebody else's business, even if rows for it are still in the cache.
 function isFetchableOwnWallet(w) { return WALLETS.includes(w) || isLostWallet(w); }
 let rowsSkippedNotOwned = 0;
+// Disposals that drew on a lot dated AFTER the disposal. A single
+// chronological pass cannot produce one: the lot does not exist yet when the
+// disposal is processed. Two passes over the same arrays can, and did
+// (Nov 2026: a fetch and the treatment comparison overlapped; every 2024 and
+// 2025 row came out twice, the second copies selling coins "acquired" in
+// 2026). Unlike the row-count check, the second pass's reset cannot hide it.
+let futureLotRows = 0;
+let futureLotSample = null;
 
 // Per-wallet payment flow, accumulated during the build at no extra cost.
 //
@@ -3923,6 +3937,16 @@ function dataQualityHTML() {
            building this, that was 1,179 XRPL transactions moving 81,385 XRP.`}<br>
       The sync markers have already been cleared. <strong>Run a fetch to pull the missing history</strong>; nothing
       cached was deleted, and rows already held are kept rather than duplicated.
+    </div>`);
+  }
+  if(futureLotRows) {
+    const fs = futureLotSample;
+    parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#fdecea;border:2px solid #8b0000;border-radius:4px;font-size:11px;color:#8b0000">
+      <strong>✗ DO NOT FILE THESE FIGURES — internal consistency check failed.</strong><br>
+      ${futureLotRows.toLocaleString()} disposal lot(s) were matched to coins acquired <em>after</em> the sale
+      (e.g. ${fmt(fs.qty)} ${fs.ticker} sold ${fs.sold}, "acquired" ${fs.acquired}). One pass in date order cannot
+      do that; two report builds running over each other can, and they also duplicate rows and inflate gains.
+      Wait for any fetch or rebuild to finish, then use <em>View Report From Cache</em> to rebuild once.
     </div>`);
   }
   if(ledgerCountMismatch) {
@@ -4740,15 +4764,17 @@ async function processMergedXRPLEntries(entries, walletSet) {
 
 // ── Main fetch ─────────────────────────────────────────────────────────────
 async function runFetch(){
-  // A fetch rebuilds the very same ledger arrays a cache rebuild does, so
-  // starting one while a rebuild is running corrupts both, in exactly the way
-  // two concurrent rebuilds do. Wait for the in-flight one instead.
-  if(_ledgerBuildInFlight) {
+  // A fetch rebuilds the very same ledger arrays a cache rebuild does, so it
+  // takes the same lock: it waits for whatever is running, and anything
+  // started while it runs waits for it.
+  if(_ledgerLockHeld) {
     logEl = document.getElementById('logSetup');
     if(logEl) { logEl.style.display='block'; }
-    log('Waiting for the in-progress report build to finish before fetching…', 'wa');
-    try { await _ledgerBuildInFlight; } catch(_) {}
+    log(`Waiting for the running ${_ledgerLockHeld} to finish before fetching…`, 'wa');
   }
+  return withLedgerLock('fetch', _runFetchLocked);
+}
+async function _runFetchLocked(){
   abortFlag=false; allTxs=[];
   // Every run rebuilds the FIFO ledger and disposal/income rows fresh — in
   // desktop mode, from the full local cache (old + newly-synced rows); in
@@ -5417,16 +5443,54 @@ function renderSummary(){
 // rather than starting a competing one.
 let _ledgerBuildInFlight = null;
 
+// ONE lock for everything that writes the ledger arrays: a fetch, a rebuild,
+// a treatment switch, the treatment comparison. The join-the-running-build
+// guard above only knew about rebuilds. A fetch builds the same arrays itself
+// and never registered, so the comparison button (or the treatment dropdown)
+// pressed during a fetch ran a second pass straight over it. Measured
+// 2026-11-10: every 2024 row twice, 2025's gain $1,827 against a filed $882,
+// and the comparison's "not booked" column all zeros.
+//
+// Operations queue rather than refuse: each waits for the one before it to
+// finish completely. An operation that changes a setting the build reads per
+// row (ammTreatment) must change it INSIDE its turn, never before.
+let _ledgerLock = Promise.resolve();
+let _ledgerLockHeld = null;   // label of the running operation, for messages
+let _ledgerQueue = 0;         // running + waiting
+function withLedgerLock(label, fn) {
+  _ledgerQueue++;
+  const start = async () => {
+    _ledgerLockHeld = label;
+    try { return await fn(); } finally { _ledgerLockHeld = null; _ledgerQueue--; }
+  };
+  // Idle: start NOW, synchronously, so _ledgerBuildInFlight is set before
+  // this returns, exactly as it was before the lock existed (the tests and
+  // the join-a-running-rebuild check both read it). Busy: queue behind the
+  // last operation.
+  const run = _ledgerQueue === 1 ? start() : _ledgerLock.then(start);
+  _ledgerLock = run.catch(() => {});
+  return run;
+}
+
 // What happened to the last build. Three states the UI genuinely needs to
 // tell apart: never run, running, and stopped without finishing. Collapsing
 // the last two is what made a failed build look like a missing feature.
 let _lastBuildOutcome = null;   // null | 'ok' | 'empty' | Error
 
 async function buildReportFromCache(opts = {}) {
-  if(_ledgerBuildInFlight) {
+  // A second click during a plain rebuild joins it: same settings, same
+  // result. Anything else (a fetch, a treatment change) queues behind it.
+  if(_ledgerBuildInFlight && _ledgerLockHeld === 'rebuild') {
     if(!opts.silent) log('A report build is already running — waiting for it to finish rather than starting a second one.', 'wa');
     return _ledgerBuildInFlight;
   }
+  if(_ledgerLockHeld && !opts.silent) log(`Waiting for the running ${_ledgerLockHeld} to finish before rebuilding…`, 'wa');
+  return withLedgerLock('rebuild', () => _runLedgerBuild(opts));
+}
+
+// The build itself, for callers that already hold the lock. Never call this
+// without it.
+async function _runLedgerBuild(opts = {}) {
   _ledgerBuildInFlight = _buildReportFromCacheInner(opts);
   try {
     const ok = await _ledgerBuildInFlight;
@@ -5675,13 +5739,17 @@ async function setAmmTreatmentUI(value) {
     if(!ok) { syncAmmTreatmentSelect(); return; }
   }
 
-  ammTreatment = next;
-  saveAmmTreatment();
-  syncAmmTreatmentSelect();
-  renderAmmTreatmentNote();
-  // A figure produced under one treatment must never sit alongside a figure
-  // produced under another, so this is not optional and not deferred.
-  if(USE_LOCAL_DB) await buildReportFromCache({ silent: true });
+  // The setting is read per row during a build, so it changes inside the
+  // lock: never halfway through someone else's fetch or rebuild.
+  await withLedgerLock('treatment change', async () => {
+    ammTreatment = next;
+    saveAmmTreatment();
+    syncAmmTreatmentSelect();
+    renderAmmTreatmentNote();
+    // A figure produced under one treatment must never sit alongside a figure
+    // produced under another, so this is not optional and not deferred.
+    if(USE_LOCAL_DB) await _runLedgerBuild({ silent: true });
+  });
   renderResults();
   renderDataSummary();
 }
@@ -5752,16 +5820,24 @@ async function compareTreatmentsUI() {
               'and nothing is saved.')) return;
 
   if(btn) { btn.disabled = true; btn.textContent = '⏳ Building…'; }
+  if(_ledgerLockHeld) {
+    box.innerHTML = `<div style="font-size:11px;color:#555">Waiting for the running ${_ledgerLockHeld} to finish first…</div>`;
+  }
+  // The whole comparison is ONE turn of the ledger lock: nothing may run
+  // between its builds, and it may not start while a fetch is running.
+  await withLedgerLock('treatment comparison', async () => {
   box.innerHTML = '<div style="font-size:11px;color:#555">Building with the current default (not booked)…</div>';
   try {
     ammTreatment = 'none';
-    await buildReportFromCache({ silent: true });
+    await _runLedgerBuild({ silent: true });
     const before = treatmentSnapshot();
+    if(futureLotRows || ledgerCountMismatch) throw new Error('the "not booked" build failed its consistency check');
 
     box.innerHTML = '<div style="font-size:11px;color:#555">Building again with Treatment A…</div>';
     ammTreatment = 'A';
-    await buildReportFromCache({ silent: true });
+    await _runLedgerBuild({ silent: true });
     const after = treatmentSnapshot();
+    if(futureLotRows || ledgerCountMismatch) throw new Error('the Treatment A build failed its consistency check');
 
     box.innerHTML = renderTreatmentCompare(before, after);
     _lastTreatmentCompare = { before, after, at: new Date().toISOString() };
@@ -5775,11 +5851,12 @@ async function compareTreatmentsUI() {
     ammTreatment = original;
     syncAmmTreatmentSelect();
     renderAmmTreatmentNote();
-    await buildReportFromCache({ silent: true });
+    await _runLedgerBuild({ silent: true });
     renderResults();
     renderDataSummary();
     if(btn) { btn.disabled = false; btn.textContent = '⚖ What would Treatment A change?'; }
   }
+  });
 }
 
 let _lastTreatmentCompare = null;
