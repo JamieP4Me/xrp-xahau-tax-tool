@@ -39,6 +39,8 @@
  *   REWARD    no outbound to that counterparty in the window at all.
  *   MULTI     a purchase whose receipt carried several tokens at once. The
  *             total cost is known; how to split it across them is not.
+ *   RETURN    the same token sent and the same token back: change or a
+ *             refund, never a purchase. No basis assigned; left for review.
  *
  * WHAT IT REFUSES TO DO
  *
@@ -230,7 +232,12 @@ for (const wallet of wallets) {
     const tokens = r.legs.filter(l => l.asset !== 'XAH');
     let cls = 'REWARD', pay = null;
     if (near && dt <= windowSec) { near.used = true; pay = near; cls = tokens.length > 1 ? 'MULTI' : 'PURCHASE'; }
-    else if (near && dt <= reviewSec) cls = 'REVIEW';
+    // The same token back for the same token is not a purchase: 50 XXX out,
+    // 13.44 XXX back 43 s later is change or a refund, and calling it a
+    // purchase gives the returned units a basis they never had. Measured on
+    // the November cache: two such pairs (XXX and RVN).
+    if (pay && tokens.length === 1 && pay.legs.length === 1 && pay.legs[0].asset === tokens[0].asset) cls = 'RETURN';
+    if (!pay && near && dt <= reviewSec) cls = 'REVIEW';
     classified.push({ r, cls, pay, dt, tokens });
     // Forward swap: XAH given, one token back -> an XAH rate for that token.
     if (cls === 'PURCHASE' && pay.legs.every(l => l.asset === 'XAH')) {
@@ -311,6 +318,14 @@ for (const c of classified) {
       rows.push({ ...base, qty: t.qty, asset: t.asset, consideration: '', paidAt: '', considerationUsd: null,
                   basis: v.usd, perUnit: v.usd != null ? v.usd / t.qty : null, income: v.usd, notes: v.note, flags });
     }
+  } else if (c.cls === 'RETURN') {
+    const sent = c.pay.legs[0].qty, back = c.tokens[0].qty;
+    rows.push({ ...base, qty: back, asset: c.tokens[0].asset, consideration: `${qtyS(sent)} ${c.tokens[0].asset}`,
+                paidAt: c.pay.ts, considerationUsd: null, basis: null, perUnit: null, income: null,
+                notes: `same token back: ${qtyS(sent)} sent, ${qtyS(back)} returned, net ${qtyS(sent - back)} ${c.tokens[0].asset} ` +
+                       `left the wallet. No new basis: the returned units keep the basis they left with. ` +
+                       `What the net amount was (fee, deposit, purchase of something not received here) needs a look.`,
+                flags: ['REVIEW', 'SAME-TOKEN-RETURN'] });
   } else {
     for (const t of c.tokens) {
       rows.push({ ...base, qty: t.qty, asset: t.asset, consideration: '', paidAt: '', considerationUsd: null,
@@ -345,7 +360,7 @@ console.log(oraclePath ? `oracle: ${oraclePath} · ${Object.keys(ORACLE).length}
 const byCls = {};
 for (const c of classified) byCls[c.cls] = (byCls[c.cls] || 0) + 1;
 console.log('--- receipts by class ---');
-for (const k of ['PURCHASE', 'MULTI', 'REWARD', 'REVIEW']) console.log(`  ${k.padEnd(9)} ${String(byCls[k] || 0).padStart(5)}`);
+for (const k of ['PURCHASE', 'MULTI', 'RETURN', 'REWARD', 'REVIEW']) console.log(`  ${k.padEnd(9)} ${String(byCls[k] || 0).padStart(5)}`);
 
 const byAsset = {};
 for (const r of rows) {
