@@ -47,9 +47,19 @@
  *   never assigns a basis it cannot derive. Native XAH legs are excluded:
  *   their treatment is deferred to the preparer.
  *
- * Prices are DAILY HIGH, read from the app's own tables in
+ * XAH and EVR are priced at the DAILY HIGH from the app's own tables in
  * renderer/index.html, because that is what the app uses for basis and
- * income. Two price sources on one return would be its own inconsistency.
+ * income. Two price sources for one asset would be its own inconsistency.
+ *
+ * Tokens the tables do not carry (XXX, RVN, the LP tokens) are valued, in
+ * order of preference:
+ *   1. --oracle CSV (npm run oracle:prices): the on-ledger oracle's USD
+ *      price in the hour of receipt, or the nearest hour within 24 h. This
+ *      is fair market value at the time, which is what income needs.
+ *   2. Your own nearest XAH purchase rate x the XAH daily high. Fine when
+ *      the purchase is close; flagged RATE->14d when it is not. With an
+ *      oracle loaded, a fall-back to this is flagged ORACLE-GAP.
+ * Purchases are never revalued by the oracle: basis is what was paid.
  *
  * READONLY against the cache. Writes one CSV (gitignored) and a summary.
  *
@@ -63,7 +73,7 @@ const path = require('path');
 const { parseArgs, openCache, decodeCurrency } = require('./iou-inventory');
 
 const ROOT = path.join(__dirname, '..');
-let year = 2026, out = null, windowSec = 120, reviewSec = 600, htmlPath = path.join(ROOT, 'renderer', 'index.html');
+let year = 2026, out = null, windowSec = 120, reviewSec = 600, htmlPath = path.join(ROOT, 'renderer', 'index.html'), oraclePath = null;
 const shared = [process.argv[0], process.argv[1]];
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
@@ -72,6 +82,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === '--window') windowSec = Number(process.argv[++i]);
   else if (a === '--review') reviewSec = Number(process.argv[++i]);
   else if (a === '--html') htmlPath = process.argv[++i];
+  else if (a === '--oracle') oraclePath = process.argv[++i];
   else if (a === '--db') shared.push(a, process.argv[++i]);
   else { console.error('Unknown argument: ' + a); process.exit(1); }
 }
@@ -109,6 +120,39 @@ function priceOf(asset, dk) {
     if (d < bestD) { best = k; bestD = d; }
   }
   return { usd: t[best].high, used: best, days: Math.round(bestD), stale: dk > LAST[asset] };
+}
+
+// -- oracle: hourly closes from npm run oracle:prices (optional) -------------
+const HOUR = 3600000;
+const ORACLE = {};
+if (oraclePath) {
+  const txt = fs.readFileSync(oraclePath, 'utf8').trim().split('\n');
+  const hdr = txt.shift().split(',');
+  const iH = hdr.indexOf('Hour (UTC)'), iP = hdr.indexOf('Pair'), iC = hdr.indexOf('Close');
+  if (iH < 0 || iP < 0 || iC < 0) throw new Error(oraclePath + ' is not an oracle:prices CSV');
+  for (const line of txt) {
+    const c = line.split(',');
+    const ms = Date.parse(c[iH] + ':00Z'), close = Number(c[iC]);
+    if (!Number.isFinite(ms) || !(close > 0)) continue;
+    (ORACLE[c[iP]] = ORACLE[c[iP]] || []).push({ ms, close });
+  }
+  for (const k of Object.keys(ORACLE)) ORACLE[k].sort((a, b) => a.ms - b.ms);
+}
+// The bucket holding ms, else the nearest within 24 h (earlier wins a tie).
+function oracleAt(pair, ms) {
+  const list = ORACLE[pair];
+  if (!list || !list.length) return null;
+  const want = Math.floor(ms / HOUR) * HOUR;
+  let lo = 0, hi = list.length - 1;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (list[mid].ms < want) lo = mid + 1; else hi = mid; }
+  let best = null;
+  for (const j of [lo - 1, lo]) {
+    if (j < 0 || j >= list.length) continue;
+    const d = Math.abs(list[j].ms - want);
+    if (!best || d < best.d) best = { ...list[j], d };
+  }
+  if (!best || best.d > 24 * HOUR) return null;
+  return { usd: best.close, hour: new Date(best.ms).toISOString().slice(0, 13) + ':00', hours: Math.round(best.d / HOUR) };
 }
 
 const NUL = String.fromCharCode(0);
@@ -215,10 +259,17 @@ function valueLeg(leg, ms) {
     return { usd: leg.qty * p.usd, stale: p.stale, farRate: false,
              note: `${qtyS(leg.qty)} ${leg.asset} x $${p.usd} (${leg.asset} high ${p.used}${p.days ? ', ' + p.days + 'd from ' + dk : ''})` };
   }
+  const o = oracleAt(leg.asset + '/USD', ms);
+  if (o) {
+    return { usd: leg.qty * o.usd, stale: false, farRate: false, src: 'oracle',
+             note: `${qtyS(leg.qty)} ${leg.asset} x $${o.usd} (oracle ${leg.asset}/USD ${o.hour}${o.hours ? ', ' + o.hours + 'h away' : ''})` };
+  }
+  const gap = oraclePath ? true : false;
   const r = rateFor(leg.asset, ms);
-  if (!r) return { usd: null, stale: false, farRate: false, note: `no XAH rate for ${leg.asset}: you never bought it with XAH` };
+  if (!r) return { usd: null, stale: false, farRate: false, oracleGap: gap, note: `no XAH rate for ${leg.asset}: you never bought it with XAH` +
+                   (gap ? '; no oracle price within 24h either' : '') };
   const p = priceOf('XAH', dk);
-  return { usd: leg.qty * r.xahPerUnit * p.usd, stale: p.stale, farRate: r.days > 14,
+  return { usd: leg.qty * r.xahPerUnit * p.usd, stale: p.stale, farRate: r.days > 14, oracleGap: gap, src: 'rate',
            note: `${qtyS(leg.qty)} ${leg.asset} x ${r.xahPerUnit.toFixed(6)} XAH (own purchase ${r.dk}: ${r.how}` +
                  `${r.days ? ', ' + r.days + 'd away' : ''}) x $${p.usd} (XAH high ${p.used})` };
 }
@@ -235,6 +286,8 @@ for (const c of classified) {
     if (!known) flags.push('CONSIDERATION-UNVALUED');
     if (vals.some(v => v.stale)) flags.push('STALE-PRICE');
     if (vals.some(v => v.farRate)) flags.push('RATE->14d');
+    if (vals.some(v => v.oracleGap)) flags.push('ORACLE-GAP');
+    if (vals.some(v => v.src === 'oracle')) flags.push('ORACLE');
     if (c.cls === 'MULTI') flags.push('MULTI-TOKEN-RECEIPT');
     for (const t of c.tokens) {
       const basis = c.cls === 'PURCHASE' ? cost : null;
@@ -253,6 +306,8 @@ for (const c of classified) {
       if (v.usd == null) flags.push('UNVALUED');
       if (v.stale) flags.push('STALE-PRICE');
       if (v.farRate) flags.push('RATE->14d');
+      if (v.oracleGap) flags.push('ORACLE-GAP');
+      if (v.src === 'oracle') flags.push('ORACLE');
       rows.push({ ...base, qty: t.qty, asset: t.asset, consideration: '', paidAt: '', considerationUsd: null,
                   basis: v.usd, perUnit: v.usd != null ? v.usd / t.qty : null, income: v.usd, notes: v.note, flags });
     }
@@ -283,7 +338,9 @@ fs.writeFileSync(out, lines.join('\n') + '\n');
 const fmt = (n) => Number(n).toLocaleString('en-US', { maximumFractionDigits: 6 });
 console.log(`cache: ${args.db}`);
 console.log(`tax year ${year} · ${wallets.length} wallet(s) with Remit activity · pairing window ${windowSec}s, review to ${reviewSec}s`);
-console.log(`prices: daily HIGH from the app's own tables · XAH table ends ${LAST.XAH}, EVR table ends ${LAST.EVR}\n`);
+console.log(`prices: daily HIGH from the app's own tables · XAH table ends ${LAST.XAH}, EVR table ends ${LAST.EVR}`);
+console.log(oraclePath ? `oracle: ${oraclePath} · ${Object.keys(ORACLE).length} pair(s): ${Object.keys(ORACLE).sort().join(' ')}\n`
+                       : 'oracle: none (pass --oracle <csv> from npm run oracle:prices to value tokens at market)\n');
 
 const byCls = {};
 for (const c of classified) byCls[c.cls] = (byCls[c.cls] || 0) + 1;
@@ -324,6 +381,25 @@ for (const [k, list] of Object.entries(rateObs).sort()) {
     console.log(`         WARNING: ${k} rates differ ${spread.toFixed(1)}x. Check these purchases ` +
                 `before relying on anything valued by them (see the CSV notes).`);
   }
+}
+
+if (oraclePath) {
+  // Each purchase is a price you actually paid. Set beside what the oracle
+  // said in the same hour, it is the only independent check on the oracle
+  // this project has -- and the oracle is the only check on a stale rate.
+  console.log('\n--- your purchases vs the oracle, same hour (USD per unit) ---');
+  console.log('  asset  date        you paid      oracle     ratio');
+  let shown = 0;
+  for (const [k, list] of Object.entries(rateObs).sort()) {
+    for (const ob of list) {
+      const o = oracleAt(k + '/USD', ob.ms);
+      const paid = ob.xahPerUnit * priceOf('XAH', ob.dk).usd;
+      console.log(`  ${k.padEnd(6)} ${ob.dk}  ${paid.toFixed(6).padStart(11)} ${o ? o.usd.toFixed(6).padStart(11) : '         -'}` +
+                  `${o ? (paid / o.usd).toFixed(2).padStart(9) : ''}`);
+      shown++;
+    }
+  }
+  if (!shown) console.log('  (no purchases to compare)');
 }
 
 const fl = {};
