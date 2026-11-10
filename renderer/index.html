@@ -648,7 +648,7 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
 // timestamp. Each entry is the highest and lowest CoinGecko price SAMPLED
 // DURING that UTC day.
 //
-// DATE ALIGNMENT (corrected Nov 2026). Until v1.10.3 every key in all three
+// DATE ALIGNMENT (corrected Nov 2026). Before that, every key in all three
 // series was one day late: the entry labelled D held day D-1's range. That is
 // the signature of reading CoinGecko OHLC candles, whose timestamp is the
 // candle's CLOSE (00:00 of the next day), as though it were the open. Checked
