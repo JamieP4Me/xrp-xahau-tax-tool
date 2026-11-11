@@ -3470,6 +3470,59 @@ function resetLedgerState() {
   ammBookedWithdrawQty = 0;
 }
 
+// Everything resetLedgerState() clears, captured and put back. The treatment
+// comparison builds the report under the other setting and then has to hand
+// back yours; rebuilding it from the cache was a third multi-minute pass over
+// six million rows to recreate a few thousand rows and lots that were in
+// memory a moment ago. test/ledger-lock.test.js checks that every name reset
+// above is carried here, so a new piece of ledger state cannot be forgotten
+// on the restore path.
+//
+// walletLedger's FIFO cursors (_fifoCursor, a WeakMap keyed by the lot
+// arrays) are not carried: the clone makes new arrays, so the cursor restarts
+// at 0 and the next scan simply walks the spent prefix once more.
+function snapshotLedgerState() {
+  const c = (v) => structuredClone(v);
+  return {
+    allDisposalsHigh: c(allDisposalsHigh), allIncomeRows: c(allIncomeRows),
+    allGiftRows: c(allGiftRows), allLostSpendRows: c(allLostSpendRows),
+    inferredBasisRows: c(inferredBasisRows), unvaluedRows: c(unvaluedRows),
+    basisShortfalls: c(basisShortfalls), allTransactionHistory: c(allTransactionHistory),
+    missingPriceRows: c(missingPriceRows),
+    walletFlowStats: c(walletFlowStats), myVolumeByMonth: c(myVolumeByMonth),
+    unvaluedSamples: c(unvaluedSamples), walletLedger: c(walletLedger),
+    transactionsScanned, dustSkipped, ledgerCountMismatch: c(ledgerCountMismatch),
+    rowsStreamedThisBuild, rowsSkippedNotOwned, futureLotRows, futureLotSample: c(futureLotSample),
+    rowsSkippedStaleType, ammLedgerUsed, ammLedgerMissing, ammLedgerUplift, ammNoXrpLeg,
+    ammBookedDeposits, ammBookedWithdrawals, ammSkippedUnverified, ammBookedDepositQty, ammBookedWithdrawQty,
+  };
+}
+function restoreLedgerState(snap) {
+  resetLedgerState();
+  const fill = (dst, src) => { for(let i = 0; i < src.length; i++) dst.push(src[i]); };   // no spread: arrays can be large
+  const c = (v) => structuredClone(v);   // the snapshot stays intact for a second restore
+  fill(allDisposalsHigh, c(snap.allDisposalsHigh)); fill(allIncomeRows, c(snap.allIncomeRows));
+  fill(allGiftRows, c(snap.allGiftRows)); fill(allLostSpendRows, c(snap.allLostSpendRows));
+  fill(inferredBasisRows, c(snap.inferredBasisRows)); fill(unvaluedRows, c(snap.unvaluedRows));
+  fill(basisShortfalls, c(snap.basisShortfalls)); fill(allTransactionHistory, c(snap.allTransactionHistory));
+  fill(missingPriceRows, c(snap.missingPriceRows));
+  Object.assign(walletFlowStats, c(snap.walletFlowStats)); Object.assign(myVolumeByMonth, c(snap.myVolumeByMonth));
+  Object.assign(unvaluedSamples, c(snap.unvaluedSamples)); Object.assign(walletLedger, c(snap.walletLedger));
+  _flowsCache = null;
+  transactionsScanned = snap.transactionsScanned; dustSkipped = snap.dustSkipped;
+  ledgerCountMismatch = c(snap.ledgerCountMismatch);
+  rowsStreamedThisBuild = snap.rowsStreamedThisBuild; rowsSkippedNotOwned = snap.rowsSkippedNotOwned;
+  futureLotRows = snap.futureLotRows; futureLotSample = c(snap.futureLotSample);
+  rowsSkippedStaleType = snap.rowsSkippedStaleType;
+  ammLedgerUsed = snap.ammLedgerUsed; ammLedgerMissing = snap.ammLedgerMissing;
+  ammLedgerUplift = snap.ammLedgerUplift; ammNoXrpLeg = snap.ammNoXrpLeg;
+  ammBookedDeposits = snap.ammBookedDeposits; ammBookedWithdrawals = snap.ammBookedWithdrawals;
+  ammSkippedUnverified = snap.ammSkippedUnverified;
+  ammBookedDepositQty = snap.ammBookedDepositQty; ammBookedWithdrawQty = snap.ammBookedWithdrawQty;
+  syncTaxYearSelects();
+  applyReportingYear(taxYear());
+}
+
 const MS_PER_DAY = 86400000;
 function holdingDays(acqDateStr, disposalDateKey) {
   if(!acqDateStr) return 0; // unknown lot → treated as 0 days (short-term)
@@ -5957,6 +6010,9 @@ async function _compareInsideLock(onProgress) {
     await captureBuildBase();
     base = _lastBuildBase;
   }
+  // Your report, as it stands, so it can be handed back without a third
+  // pass over the cache.
+  const mine = snapshotLedgerState();
   let otherSnap, otherRows;
   try {
     say(`Building with ${other === 'A' ? 'Treatment A' : 'the standard (not booked) setting'}…`);
@@ -5970,7 +6026,8 @@ async function _compareInsideLock(onProgress) {
     // because a build threw halfway, is the one outcome this must not allow.
     ammTreatment = cur;
     say('Restoring your report…');
-    await _runLedgerBuild({ silent: true });
+    restoreLedgerState(mine);
+    try { renderPriceHistory(); } catch(_) {}
     await captureBuildBase();
   }
   const result = {

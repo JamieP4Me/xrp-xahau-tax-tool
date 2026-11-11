@@ -448,6 +448,41 @@ test('a sub-1 EVR reward is income with a basis lot; sub-1 XAH is still dust', a
   expect(out.xahLots).toEqual([]);
 });
 
+test('snapshotLedgerState/restoreLedgerState round-trip the report exactly', async () => {
+  const out = await window.evaluate((args) => {
+    resetLedgerState();
+    const helpers = makeXahauPriceHelpers();
+    const ws = new Set([args.wallet]);
+    const pay = (hash, ts, from, to, xah, val, cur) => ({
+      TransactionType: 'Payment', TransactionResult: 'tesSUCCESS', Account: from, Destination: to,
+      Timestamp: ts, TransactionHash: hash, Amount_XRP: xah, delivered_amount_XRP: xah,
+      Amount_value: val, Amount_currency: cur, delivered_amount_value: val, delivered_amount_currency: cur,
+    });
+    processOneXahauRow(pay('R1', '2024-03-01 00:00:00', args.other, args.wallet, '0', '12', 'EVR'), args.wallet, ws, 'in', helpers);
+    processOneXahauRow(pay('R2', '2024-04-01 00:00:00', args.other, args.wallet, '500', '', ''), args.wallet, ws, 'in', helpers);
+    processOneXahauRow(pay('S1', '2025-05-01 00:00:00', args.wallet, args.other, '0', '5', 'EVR'), args.wallet, ws, 'out', helpers);
+    processOneXahauRow(pay('S2', '2025-06-01 00:00:00', args.wallet, args.other, '900', '', ''), args.wallet, ws, 'out', helpers);
+    rowsStreamedThisBuild = 4; transactionsScanned = 4;
+    const view = () => JSON.stringify({
+      d: allDisposalsHigh, i: allIncomeRows, l: walletLedger, sf: basisShortfalls, u: unvaluedRows,
+      n: [transactionsScanned, rowsStreamedThisBuild, dustSkipped, futureLotRows],
+    });
+    const before = view();
+    const snap = snapshotLedgerState();
+    resetLedgerState();
+    const cleared = allDisposalsHigh.length === 0 && Object.keys(walletLedger).length === 0 && rowsStreamedThisBuild === 0;
+    restoreLedgerState(snap);
+    const after = view();
+    // The snapshot is reusable: a second restore must give the same again.
+    resetLedgerState(); restoreLedgerState(snap);
+    return { cleared, same: before === after, again: view() === before, disposals: allDisposalsHigh.length };
+  }, { wallet: W_XAHAU, other: OTHER });
+  expect(out.cleared).toBe(true);
+  expect(out.disposals).toBe(2);
+  expect(out.same).toBe(true);
+  expect(out.again).toBe(true);
+});
+
 test('a token name that is HTML is shown as text in the not-on-8949 panel', async () => {
   // The currency code is the token's own 20 bytes, decoded. Anyone can Remit
   // a token to this wallet, so the name is attacker-chosen.

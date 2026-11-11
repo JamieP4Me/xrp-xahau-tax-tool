@@ -86,7 +86,10 @@ test('both comparison entry points run it inside one turn of the lock', () => {
 test('the comparison builds both sides and always restores your treatment', () => {
   const b = body('async function _compareInsideLock(');
   assert.ok(!/withLedgerLock\(|buildReportFromCache\(/.test(b), 'would deadlock: it is called with the lock held');
-  assert.strictEqual((b.match(/_runLedgerBuild\(/g) || []).length, 3);
+  // Two builds at most (yours only when no clean base exists); the restore
+  // is a snapshot, never a third pass over the cache.
+  assert.strictEqual((b.match(/_runLedgerBuild\(/g) || []).length, 2);
+  assert.ok(/const mine = snapshotLedgerState\(\)/.test(b) && /restoreLedgerState\(mine\)/.test(b));
   const fin = b.indexOf('} finally {');
   assert.ok(fin > 0 && b.indexOf('ammTreatment = cur;', fin) > fin, 'restore is not in finally');
   assert.ok(/buildIsConsistent\(\)/.test(b), 'stores figures without checking the build');
@@ -118,7 +121,7 @@ test('every export that reads the live arrays waits for the lock', () => {
 
 test('no caller outside the lock-holders reaches the raw build', () => {
   const calls = html.split('\n').filter((l) => /_runLedgerBuild\(/.test(l) && !/function _runLedgerBuild/.test(l));
-  assert.strictEqual(calls.length, 1 + 1 + 3, calls.join('\n'));   // buildReportFromCache + treatment + _compareInsideLock
+  assert.strictEqual(calls.length, 1 + 1 + 2, calls.join('\n'));   // buildReportFromCache + treatment + _compareInsideLock
 });
 
 test('a sale matched to a lot acquired after it is a filing-blocking error', () => {
@@ -146,6 +149,21 @@ test('the row-count check expects the same type-filtered rows the build streams'
     assert.ok(/countForChain\(chain, types\)/.test(b));
   }
   assert.ok(/getChainRowsPage\(chain, LEDGER_PAGE_ROWS, cursor, types\)/.test(st));
+});
+
+test('every piece of state resetLedgerState clears is carried by the snapshot and the restore', () => {
+  const reset = body('function resetLedgerState(');
+  const names = new Set();
+  for (const m of reset.matchAll(/^\s*(?:Object\.keys\()?([A-Za-z_]\w*)/gm)) {
+    const n = m[1];
+    if (['function', 'const', 'let', 'return'].includes(n)) continue;
+    names.add(n);
+  }
+  assert.ok(names.size >= 25, 'parsed only ' + names.size + ' names from resetLedgerState');
+  const snap = body('function snapshotLedgerState(');
+  const restore = body('function restoreLedgerState(');
+  const missing = [...names].filter((n) => n !== '_flowsCache' && !(new RegExp('\\b' + n + '\\b').test(snap) && new RegExp('\\b' + n + '\\b').test(restore)));
+  assert.deepStrictEqual(missing, []);
 });
 
 Promise.all(pending).then(() => {
