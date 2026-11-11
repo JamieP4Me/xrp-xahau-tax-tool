@@ -7819,9 +7819,10 @@ async function renderHoldings() {
           const marked = isTransferOnly(d.dest);
           const gift = giftEntry(d.dest);
           // The address goes into inline handler attributes below. A row's
-          // Destination is ledger data; only a real r-address may be
-          // interpolated there, anything else is shown but gets no buttons.
-          const isDex = d.dest === 'DEX offer' || d.dest === '(unrecorded)' || !R_ADDR_RE.test(d.dest);
+          // Destination is ledger data; only a plain alphanumeric token may
+          // be interpolated there (a real address always is), anything else
+          // is shown escaped but gets no buttons.
+          const isDex = d.dest === 'DEX offer' || d.dest === '(unrecorded)' || !/^[A-Za-z0-9_-]+$/.test(d.dest);
           return `<tr style="${gift ? 'background:#f6ecff' : (marked ? 'background:#e8f5e9' : '')}">
           <td style="text-align:center">${isDex ? '—' : `<input type="checkbox" ${marked ? 'checked' : ''} onchange="toggleTransferOnly('${d.dest}')">`}</td>
           <td style="text-align:center">${isDex ? '—' : (gift

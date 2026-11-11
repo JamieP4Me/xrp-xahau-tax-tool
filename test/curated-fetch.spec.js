@@ -478,7 +478,8 @@ test('snapshotLedgerState/restoreLedgerState round-trip the report exactly', asy
     return { cleared, same: before === after, again: view() === before, disposals: allDisposalsHigh.length };
   }, { wallet: W_XAHAU, other: OTHER });
   expect(out.cleared).toBe(true);
-  expect(out.disposals).toBe(2);
+  // S1, plus S2 split into the 500 XAH long-term lot and a 400 XAH shortfall.
+  expect(out.disposals).toBe(3);
   expect(out.same).toBe(true);
   expect(out.again).toBe(true);
 });
