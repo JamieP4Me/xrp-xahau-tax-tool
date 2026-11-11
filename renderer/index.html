@@ -2840,7 +2840,20 @@ function parseAmmLedgerCSV(text) {
   return { rows, errors, stats: { total: rows.length, withDelivered, unpaired, flagged } };
 }
 
-const DUST_MIN_UNITS = 1.0;
+// Per asset, because the floor was doing two different jobs. For XRP and
+// XAH it filters spam: a 1-drop payment is noise and booking it as a lot put
+// phantom inventory ahead of real coins (Round 5). For EVR the same floor
+// was deleting the business. Evernode pays a host its reward per heartbeat:
+// at the measured 38.1 EVR/day across 45 hosts that is a few hundredths of
+// an EVR per payment, every one below 1.0, so until Nov 2026 no reward was
+// income and no reward had a basis lot. 11,546 EVR of "zero basis" across
+// ~70 host accounts was those rewards leaving the hosts with the basis the
+// floor had thrown away. EVR is an IOU that only the Evernode issuer mints,
+// so dust-spam in EVR is not a thing worth a floor; 1e-6 only drops a true
+// rounding residue.
+const DUST_FLOOR = { XRP: 1.0, XAH: 1.0, EVR: 0.000001 };
+const DUST_MIN_UNITS = DUST_FLOOR.XRP;   // the XRP paths still read this name
+const dustOk = (ticker, qty) => qty >= (DUST_FLOOR[ticker] ?? 1.0) && qty < 1e9;
 let dustSkipped = 0;
 
 // Format "now (minus the safety buffer)" the same way WinDB's own Timestamp
@@ -4102,13 +4115,16 @@ function dataQualityHTML() {
           <th style="text-align:right;padding:3px 6px">Units known</th>
           <th style="text-align:left;padding:3px 6px">Why it is not booked</th></tr>
         ${order.map(([t,v]) => `<tr style="border-top:1px solid #e0cba8">
-          <td style="padding:3px 6px"><code>${t}</code></td>
+          <td style="padding:3px 6px"><code>${escapeHTML(t)}</code></td>
           <td style="padding:3px 6px;text-align:right">${v.n.toLocaleString()}</td>
           <td style="padding:3px 6px;text-align:right">${v.known.toLocaleString()}</td>
           <td style="padding:3px 6px;text-align:right">${v.qty ? v.qty.toLocaleString(undefined,{maximumFractionDigits:2}) : '—'}</td>
           <td style="padding:3px 6px">${UNVALUED_REASON[t] || 'type not yet handled by the tax engine'}</td>
         </tr>`).join('')}
       </table>
+      ${/* Asset names are the token's own 20-byte currency code, decoded: anyone can
+            Remit a token named "<img onerror=…>" to this wallet. Escaped, like every
+            other value that comes off a row. */ ''}
       ${assets.length ? `<div style="margin-top:8px"><strong>Assets these transactions moved</strong> —
         the quantities and dates are recorded; what they were worth is not, and this tool does not guess it.</div>
       <table style="margin:6px 0;border-collapse:collapse;font-size:10px;width:100%">
@@ -4117,7 +4133,7 @@ function dataQualityHTML() {
           <th style="text-align:right;padding:3px 6px">Units</th>
           <th style="text-align:right;padding:3px 6px">Issuers</th></tr>
         ${assets.map(([c,v]) => `<tr style="border-top:1px solid #e0cba8">
-          <td style="padding:3px 6px"><code>${c}</code></td>
+          <td style="padding:3px 6px"><code>${escapeHTML(c)}</code></td>
           <td style="padding:3px 6px;text-align:right">${v.n.toLocaleString()}</td>
           <td style="padding:3px 6px;text-align:right">${v.qty.toLocaleString(undefined,{maximumFractionDigits:6})}</td>
           <td style="padding:3px 6px;text-align:right">${v.issuers.size}</td>
@@ -4145,7 +4161,7 @@ function dataQualityHTML() {
   if(dustSkipped) {
     parts.push(`<div style="margin-top:8px;padding:8px 10px;background:#fff8e6;border:1px solid #e0c060;border-radius:4px;font-size:9.5px;color:#6b4e00">
       <strong>${dustSkipped.toLocaleString()} XRP transfer(s) skipped as below the dust threshold</strong>
-      (under ${DUST_MIN_UNITS} XRP). These are almost always spam or fee-level amounts worth a
+      (under ${DUST_FLOOR.XRP} XRP; EVR has no such floor, see DUST_FLOOR). These are almost always spam or fee-level amounts worth a
       fraction of a cent. They get no cost-basis lot and produce no disposal, which also means a
       later sale of that amount would fall back to $0 basis — worth knowing if this count is ever
       large relative to your real activity.
@@ -4226,7 +4242,7 @@ function processOneXahauRow(row, wallet, walletSet, mode, helpers) {
     const isEVR  = amtCur === 'EVR';
     // Flow accounting runs regardless of how the payment is later classified —
     // see walletFlowStats. It is what identifies a shared service address.
-    if(isEVR ? amtVal >= 1.0 : amtXAH >= 1.0) {
+    if(isEVR ? dustOk('EVR', amtVal) : dustOk('XAH', amtXAH)) {
       const t = isEVR ? 'EVR' : 'XAH', q = isEVR ? amtVal : amtXAH;
       if(src === wallet) recordFlow(wallet, 'out', t, q, dest, dk, yr);
       else if(dest === wallet) recordFlow(wallet, 'in', t, q, src, dk, yr);
@@ -4244,18 +4260,18 @@ function processOneXahauRow(row, wallet, walletSet, mode, helpers) {
       if(ownDest) {
         // Internal transfer — always consume + carry over basis AND the
         // original acquisition date(s), no year gate.
-        if(isEVR && amtVal >= 1.0) {
+        if(isEVR && dustOk('EVR', amtVal)) {
           ledgerTransferIn(wallet, dest, 'EVR', amtVal);
-        } else if(amtXAH >= 1.0) {
+        } else if(dustOk('XAH', amtXAH)) {
           ledgerTransferIn(wallet, dest, 'XAH', amtXAH);
         }
       } else if(isLostSpend(wallet, dk)) {
         // Involuntary outflow from a wallet whose keys are gone. Checked
         // BEFORE gift and disposal: the user neither sold nor gave anything
         // away, and received nothing for it. See pushLostSpend().
-        if(isEVR && amtVal >= 1.0) {
+        if(isEVR && dustOk('EVR', amtVal)) {
           pushLostSpend(wallet, 'EVR', amtVal, dk, ds, yr, hash, getEH(dk), dest);
-        } else if(amtXAH >= 1.0) {
+        } else if(dustOk('XAH', amtXAH)) {
           pushLostSpend(wallet, 'XAH', amtXAH, dk, ds, yr, hash, getXH(dk), dest);
         }
       } else if(isGiftAddress(dest)) {
@@ -4263,17 +4279,17 @@ function processOneXahauRow(row, wallet, walletSet, mode, helpers) {
         // BEFORE the external-disposal branch, and kept out of the owned
         // set, because a gift is neither a sale nor still yours.
         const rcpt = (giftEntry(dest)||{}).recipient;
-        if(isEVR && amtVal >= 1.0) {
+        if(isEVR && dustOk('EVR', amtVal)) {
           pushGift(wallet, 'EVR', amtVal, dk, ds, yr, hash, getEH(dk), rcpt, dest);
-        } else if(amtXAH >= 1.0) {
+        } else if(dustOk('XAH', amtXAH)) {
           pushGift(wallet, 'XAH', amtXAH, dk, ds, yr, hash, getXH(dk), rcpt, dest);
         }
       } else {
         // External disposal — pushDisposal handles FIFO consumption AND
         // splits into short-term (Box I) / long-term (Box L) automatically
-        if(isEVR && amtVal >= 1.0) {
+        if(isEVR && dustOk('EVR', amtVal)) {
           pushDisposal(wallet, 'EVR', amtVal, dk, ds, yr, hash, getEH(dk), getEL(dk), '', dest);
-        } else if(amtXAH >= 1.0) {
+        } else if(dustOk('XAH', amtXAH)) {
           pushDisposal(wallet, 'XAH', amtXAH, dk, ds, yr, hash, getXH(dk), getXL(dk), '', dest);
         }
       }
@@ -4298,21 +4314,21 @@ function processOneXahauRow(row, wallet, walletSet, mode, helpers) {
     // the market price on the arrival date, recorded in inferredBasisRows so
     // it is disclosed rather than assumed.
     if(dest === wallet && ownSrc && isTransferOnly(src)) {
-      if(isEVR && amtVal >= 1.0) {
+      if(isEVR && dustOk('EVR', amtVal)) {
         // Deliberately NOT income: a withdrawal from your own exchange
         // account is not an Evernode reward, and booking it as one would
         // invent ordinary income out of moving your own coins.
         ledgerTransferIn(src, wallet, 'EVR', amtVal, { unitCost: getEH(dk), date: dk });
-      } else if(amtXAH >= 1.0) {
+      } else if(dustOk('XAH', amtXAH)) {
         ledgerTransferIn(src, wallet, 'XAH', amtXAH, { unitCost: getXH(dk)||xahAirdrop, date: dk });
       }
     } else if(dest === wallet && !ownSrc) {
       // External inbound = acquisition — always add lot + record income row
-      if(isEVR && amtVal >= 1.0) {
+      if(isEVR && dustOk('EVR', amtVal)) {
         const unitCost = getEH(dk);
         ledgerAdd(wallet,'EVR',dk,amtVal,unitCost,'reward');
         allIncomeRows.push({wallet,dateStr:ds,dk,year:yr,qty:amtVal,fmv:amtVal*unitCost,ticker:'EVR',txHash:hash,description:`${amtVal.toFixed(4)} EVR reward`});
-      } else if(amtXAH >= 1.0) {
+      } else if(dustOk('XAH', amtXAH)) {
         ledgerAdd(wallet,'XAH',dk,amtXAH,getXH(dk)||xahAirdrop,'received');
       }
     }
@@ -4335,19 +4351,19 @@ function processOneXahauRow(row, wallet, walletSet, mode, helpers) {
     // lostSpendSummaryHTML(). In practice these host accounts do not trade,
     // so this should stay at zero.
     const lostDex = isLostSpend(wallet, dk);
-    if(tgCur === 'EVR' && tgVal >= 1.0) {
+    if(tgCur === 'EVR' && dustOk('EVR', tgVal)) {
       if(lostDex) pushLostSpend(wallet, 'EVR', tgVal, dk, ds, yr, hash, getEH(dk), 'DEX offer');
       else pushDisposal(wallet, 'EVR', tgVal, dk, ds, yr, hash, getEH(dk), getEL(dk), ' (DEX)', 'DEX offer');
-    } else if(tgXAH >= 1.0) {
+    } else if(dustOk('XAH', tgXAH)) {
       if(lostDex) pushLostSpend(wallet, 'XAH', tgXAH, dk, ds, yr, hash, getXH(dk), 'DEX offer');
       else pushDisposal(wallet, 'XAH', tgXAH, dk, ds, yr, hash, getXH(dk), getXL(dk), ' (DEX)', 'DEX offer');
     }
 
     // TakerPays = acquisition
-    if(tpCur === 'EVR' && tpVal >= 1.0) {
+    if(tpCur === 'EVR' && dustOk('EVR', tpVal)) {
       const xahCost = tgXAH * (getXH(dk)||xahAirdrop);
       ledgerAdd(wallet,'EVR',dk,tpVal,xahCost/Math.max(tpVal,1e-8),'dex_buy');
-    } else if(tpXAH >= 1.0) {
+    } else if(dustOk('XAH', tpXAH)) {
       ledgerAdd(wallet,'XAH',dk,tpXAH,getXH(dk)||xahAirdrop,'dex_buy');
     }
   }
@@ -7015,6 +7031,10 @@ async function streamChainIntoLedger(chain, walletSet) {
     log(`  (type filter unavailable — reading every row: ${e.message})`, 'wa');
   }
   log(`\nBuilding ${chain} FIFO ledger from ${total.toLocaleString()} cached row(s), in true chronological order…`, 'hd');
+  // One Set for the whole stream: isFetchableOwnWallet() scans the WALLETS
+  // array, and 140 entries x 6 million rows is a measurable share of a build.
+  const own = new Set(WALLETS);
+  const ownOrLost = (w) => own.has(w) || isLostWallet(w);
   let cursor = null, done = 0;
   for(;;) {
     const page = await window.taxDB.getChainRowsPage(chain, LEDGER_PAGE_ROWS, cursor, types);
@@ -7042,7 +7062,7 @@ async function streamChainIntoLedger(chain, walletSet) {
       // catches double-processing keeps working.
       rowsStreamedThisBuild++;
       done++;
-      if(!isFetchableOwnWallet(wallet)) { rowsSkippedNotOwned++; continue; }
+      if(!ownOrLost(wallet)) { rowsSkippedNotOwned++; continue; }
       processRow(row, wallet, walletSet, 'out', helpers);
     }
     page.rows.length = 0;
@@ -7095,7 +7115,7 @@ async function buildRelevantTaxRows() {
         amount = parseFloat(r.Amount_XRP||0);
         ticker = isXahau ? 'XAH' : 'XRP';
       }
-      if(!(amount >= DUST_MIN_UNITS && amount < 1e9)) return; // dust — not a real transfer
+      if(!dustOk(ticker, amount)) return; // dust — not a real transfer
 
       if(ownSrc && ownDest) return; // internal transfer — see comment above
 
@@ -7160,8 +7180,9 @@ async function buildRelevantTaxRows() {
       // all, so they land here — counted rather than silently dropped, since
       // the fix (a Force Full Re-sync, which re-fetches with the new columns)
       // isn't something the user could otherwise guess at.
-      if(sentAmount >= 1.0 && !(receivedAmount >= 1.0)) { skippedNoBuySide++; return; }
-      if(!(sentAmount >= 1.0) || !(receivedAmount >= 1.0)) return;
+      const sentOk = dustOk(sentTicker, sentAmount), recvOk = dustOk(receivedTicker, receivedAmount);
+      if(sentOk && !recvOk) { skippedNoBuySide++; return; }
+      if(!sentOk || !recvOk) return;
       const price = sentTicker==='XAH' ? xahHelpers.getXH(dk) : xahHelpers.getEH(dk);
       out.push({
         rawTs: r.rawTs, kind:'trade',
@@ -7374,7 +7395,7 @@ function txAmountOf(r) {
   const cur = (r.Amount_currency||'').toUpperCase().trim();
   if(isXahau && cur === 'EVR') {
     const v = parseFloat(r.Amount_value||0);
-    return v >= DUST_MIN_UNITS ? { amount: v, ticker: 'EVR' } : null;
+    return dustOk('EVR', v) ? { amount: v, ticker: 'EVR' } : null;
   }
   const v = parseFloat(r.Amount_XRP||0);
   if(!(v >= DUST_MIN_UNITS && v < 1e9)) return null;
@@ -7738,7 +7759,10 @@ async function renderHoldings() {
         ${dests.slice(0, 60).map(d => {
           const marked = isTransferOnly(d.dest);
           const gift = giftEntry(d.dest);
-          const isDex = d.dest === 'DEX offer' || d.dest === '(unrecorded)';
+          // The address goes into inline handler attributes below. A row's
+          // Destination is ledger data; only a real r-address may be
+          // interpolated there, anything else is shown but gets no buttons.
+          const isDex = d.dest === 'DEX offer' || d.dest === '(unrecorded)' || !R_ADDR_RE.test(d.dest);
           return `<tr style="${gift ? 'background:#f6ecff' : (marked ? 'background:#e8f5e9' : '')}">
           <td style="text-align:center">${isDex ? '—' : `<input type="checkbox" ${marked ? 'checked' : ''} onchange="toggleTransferOnly('${d.dest}')">`}</td>
           <td style="text-align:center">${isDex ? '—' : (gift
@@ -7746,7 +7770,7 @@ async function renderHoldings() {
             : `<a href="#" style="font-size:9.5px" onclick="promptGift('${d.dest}');return false;">mark gift</a>`)}</td>
           <td style="font-family:monospace;font-size:9.5px">${escapeHTML(d.dest)}</td>
           <td>${escapeHTML(labelFor(d.dest) || (gift ? gift.recipient : ''))}</td>
-          <td>${[...d.tickers].join(', ')}</td>
+          <td>${escapeHTML([...d.tickers].join(', '))}</td>
           <td style="text-align:right">${d.count}</td>
           <td style="text-align:right;font-weight:700">$${fmt(d.proceeds)}</td>
           <td style="text-align:right">${destTotal ? (100*d.proceeds/destTotal).toFixed(1) : '0.0'}%</td>

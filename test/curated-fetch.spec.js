@@ -423,6 +423,52 @@ test('an empty amount column stays null, and is never booked at zero', async () 
   expect(out.newDisposals, 'an unvalued type was booked on Form 8949').toBe(0);
 });
 
+test('a sub-1 EVR reward is income with a basis lot; sub-1 XAH is still dust', async () => {
+  // Evernode pays a host per heartbeat, a few hundredths of an EVR each.
+  // Until Nov 2026 the flat 1.0 floor dropped every one: no income row, no
+  // lot, and the EVR later left the host with $0 basis (11,546 EVR of it).
+  const out = await window.evaluate((args) => {
+    resetLedgerState();
+    const helpers = makeXahauPriceHelpers();
+    const pay = (hash, amtVal, cur, amtXAH) => ({
+      TransactionType: 'Payment', TransactionResult: 'tesSUCCESS',
+      Account: args.other, Destination: args.wallet, Timestamp: '2025-06-11 08:30:00',
+      TransactionHash: hash, Amount_XRP: amtXAH, delivered_amount_XRP: amtXAH,
+      Amount_value: amtVal, Amount_currency: cur, delivered_amount_value: amtVal, delivered_amount_currency: cur,
+    });
+    processOneXahauRow(pay('E1', '0.0352', 'EVR', '0'), args.wallet, new Set([args.wallet]), 'in', helpers);
+    processOneXahauRow(pay('X1', '', '', '0.33'), args.wallet, new Set([args.wallet]), 'in', helpers);
+    const evr = (walletLedger[args.wallet] && walletLedger[args.wallet].EVR) || [];
+    const xah = (walletLedger[args.wallet] && walletLedger[args.wallet].XAH) || [];
+    return { evrLots: evr.map(l => l.qty), xahLots: xah.map(l => l.qty),
+             income: allIncomeRows.map(r => [r.ticker, r.qty]), dust: dustSkipped };
+  }, { wallet: W_XAHAU, other: OTHER });
+  expect(out.evrLots).toEqual([0.0352]);
+  expect(out.income).toEqual([['EVR', 0.0352]]);
+  expect(out.xahLots).toEqual([]);
+});
+
+test('a token name that is HTML is shown as text in the not-on-8949 panel', async () => {
+  // The currency code is the token's own 20 bytes, decoded. Anyone can Remit
+  // a token to this wallet, so the name is attacker-chosen.
+  const out = await window.evaluate((args) => {
+    resetLedgerState();
+    processOneXahauRow(
+      { TransactionType: 'Remit', TransactionResult: 'tesSUCCESS',
+        Account: args.other, Destination: args.wallet, Timestamp: '2025-06-11 08:30:00',
+        Amounts: [{ XRP: 0, token_value: '5', token_issuer: args.other, token_currency: '<img src=x onerror=1>' }] },
+      args.wallet, new Set([args.wallet]), 'in', makeXahauPriceHelpers());
+    const html = dataQualityHTML();
+    const probe = document.createElement('div');
+    probe.innerHTML = html;
+    return { escaped: html.includes('&lt;img src=x onerror=1&gt;'), imgs: probe.querySelectorAll('img').length,
+             raw: html.includes('<img src=x onerror=1>') };
+  }, { wallet: W_XAHAU, other: OTHER });
+  expect(out.escaped).toBe(true);
+  expect(out.raw).toBe(false);
+  expect(out.imgs).toBe(0);
+});
+
 test('a Remit on Xahau is recorded unvalued rather than silently dropped', async () => {
   const out = await window.evaluate((args) => {
     resetLedgerState();

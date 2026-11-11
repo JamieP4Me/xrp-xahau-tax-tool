@@ -252,7 +252,13 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false, // preload needs ipcRenderer; no remote content is ever loaded so this stays safe
+      // A sandboxed preload still gets contextBridge, ipcRenderer,
+      // process.platform and process.env, which is all preload.js uses. The
+      // old `sandbox: false` ("preload needs ipcRenderer") was out of date:
+      // with it on, an injected script or a Chromium bug is confined to an
+      // OS-sandboxed process instead of a process that can reach the
+      // filesystem.
+      sandbox: true,
     },
   });
 
@@ -356,6 +362,21 @@ app.on('will-quit', () => {
 });
 
 // ── IPC surface exposed to the renderer via preload.js's contextBridge ─────
+// Every handler answers only the app's own window. Nothing else can reach
+// them today (no iframes, navigation pinned to the local origin), so this is
+// defence in depth: a handler that hands out the complete transaction
+// history should not rely on there never being another caller.
+function fromOwnWindow(evt) {
+  const f = evt && evt.senderFrame;
+  return !!(f && !f.parent && isSameLocalOrigin(f.url));
+}
+function guarded(fn) {
+  return (evt, ...args) => {
+    if (!fromOwnWindow(evt)) throw new Error('ipc: caller is not the app window');
+    return fn(evt, ...args);
+  };
+}
+
 function registerIpcHandlers(db, dbPath) {
   // The version comes from the main process rather than being written into
   // the HTML, so it cannot go stale: app.getVersion() reads the packaged
@@ -363,51 +384,51 @@ function registerIpcHandlers(db, dbPath) {
   // number typed into the page would have to be remembered at every release,
   // and the first release someone forgot would leave the app confidently
   // reporting the wrong version — worse than showing none.
-  ipcMain.handle('app:getVersion', () => app.getVersion());
+  ipcMain.handle('app:getVersion', guarded(() => app.getVersion()));
 
-  ipcMain.handle('db:getSyncState', (_evt, wallet, chain) => db.getSyncState(wallet, chain));
+  ipcMain.handle('db:getSyncState', guarded((_evt, wallet, chain) => db.getSyncState(wallet, chain)));
 
-  ipcMain.handle('db:insertRows', (_evt, wallet, chain, rows) => db.insertRows(wallet, chain, rows));
+  ipcMain.handle('db:insertRows', guarded((_evt, wallet, chain, rows) => db.insertRows(wallet, chain, rows)));
 
-  ipcMain.handle('db:upsertSyncState', (_evt, wallet, chain, newTimestamp) =>
-    db.upsertSyncState(wallet, chain, newTimestamp));
+  ipcMain.handle('db:upsertSyncState', guarded((_evt, wallet, chain, newTimestamp) =>
+    db.upsertSyncState(wallet, chain, newTimestamp)));
 
-  ipcMain.handle('db:getAllRows', (_evt, wallet, chain) => db.getAllRows(wallet, chain));
+  ipcMain.handle('db:getAllRows', guarded((_evt, wallet, chain) => db.getAllRows(wallet, chain)));
 
-  ipcMain.handle('db:countForWallet', (_evt, wallet, chain) => db.countForWallet(wallet, chain));
+  ipcMain.handle('db:countForWallet', guarded((_evt, wallet, chain) => db.countForWallet(wallet, chain)));
 
-  ipcMain.handle('db:clearWalletChain', (_evt, wallet, chain) => db.clearWalletChain(wallet, chain));
+  ipcMain.handle('db:clearWalletChain', guarded((_evt, wallet, chain) => db.clearWalletChain(wallet, chain)));
 
-  ipcMain.handle('db:forceFullResync', () => db.forceFullResync());
+  ipcMain.handle('db:forceFullResync', guarded(() => db.forceFullResync()));
 
   // Read/write only — the renderer decides what a key means. Used for the
   // fetch-scope fingerprint; see db.js getMeta().
-  ipcMain.handle('db:getMeta', (_evt, key) => db.getMeta(key));
+  ipcMain.handle('db:getMeta', guarded((_evt, key) => db.getMeta(key)));
 
-  ipcMain.handle('db:setMeta', (_evt, key, value) => db.setMeta(key, value));
+  ipcMain.handle('db:setMeta', guarded((_evt, key, value) => db.setMeta(key, value)));
 
-  ipcMain.handle('db:clearAll', () => db.clearAll());
+  ipcMain.handle('db:clearAll', guarded(() => db.clearAll()));
 
-  ipcMain.handle('db:getStats', () => db.getStats());
+  ipcMain.handle('db:getStats', guarded(() => db.getStats()));
 
-  ipcMain.handle('db:getPath', () => dbPath);
+  ipcMain.handle('db:getPath', guarded(() => dbPath));
 
-  ipcMain.handle('db:listCachedWallets', () => db.listCachedWallets());
+  ipcMain.handle('db:listCachedWallets', guarded(() => db.listCachedWallets()));
 
-  ipcMain.handle('db:countForChain', (_evt, chain, types) => db.countForChain(chain, types));
-  ipcMain.handle('db:countByType', (_evt, chain) => db.countByType(chain));
+  ipcMain.handle('db:countForChain', guarded((_evt, chain, types) => db.countForChain(chain, types)));
+  ipcMain.handle('db:countByType', guarded((_evt, chain) => db.countByType(chain)));
 
-  ipcMain.handle('db:getChainRowsPage', (_evt, chain, limit, cursor, types) =>
-    db.getChainRowsPage(chain, limit, cursor, types));
+  ipcMain.handle('db:getChainRowsPage', guarded((_evt, chain, limit, cursor, types) =>
+    db.getChainRowsPage(chain, limit, cursor, types)));
 
   // Ledger-verified AMM amounts. The renderer parses the verifier's CSV (it
   // already has a CSV parser, and parsing there keeps it testable under
   // Playwright) and sends the rows; nothing here touches the filesystem.
-  ipcMain.handle('db:importAmmLedger', (_evt, rows) => db.importAmmLedger(rows));
+  ipcMain.handle('db:importAmmLedger', guarded((_evt, rows) => db.importAmmLedger(rows)));
 
-  ipcMain.handle('db:getAmmLedger', () => db.getAmmLedger());
+  ipcMain.handle('db:getAmmLedger', guarded(() => db.getAmmLedger()));
 
-  ipcMain.handle('db:getAmmStats', () => db.getAmmStats());
+  ipcMain.handle('db:getAmmStats', guarded(() => db.getAmmStats()));
 
-  ipcMain.handle('db:clearAmmLedger', () => db.clearAmmLedger());
+  ipcMain.handle('db:clearAmmLedger', guarded(() => db.clearAmmLedger()));
 }

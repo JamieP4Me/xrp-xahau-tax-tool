@@ -80,6 +80,15 @@ test('the renderer offers no require() or AMD route for that loader to use', () 
   // these two settings forbid.
   const main = read('main.js');
   assert.ok(/contextIsolation:\s*true/.test(main), 'contextIsolation is no longer true');
+  // Code lines only: both settings are also discussed in comments.
+  const code = main.split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n');
+  assert.ok(/sandbox:\s*true/.test(code), 'the renderer sandbox is off');
+  assert.ok(!/sandbox:\s*false/.test(code), 'sandbox: false is back');
+  // Every IPC handler answers only the app window. Count the registrations
+  // and the guards; a new handler added without one fails here.
+  const handlers = (code.match(/ipcMain\.handle\(/g) || []).length;
+  const guards = (code.match(/ipcMain\.handle\('[^']+',\s*guarded\(/g) || []).length;
+  assert.ok(handlers > 10 && handlers === guards, `${handlers} handlers, ${guards} guarded`);
   assert.ok(/nodeIntegration:\s*false/.test(main), 'nodeIntegration is no longer false');
 });
 
