@@ -6930,9 +6930,31 @@ const LEDGER_PAGE_ROWS = 25000;
 // to the same arrays. Had this check existed, the app would have said so
 // immediately instead of presenting a $929,409 capital gain as if it were
 // arithmetic.
+// How many rows a build reads for one chain: the rows of the types the engine
+// books, exactly as streamChainIntoLedger() selects them, falling back to
+// every row when the type filter is unavailable (as it does).
+//
+// The row-count check used to compare against EVERY cached row. Once the
+// build stopped reading types it never books (749,529 URITokenBuys and a few
+// thousand others on this cache), every healthy build "failed" by exactly
+// that many: 6,136,834 read against 6,889,246 cached. Nobody saw it, because
+// the warning only painted after a fetch (fixed in 205176c), until the
+// background comparison refused to store a result from a build it was told
+// was corrupt. Expected and streamed must come from the same selection.
+async function expectedRowsForChain(chain) {
+  const totalAll = await window.taxDB.countForChain(chain);
+  if(!totalAll) return 0;
+  const types = chain === 'Xahau' ? FETCH_TYPES_XAHAU : FETCH_TYPES_XRPL;
+  try {
+    const filtered = await window.taxDB.countForChain(chain, types);
+    if(Number.isFinite(filtered) && filtered > 0) return filtered;
+  } catch(e) { /* same fallback as the stream: read everything */ }
+  return totalAll;
+}
+
 async function verifyScannedRowCount() {
   try {
-    const expected = (await window.taxDB.countForChain('Xahau')) + (await window.taxDB.countForChain('XRPL'));
+    const expected = (await expectedRowsForChain('Xahau')) + (await expectedRowsForChain('XRPL'));
     // Compare rows STREAMED, not rows processed. transactionsScanned counts
     // only rows that reached the ledger logic — a failed transaction
     // (TransactionResult != tesSUCCESS) is cached but returns early and is
@@ -6970,6 +6992,8 @@ async function streamChainIntoLedger(chain, walletSet) {
   const totalAll = await window.taxDB.countForChain(chain);
   if(totalAll === 0) return 0;
   let total = totalAll;
+  // NOTE: verifyScannedRowCount() expects exactly the rows selected here, via
+  // expectedRowsForChain(). Change the selection in both places or neither.
   try {
     const filtered = await window.taxDB.countForChain(chain, types);
     if(Number.isFinite(filtered) && filtered > 0) {

@@ -135,6 +135,19 @@ test('the DO NOT FILE warnings are painted after a cache rebuild, not only after
   assert.ok(/dataQualityHTML\(\)/.test(branch), 'the no-fetch-counts branch drops the data-quality warnings');
 });
 
+test('the row-count check expects the same type-filtered rows the build streams', () => {
+  const v = body('async function verifyScannedRowCount(');
+  assert.ok(/expectedRowsForChain\('Xahau'\)/.test(v) && /expectedRowsForChain\('XRPL'\)/.test(v),
+    'expected count is not the type-filtered selection');
+  const e = body('async function expectedRowsForChain(');
+  const st = body('async function streamChainIntoLedger(');
+  for (const b of [e, st]) {
+    assert.ok(/FETCH_TYPES_XAHAU : FETCH_TYPES_XRPL/.test(b));
+    assert.ok(/countForChain\(chain, types\)/.test(b));
+  }
+  assert.ok(/getChainRowsPage\(chain, LEDGER_PAGE_ROWS, cursor, types\)/.test(st));
+});
+
 Promise.all(pending).then(() => {
   if (failures) { console.log(`\n${failures} test(s) FAILED`); process.exit(1); }
   console.log('\nAll ledger-lock tests passed');
