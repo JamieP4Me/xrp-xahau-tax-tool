@@ -6039,8 +6039,10 @@ async function _compareInsideLock(onProgress) {
   _lastTreatmentCompare = result;
   _otherTreatmentRows = { treatment: other, rows: otherRows, stamp: base.stamp };
   try { localStorage.setItem(BG_COMPARE_KEY, JSON.stringify(result)); } catch(e) {}
-  try { localStorage.setItem(BG_COMPARE_ROWS_KEY, JSON.stringify(_otherTreatmentRows)); }
-  catch(e) { try { localStorage.removeItem(BG_COMPARE_ROWS_KEY); } catch(_) {} }  // too big: session only
+  // The rows carry wallet addresses and every disposal: they belong in the
+  // app's own database beside the cache, not in a 10 MB browser store.
+  try { await window.taxDB.setMeta(BG_COMPARE_ROWS_KEY, JSON.stringify(_otherTreatmentRows)); } catch(e) {}
+  try { localStorage.removeItem(BG_COMPARE_ROWS_KEY); } catch(e) {}   // where an earlier build put them
   return result;
 }
 
@@ -6117,10 +6119,10 @@ function refreshCompareAfterBuild(reason) {
   renderStoredCompare();
   if(_compareState !== 'current') scheduleBackgroundCompare(reason);
   else if(!_otherTreatmentRows && stored) {
-    try {
-      const r = JSON.parse(localStorage.getItem(BG_COMPARE_ROWS_KEY) || 'null');
-      if(r && r.stamp === stored.stamp) _otherTreatmentRows = r;
-    } catch(e) {}
+    window.taxDB.getMeta(BG_COMPARE_ROWS_KEY).then((v) => {
+      const r = v ? JSON.parse(v) : null;
+      if(r && r.stamp === stored.stamp && !_otherTreatmentRows) { _otherTreatmentRows = r; renderStoredCompare(); }
+    }).catch(() => {});
   }
 }
 
