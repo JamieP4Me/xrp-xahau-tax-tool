@@ -5898,6 +5898,20 @@ const snapKey = (snap) => JSON.stringify(Object.keys(snap.byYear).sort().map(y =
   return [y, v.rows, v.stProceeds.toFixed(2), v.stBasis.toFixed(2), v.ltProceeds.toFixed(2), v.ltBasis.toFixed(2)];
 }));
 const buildIsConsistent = () => !futureLotRows && !ledgerCountMismatch;
+// What exactly failed, in words, for the panel and the log.
+function consistencyDetail() {
+  const parts = [];
+  if(futureLotRows) {
+    const f = futureLotSample || {};
+    parts.push(`${futureLotRows.toLocaleString()} sale lot(s) matched to coins acquired after the sale ` +
+               `(first: ${f.qty != null ? fmt(f.qty) : '?'} ${f.ticker || ''} sold ${f.sold || '?'}, "acquired" ${f.acquired || '?'})`);
+  }
+  if(ledgerCountMismatch) {
+    parts.push(`processed ${ledgerCountMismatch.actual.toLocaleString()} rows but the cache holds ${ledgerCountMismatch.expected.toLocaleString()}`);
+  }
+  return parts.join('; ') || 'no detail recorded';
+}
+let _compareFailReason = '';
 
 // Called inside the lock at the end of every ordinary build or fetch.
 async function captureBuildBase() {
@@ -5923,7 +5937,7 @@ async function _compareInsideLock(onProgress) {
   if(!base || base.treatment !== cur) {
     say(`Building with your current setting (${cur === 'A' ? 'Treatment A' : 'not booked'})…`);
     await _runLedgerBuild({ silent: true });
-    if(!buildIsConsistent()) throw new Error('the build with your current setting failed its consistency check');
+    if(!buildIsConsistent()) throw new Error(`the build with your current setting failed its consistency check: ${consistencyDetail()}`);
     await captureBuildBase();
     base = _lastBuildBase;
   }
@@ -5932,7 +5946,7 @@ async function _compareInsideLock(onProgress) {
     say(`Building with ${other === 'A' ? 'Treatment A' : 'the standard (not booked) setting'}…`);
     ammTreatment = other;
     await _runLedgerBuild({ silent: true });
-    if(!buildIsConsistent()) throw new Error(`the ${other === 'A' ? 'Treatment A' : 'not-booked'} build failed its consistency check`);
+    if(!buildIsConsistent()) throw new Error(`the ${other === 'A' ? 'Treatment A' : 'not-booked'} build failed its consistency check: ${consistencyDetail()}`);
     otherSnap = treatmentSnapshot();
     otherRows = allDisposalsHigh.slice();   // the row objects outlive the next reset
   } finally {
@@ -5980,6 +5994,7 @@ function scheduleBackgroundCompare(reason) {
       log(`✓ Treatment comparison updated in the background (${reason}).`, 'ok');
     } catch(e) {
       _compareState = 'failed';
+      _compareFailReason = e.message;
       log(`Treatment comparison not updated: ${e.message}`, 'wa');
     }
   }).catch(() => { _bgCompareQueued = false; }).finally(() => {
@@ -6007,7 +6022,7 @@ function renderStoredCompare() {
     current: `Up to date — built ${when} from the data now loaded.`,
     stale:   `Out of date: built ${when}, before the data changed.` + (autoCompareEnabled() ? ' Updating in the background…' : ' Click the button to rebuild it.'),
     running: 'Updating in the background… the app stays usable; exports wait until it finishes.',
-    failed:  'The last background update failed its consistency check, so nothing was stored from it. See the log.',
+    failed:  `The last update was stopped, so nothing was stored from it: ${escapeHTML(_compareFailReason || 'see the log')}.`,
   }[_compareState] || '';
   const colour = _compareState === 'current' ? '#1a5c2a' : (_compareState === 'failed' ? '#8b0000' : '#7a4a00');
   box.innerHTML = `<div id="treatmentCompareStatus" style="font-size:11px;color:${colour};margin-bottom:6px">${status}</div>` +
@@ -6078,6 +6093,7 @@ async function compareTreatmentsUI() {
       _compareState = 'current';
     } catch(e) {
       _compareState = 'failed';
+      _compareFailReason = e.message;
       log(`Treatment comparison failed: ${e.message}`, 'er');
     } finally {
       syncAmmTreatmentSelect();
