@@ -127,6 +127,14 @@ test('a sale matched to a lot acquired after it is a filing-blocking error', () 
   assert.ok(/futureLotRows = 0;/.test(body('function resetLedgerState(')));
 });
 
+test('the DO NOT FILE warnings are painted after a cache rebuild, not only after a fetch', () => {
+  const b = body('function renderDataSummary(');
+  const early = b.indexOf('if(total === 0)');
+  assert.ok(early > 0, 'renderDataSummary shape changed');
+  const branch = b.slice(early, b.indexOf('return;', early));
+  assert.ok(/dataQualityHTML\(\)/.test(branch), 'the no-fetch-counts branch drops the data-quality warnings');
+});
+
 Promise.all(pending).then(() => {
   if (failures) { console.log(`\n${failures} test(s) FAILED`); process.exit(1); }
   console.log('\nAll ledger-lock tests passed');

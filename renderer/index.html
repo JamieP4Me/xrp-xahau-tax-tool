@@ -6255,7 +6255,20 @@ async function clearAmmLedgerUI() {
 function renderDataSummary() {
   if(_ledgerLockHeld === 'background treatment comparison') return;   // see renderResults
   const total = grandTotalRaw();
-  if(total === 0) return;
+  if(total === 0) {
+    // chainStats count rows FETCHED this session, so after a rebuild from the
+    // cache (every launch) this used to return here and paint nothing at all:
+    // including the data-quality warnings and both DO NOT FILE checks, which
+    // therefore could never appear except straight after a fetch. Found
+    // 2026-11-11 looking for one that should have been on screen. The table
+    // has nothing to say without fetch counts; the warnings always do.
+    const q = dataQualityHTML();
+    const b1 = document.getElementById('dataSummaryBox');
+    if(b1) { b1.innerHTML = q; b1.style.display = q ? 'block' : 'none'; }
+    const b2 = document.getElementById('dataSummaryBoxForm8949');
+    if(b2) b2.innerHTML = q;
+    return;
+  }
 
   const rows = [
     chainStats.Xahau.rawRows > 0 ? {
