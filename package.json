@@ -48,6 +48,8 @@
     "cache:optimise": "node scripts/optimise-cache.js",
     "precache:optimise": "node scripts/check-abi.js node",
     "oracle:prices": "node scripts/oracle-prices.js",
+    "trace": "node scripts/wallet-trace.js",
+    "pretrace": "node scripts/check-abi.js node",
     "prices:update": "node scripts/update-prices.js",
     "probe:remit": "node scripts/probe-remit-raw.js",
     "preprobe:remit": "node scripts/check-abi.js node",
