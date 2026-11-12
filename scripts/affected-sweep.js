@@ -24,6 +24,7 @@
  *   npm run sweep -- --all-xahau --out Affected-Xahau.csv  every cached Xahau wallet
  *   npm run sweep -- --all-xahau --resume                  skip wallets already in the file
  *   node scripts/affected-sweep.js --endpoint https://xahau.network/ --page 400 --pause 500
+ *   npm run sweep -- --all-xahau --resume --parallel 3   three wallets at a time
  *
  * Paced for public infrastructure: a busy host is ~160k transactions, ~400
  * pages of 400. The file is appended wallet by wallet, so a stopped run
@@ -66,7 +67,7 @@ function iouDeltasFor(meta, account) {
 module.exports = { iouDeltasFor };
 
 if (require.main === module) {
-let wallets = [], allXahau = false, chain = 'Xahau', endpoint = null, out = null, page = 400, pause = 500, resume = false, since = null;
+let wallets = [], allXahau = false, chain = 'Xahau', endpoint = null, out = null, page = 400, pause = 500, resume = false, since = null, parallel = 1;
 const argv = [];
 for (let i = 0; i < process.argv.length; i++) {
   const a = process.argv[i];
@@ -79,6 +80,7 @@ for (let i = 0; i < process.argv.length; i++) {
   if (a === '--pause') { pause = Number(process.argv[++i]); continue; }
   if (a === '--since') { since = String(process.argv[++i] || ''); continue; }
   if (a === '--resume') { resume = true; continue; }
+  if (a === '--parallel') { parallel = Math.max(1, Math.min(6, Number(process.argv[++i]) || 1)); continue; }
   argv.push(a);
 }
 if (chain !== 'Xahau' && chain !== 'XRPL') { console.error('--chain must be Xahau or XRPL'); process.exit(2); }
@@ -189,16 +191,23 @@ async function sweep(wallet) {
 }
 
 (async () => {
-  console.log(`endpoint ${endpoint}  chain ${chain}  page ${page}  pause ${pause}ms  out ${out}`);
+  console.log(`endpoint ${endpoint}  chain ${chain}  page ${page}  pause ${pause}ms  parallel ${parallel}  out ${out}`);
   console.log(`${targets.length} wallet(s)${done.size ? `, ${done.size} already in the file` : ''}\n`);
   const t0 = Date.now();
-  let i = 0;
-  for (const w of targets) {
-    i++;
-    if (done.has(w)) continue;
-    process.stdout.write(`[${i}/${targets.length}] ${w}\n`);
-    try { await sweep(w); } catch (e) { console.log(`  ${w}: FAILED ${e.message} -- rerun with --resume to retry it`); }
+  // A small pool: one busy host is ~20 minutes on the public node, almost
+  // all of it waiting on the server, so a few in flight cost little more
+  // than one. Each wallet still appends its rows in one write at the end.
+  const queue = targets.map((w, i) => [w, i + 1]).filter(([w]) => !done.has(w));
+  async function worker() {
+    for (;;) {
+      const next = queue.shift();
+      if (!next) return;
+      const [w, i] = next;
+      process.stdout.write(`[${i}/${targets.length}] ${w}\n`);
+      try { await sweep(w); } catch (e) { console.log(`  ${w}: FAILED ${e.message} -- rerun with --resume to retry it`); }
+    }
   }
+  await Promise.all(Array.from({ length: Math.min(parallel, queue.length || 1) }, worker));
   console.log(`\ndone in ${Math.round((Date.now() - t0) / 60000)} min. Import ${out} in the app: Setup -> Ledger-affected transactions.`);
 })().catch(e => { console.error(e.message); process.exit(1); });
 }
