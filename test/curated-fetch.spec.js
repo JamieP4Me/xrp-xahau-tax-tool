@@ -493,6 +493,69 @@ test('snapshotLedgerState/restoreLedgerState round-trip the report exactly', asy
   expect(out.again).toBe(true);
 });
 
+test('a ledger sweep row becomes a Payment under the right perspective, and outbound rows are only counted', async () => {
+  const out = await window.evaluate((args) => {
+    const H = 'A'.repeat(64), H2 = 'B'.repeat(64), H3 = 'C'.repeat(64);
+    const csv = 'Wallet,Chain,Timestamp,LedgerHash,Type,Account,Destination,Currency,Issuer,Delta,NativeDelta,Fee\n' +
+      `${args.wallet},Xahau,2025-03-01 10:00:00,${H},URITokenBuy,${args.other},,EVR,rISSUER,0.0173,,0.000012\n` +   // outside tenant
+      `${args.wallet},Xahau,2025-03-02 10:00:00,${H2},URITokenBuy,${args.rep},,EVR,rISSUER,0.0100,,0.000012\n` +     // own reputation account
+      `${args.wallet},Xahau,2025-03-03 10:00:00,${H3},OfferCreate,${args.other},,EVR,rISSUER,-5,2.5,0.000012\n` +   // outbound: review only
+      `${args.wallet},Xahau,2025-03-04 10:00:00,${'D'.repeat(64)},GenesisMint,${args.other},,,,,0.15,0\n`;          // native in
+    const { rows, errors } = parseAffectedCSV(csv);
+    const plan = planAffectedImport(rows, new Set([args.wallet, args.rep]));
+    const keys = [...plan.byPerspective.keys()].sort();
+    const underHost = plan.byPerspective.get(`${args.wallet}|Xahau`) || [];
+    const underRep = plan.byPerspective.get(`${args.rep}|Xahau`) || [];
+    const first = JSON.parse(underHost[0].raw_json);
+    return { errors, n: rows.length, keys, host: underHost.map(r => r.tx_hash), rep: underRep.map(r => r.tx_hash),
+             first: { type: first.TransactionType, from: first.Account, to: first.Destination, val: first.Amount_value, cur: first.Amount_currency, aff: first._affected.type },
+             stats: { ...plan.stats, wallets: plan.stats.wallets.size } };
+  }, { wallet: W_XAHAU, other: OTHER, rep: 'rTESTreputation1111111111111111111' });
+  expect(out.errors).toEqual([]);
+  expect(out.n).toBe(4);
+  expect(out.host).toEqual(['AFFECTED:' + 'A'.repeat(64) + ':EVR', 'AFFECTED:' + 'D'.repeat(64) + ':native']);
+  expect(out.rep).toEqual(['AFFECTED:' + 'B'.repeat(64) + ':EVR']);   // own payer: stored under the payer
+  expect(out.first).toEqual({ type: 'Payment', from: OTHER, to: W_XAHAU, val: '0.0173', cur: 'EVR', aff: 'URITokenBuy' });
+  expect(out.stats.inbound).toBe(3);
+  expect(out.stats.external).toBe(2);
+  expect(out.stats.internal).toBe(1);
+  expect(out.stats.outbound).toBe(1);
+  expect(out.stats.evr).toBeCloseTo(0.0273, 6);
+});
+
+test('an imported lease row is income with a lot, and an own-payer row is a transfer with carried basis', async () => {
+  const out = await window.evaluate((args) => {
+    resetLedgerState();
+    const helpers = makeXahauPriceHelpers();
+    const ws = new Set([args.wallet, args.rep]);
+    // the reputation account holds 10 EVR bought at a known price
+    processOneXahauRow({ TransactionType: 'Payment', TransactionResult: 'tesSUCCESS', Account: args.other, Destination: args.rep,
+      Timestamp: '2024-06-01 00:00:00', TransactionHash: 'F1', Amount_XRP: '', delivered_amount_XRP: '', Amount_value: '10', Amount_currency: 'EVR',
+      delivered_amount_value: '10', delivered_amount_currency: 'EVR' }, args.rep, ws, 'in', helpers);
+    const csv = 'Wallet,Chain,Timestamp,LedgerHash,Type,Account,Destination,Currency,Issuer,Delta,NativeDelta,Fee\n' +
+      `${args.wallet},Xahau,2025-03-01 10:00:00,${'A'.repeat(64)},URITokenBuy,${args.other},,EVR,rISSUER,2,,0\n` +
+      `${args.wallet},Xahau,2025-03-02 10:00:00,${'B'.repeat(64)},URITokenBuy,${args.rep},,EVR,rISSUER,3,,0\n`;
+    const plan = planAffectedImport(parseAffectedCSV(csv).rows, ws);
+    const incomeBefore = allIncomeRows.length;
+    for(const [key, list] of plan.byPerspective) {
+      const wallet = key.split('|')[0];
+      for(const r of list) processOneXahauRow(JSON.parse(r.raw_json), wallet, ws, 'out', helpers);
+    }
+    const hostLots = (walletLedger[args.wallet] && walletLedger[args.wallet].EVR) || [];
+    const repLots = (walletLedger[args.rep] && walletLedger[args.rep].EVR) || [];
+    return {
+      income: allIncomeRows.slice(incomeBefore).map(r => [r.qty, r.description]),
+      hostLots: hostLots.map(l => [l.qty, l.source, l.date]),
+      repRemaining: repLots.reduce((s, l) => s + l.remaining, 0),
+    };
+  }, { wallet: W_XAHAU, other: OTHER, rep: 'rTESTreputation1111111111111111111' });
+  expect(out.income).toEqual([[2, '2.0000 EVR lease income']]);
+  // the outside tenant's 2 EVR is a new lot; the own account's 3 EVR carried its 2024 lot forward
+  expect(out.hostLots.map(l => l[1])).toEqual(['reward', 'transfer_in']);
+  expect(out.hostLots[1][2]).toBe('2024-06-01');
+  expect(out.repRemaining).toBe(7);
+});
+
 test('a token name that is HTML is shown as text in the not-on-8949 panel', async () => {
   // The currency code is the token's own 20 bytes, decoded. Anyone can Remit
   // a token to this wallet, so the name is attacker-chosen.

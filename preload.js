@@ -70,6 +70,8 @@ contextBridge.exposeInMainWorld('taxDB', {
   getAmmLedger: () => ipcRenderer.invoke('db:getAmmLedger'),
   getAmmStats: () => ipcRenderer.invoke('db:getAmmStats'),
   clearAmmLedger: () => ipcRenderer.invoke('db:clearAmmLedger'),
+  countAffected: () => ipcRenderer.invoke('db:countAffected'),
+  clearAffected: () => ipcRenderer.invoke('db:clearAffected'),
 });
 
 contextBridge.exposeInMainWorld('appInfo', {

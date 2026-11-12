@@ -1,7 +1,7 @@
 {
   "name": "xrp-xahau-tax-tool",
   "productName": "XRP & Xahau Tax Tool",
-  "version": "1.10.5",
+  "version": "1.10.6",
   "description": "Local desktop app for full XRP/Xahau transaction history and Form 8949/Schedule D generation, backed by a local SQLite cache with incremental sync.",
   "main": "main.js",
   "author": "XRP & Xahau Tax Tool contributors",
@@ -48,6 +48,8 @@
     "cache:optimise": "node scripts/optimise-cache.js",
     "precache:optimise": "node scripts/check-abi.js node",
     "oracle:prices": "node scripts/oracle-prices.js",
+    "sweep": "node scripts/affected-sweep.js",
+    "presweep": "node scripts/check-abi.js node",
     "trace": "node scripts/wallet-trace.js",
     "pretrace": "node scripts/check-abi.js node",
     "prices:update": "node scripts/update-prices.js",

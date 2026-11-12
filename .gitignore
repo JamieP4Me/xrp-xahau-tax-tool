@@ -62,3 +62,5 @@ Gift-Register*.xlsx
 Xahau-Basis-*.csv
 Oracle-Prices*.csv
 Price-Sources-Needed.csv
+# ledger sweep of affected-only transactions - wallet addresses
+Affected-*.csv

@@ -620,6 +620,21 @@ function makeApi(db) {
     },
 
     /** Drop the imported AMM figures. Separate from clearAll() on purpose — see the note there. */
+    /**
+     * Rows imported from a ledger sweep (scripts/affected-sweep.js): the
+     * transactions that moved a wallet's balance while it was neither sender
+     * nor destination, stored as ordinary cache rows under a marked key so the
+     * engine books them like any other Payment and they can be removed as a
+     * set. The key prefix is the only thing that distinguishes them.
+     */
+    countAffected() {
+      const r = db.prepare("SELECT COUNT(*) AS n, COUNT(DISTINCT wallet) AS w FROM raw_transactions WHERE tx_hash LIKE 'AFFECTED:%'").get();
+      return { rows: r.n || 0, wallets: r.w || 0 };
+    },
+    clearAffected() {
+      return db.prepare("DELETE FROM raw_transactions WHERE tx_hash LIKE 'AFFECTED:%'").run().changes;
+    },
+
     clearAmmLedger() {
       stmts.clearAmmLedger.run();
     },

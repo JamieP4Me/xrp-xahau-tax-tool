@@ -655,6 +655,24 @@ test('clearAmmLedger drops them when that is actually what was meant', () => {
   db.close();
 });
 
+test('ledger-affected rows are ordinary cache rows under a marked key, removable as a set', () => {
+  const db = createDb(tmpDbPath());
+  const mk = (h, ts) => ({ tx_hash: h, timestamp: ts, raw_json: JSON.stringify({ TransactionType: 'Payment', TransactionResult: 'tesSUCCESS', Timestamp: ts }) });
+  db.insertRows('rHOST', 'Xahau', [mk('AFFECTED:' + 'A'.repeat(64) + ':EVR', '2025-01-01 00:00:00'), mk('AFFECTED:' + 'B'.repeat(64) + ':EVR', '2025-01-02 00:00:00')]);
+  db.insertRows('rTENANT', 'Xahau', [mk('AFFECTED:' + 'C'.repeat(64) + ':EVR', '2025-01-03 00:00:00')]);
+  db.insertRows('rHOST', 'Xahau', [mk('2025-01-04 00:00:00_rHOST', '2025-01-04 00:00:00')]);   // an ordinary WinDB row
+  assert.deepStrictEqual(db.countAffected(), { rows: 3, wallets: 2 });
+  // the engine's stream sees them like any other Payment
+  assert.strictEqual(db.countForChain('Xahau'), 4);
+  // a re-import of the same transaction replaces, never duplicates
+  db.insertRows('rHOST', 'Xahau', [mk('AFFECTED:' + 'A'.repeat(64) + ':EVR', '2025-01-01 00:00:00')]);
+  assert.strictEqual(db.countAffected().rows, 3);
+  assert.strictEqual(db.clearAffected(), 3);
+  assert.deepStrictEqual(db.countAffected(), { rows: 0, wallets: 0 });
+  assert.strictEqual(db.countForChain('Xahau'), 1, 'the ordinary row must survive');
+  db.close();
+});
+
 test('imported AMM amounts survive a restart', () => {
   const p = tmpDbPath();
   const first = createDb(p);

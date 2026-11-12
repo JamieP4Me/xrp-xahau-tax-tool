@@ -247,6 +247,32 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
       <div id="treatmentCompare" style="margin-top:10px"></div>
     </div>
   </section>
+  <section id="affectedSection" style="display:none">
+    <div class="sec-title">Ledger-Affected Transactions — Lease Income and Other Balance Changes the Data Source Cannot See</div>
+    <div id="affectedStats" style="font-size:11.5px;color:#333;line-height:1.8">Loading…</div>
+    <div class="row" style="margin-top:10px">
+      <button class="sml" style="background:#1a3a7a;color:#fff;border-color:#1a3a7a"
+              onclick="document.getElementById('affectedCsvInput').click()">⬆ Import Ledger Sweep CSV</button>
+      <input type="file" id="affectedCsvInput" accept=".csv,.txt" style="display:none" onchange="handleAffectedCSV(this)">
+      <button class="sml" onclick="refreshAffectedPanel()">↻ Refresh</button>
+      <button class="sml dan" onclick="clearAffectedUI()">🗑 Remove Imported Rows</button>
+    </div>
+    <div style="font-size:10px;color:#888;margin-top:6px;line-height:1.5">
+      The data source is asked for transactions where your wallet is the sender or the destination. A lease on
+      one of your Evernode hosts is neither: the <b>tenant</b> signs the transaction and the EVR lands on the host
+      inside it. Measured on one host, the ledger held 162,782 transactions touching it and the cache 90,864; the
+      host had sent out 300 EVR more than the cache ever saw arrive. That is the "zero-basis EVR" on the host
+      accounts: unrecorded lease income, not a basis problem. The same mechanism hides a resting DEX offer being
+      filled by someone else.
+      Produce the file by sweeping a ledger node:
+      <code>npm run sweep -- --all-xahau</code> (hours on public infrastructure; it resumes), then import it here.
+      Each inbound amount becomes an ordinary cache row — a payment from the tenant to the host — so the engine
+      books it exactly as it books any other receipt: income with a basis lot when the payer is an outside
+      address, an internal transfer when the payer is one of your own wallets (your reputation accounts lease
+      your own hosts constantly). Outbound rows are counted and listed, not imported. Rebuild afterwards.
+    </div>
+  </section>
+
 
   <section>
     <div class="sec-title">XRP / Xahau Wallets — <span id="selCount">0</span> / <span id="totalCount">135</span> Selected</div>
@@ -4405,7 +4431,7 @@ function processOneXahauRow(row, wallet, walletSet, mode, helpers) {
       if(isEVR && dustOk('EVR', amtVal)) {
         const unitCost = getEH(dk);
         ledgerAdd(wallet,'EVR',dk,amtVal,unitCost,'reward');
-        allIncomeRows.push({wallet,dateStr:ds,dk,year:yr,qty:amtVal,fmv:amtVal*unitCost,ticker:'EVR',txHash:hash,description:`${amtVal.toFixed(4)} EVR reward`});
+        allIncomeRows.push({wallet,dateStr:ds,dk,year:yr,qty:amtVal,fmv:amtVal*unitCost,ticker:'EVR',txHash:hash,description:`${amtVal.toFixed(4)} EVR ${row._affected ? 'lease income' : 'reward'}`});
       } else if(dustOk('XAH', amtXAH)) {
         ledgerAdd(wallet,'XAH',dk,amtXAH,getXH(dk)||xahAirdrop,'received');
       }
@@ -6342,6 +6368,149 @@ function exportTreatmentCompareCSV() {
   lines.push(`"AMM transactions booked under Treatment A",${after.booked}`);
   lines.push(`"AMM transactions skipped for want of a ledger-verified amount",${after.skipped}`);
   downloadCSV(lines, `AMM-Treatment-Comparison-${(_lastTreatmentCompare.at || new Date().toISOString()).slice(0,10)}.csv`);
+}
+
+// ── Ledger-affected rows (lease income) ──────────────────────────────────
+//
+// scripts/affected-sweep.js writes one row per (transaction, asset) in which a
+// wallet's holding changed while it was neither Account nor Destination. Each
+// INBOUND row becomes an ordinary cache row shaped as a Payment from the
+// signer to the wallet, so the tax engine needs no new branch: an outside
+// payer is income with a basis lot; one of your own wallets is an internal
+// transfer, and for that the row is stored under the PAYER's perspective,
+// because the engine handles own-to-own from the sender's side.
+//
+// The cache key is 'AFFECTED:<ledger hash>:<asset>' so the rows can be
+// removed as a set and a re-import replaces rather than duplicates.
+const AFFECTED_COLS = ['wallet', 'chain', 'timestamp', 'ledgerhash', 'type', 'account', 'destination', 'currency', 'issuer', 'delta', 'nativedelta', 'fee'];
+function parseAffectedCSV(text) {
+  const raw = parseCSVRows(text);
+  const rows = [], errors = [];
+  if(raw.length === 0) return { rows, errors: ['The file is empty.'] };
+  const header = raw[0].map(f => String(f || '').trim().toLowerCase().replace(/[\s_]+/g, ''));
+  const idx = {};
+  for(const c of AFFECTED_COLS) idx[c] = header.indexOf(c);
+  for(const req of ['wallet', 'chain', 'timestamp', 'ledgerhash', 'type', 'account']) {
+    if(idx[req] === -1) return { rows, errors: [`This is not an affected-sweep file: no "${req}" column. Make one with: npm run sweep -- --all-xahau`] };
+  }
+  for(let i = 1; i < raw.length; i++) {
+    const f = raw[i]; if(!f || f.every(x => !String(x || '').trim())) continue;
+    const g = (k) => idx[k] === -1 ? '' : String(f[idx[k]] ?? '').trim();
+    const row = { wallet: g('wallet'), chain: g('chain'), ts: g('timestamp'), hash: g('ledgerhash').toUpperCase(), type: g('type'),
+                  account: g('account'), destination: g('destination'), currency: g('currency'), issuer: g('issuer'),
+                  delta: g('delta') === '' ? null : parseFloat(g('delta')), native: g('nativedelta') === '' ? null : parseFloat(g('nativedelta')) };
+    if(!R_ADDR_RE.test(row.wallet)) { errors.push(`Line ${i+1}: wallet "${row.wallet}" is not an address.`); continue; }
+    if(row.chain !== 'Xahau' && row.chain !== 'XRPL') { errors.push(`Line ${i+1}: chain "${row.chain}" must be Xahau or XRPL.`); continue; }
+    if(!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(row.ts)) { errors.push(`Line ${i+1}: bad timestamp "${row.ts}".`); continue; }
+    if(!/^[0-9A-F]{64}$/.test(row.hash)) { errors.push(`Line ${i+1}: bad ledger hash.`); continue; }
+    if(!R_ADDR_RE.test(row.account)) { errors.push(`Line ${i+1}: signer "${row.account}" is not an address.`); continue; }
+    rows.push(row);
+  }
+  return { rows, errors };
+}
+
+// Shape the rows the way the cache holds a Payment, grouped by the wallet
+// perspective they must be stored under. Returns what will be inserted and
+// what is only counted.
+function planAffectedImport(rows, owned) {
+  const byPerspective = new Map();   // `${wallet}|${chain}` -> [{tx_hash,timestamp,raw_json}]
+  const stats = { inbound: 0, internal: 0, external: 0, outbound: 0, native: 0, evr: 0, byCurrency: {}, wallets: new Set() };
+  for(const r of rows) {
+    const isIou = !!r.currency;
+    const amt = isIou ? r.delta : r.native;
+    if(!(amt > 0)) { stats.outbound++; continue; }
+    const internal = owned.has(r.account);
+    const perspective = internal ? r.account : r.wallet;
+    const raw = {
+      TransactionType: 'Payment', TransactionResult: 'tesSUCCESS',
+      Account: r.account, Destination: r.wallet, Timestamp: r.ts, TransactionHash: r.hash,
+      Amount_XRP: isIou ? '' : String(amt), delivered_amount_XRP: isIou ? '' : String(amt),
+      Amount_value: isIou ? String(amt) : '', Amount_currency: isIou ? r.currency : '', Amount_issuer: isIou ? r.issuer : '',
+      delivered_amount_value: isIou ? String(amt) : '', delivered_amount_currency: isIou ? r.currency : '',
+      _affected: { type: r.type, hash: r.hash, internal },
+    };
+    const key = `${perspective}|${r.chain}`;
+    if(!byPerspective.has(key)) byPerspective.set(key, []);
+    byPerspective.get(key).push({ tx_hash: `AFFECTED:${r.hash}:${isIou ? r.currency : 'native'}`, timestamp: r.ts, raw_json: JSON.stringify(raw) });
+    stats.inbound++; stats.wallets.add(r.wallet);
+    if(internal) stats.internal++; else stats.external++;
+    if(isIou) { stats.byCurrency[r.currency] = (stats.byCurrency[r.currency] || 0) + amt; if(r.currency === 'EVR') stats.evr += amt; }
+    else stats.native++;
+  }
+  return { byPerspective, stats };
+}
+
+function handleAffectedCSV(input) {
+  const file = input.files && input.files[0];
+  input.value = '';
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    if(ledgerBusy()) return;
+    const { rows, errors } = parseAffectedCSV(String(e.target.result || ''));
+    if(rows.length === 0) { alert('Nothing to import.\n\n' + errors.slice(0, 12).join('\n')); return; }
+    let cachedWallets = [];
+    try { cachedWallets = await window.taxDB.listCachedWallets(); } catch(_) {}
+    const owned = ownedWalletSet(cachedWallets);
+    const { byPerspective, stats } = planAffectedImport(rows, owned);
+    const cur = Object.entries(stats.byCurrency).map(([c, v]) => `${v.toLocaleString(undefined, {maximumFractionDigits: 4})} ${c}`).join(', ');
+    const preview =
+      `Import ${stats.inbound.toLocaleString()} inbound balance change(s) across ${stats.wallets.size} wallet(s)?\n\n` +
+      `  ${stats.external.toLocaleString()} from outside addresses — booked as INCOME with a basis lot\n` +
+      `  ${stats.internal.toLocaleString()} from your own wallets — booked as internal transfers\n` +
+      (cur ? `  tokens: ${cur}\n` : '') + (stats.native ? `  ${stats.native} native receipts\n` : '') +
+      (stats.outbound ? `\n  ${stats.outbound.toLocaleString()} outbound row(s) are NOT imported (listed in the file for review).\n` : '') +
+      (errors.length ? `\n${errors.length} row(s) will be SKIPPED:\n${errors.slice(0, 8).join('\n')}${errors.length > 8 ? '\n…' : ''}\n` : '') +
+      `\nRows already imported for the same transaction are replaced. Rebuild afterwards.`;
+    if(!confirm(preview)) return;
+    try {
+      let n = 0;
+      for(const [key, list] of byPerspective) {
+        const [wallet, chain] = key.split('|');
+        n += await window.taxDB.insertRows(wallet, chain, list);
+      }
+      const prev = JSON.parse((await window.taxDB.getMeta('affectedImport')) || 'null') || {};
+      await window.taxDB.setMeta('affectedImport', JSON.stringify({
+        at: new Date().toISOString(), file: file.name,
+        inbound: (prev.inbound || 0) + stats.inbound, external: (prev.external || 0) + stats.external,
+        internal: (prev.internal || 0) + stats.internal, evr: (prev.evr || 0) + stats.evr, outbound: (prev.outbound || 0) + stats.outbound,
+      }));
+      await refreshAffectedPanel();
+      alert(`Imported ${n.toLocaleString()} row(s).\n\nNow rebuild: "View Report From Cache (offline)".`);
+    } catch(err) { alert('Import failed: ' + err.message); }
+  };
+  reader.readAsText(file);
+}
+
+async function refreshAffectedPanel() {
+  const section = document.getElementById('affectedSection');
+  if(!section) return;
+  if(!USE_LOCAL_DB || !window.taxDB.countAffected) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  const box = document.getElementById('affectedStats');
+  try {
+    const c = await window.taxDB.countAffected();
+    const m = JSON.parse((await window.taxDB.getMeta('affectedImport')) || 'null');
+    if(!c.rows) {
+      box.innerHTML = '<span style="color:#b06000">No ledger sweep imported.</span> Lease income paid to your hosts by tenants, and any ' +
+        'other balance change made by someone else\'s transaction, is not in the figures.';
+    } else {
+      box.innerHTML = `<b>${c.rows.toLocaleString()}</b> ledger-affected row(s) across <b>${c.wallets}</b> wallet perspective(s)` +
+        (m ? ` &nbsp;·&nbsp; ${(m.external || 0).toLocaleString()} from outside (income), ${(m.internal || 0).toLocaleString()} internal` +
+             (m.evr ? ` &nbsp;·&nbsp; <b>${m.evr.toLocaleString(undefined, {maximumFractionDigits: 2})} EVR</b> in total` : '') +
+             `<br>Last import: <b>${new Date(m.at).toLocaleString()}</b>${m.file ? ` (${escapeHTML(m.file)})` : ''}` +
+             (m.outbound ? ` &nbsp;·&nbsp; ${m.outbound.toLocaleString()} outbound row(s) left for review` : '') : '');
+    }
+  } catch(e) { box.textContent = 'Could not read: ' + e.message; }
+}
+
+async function clearAffectedUI() {
+  if(!USE_LOCAL_DB || !window.taxDB.clearAffected || ledgerBusy()) return;
+  if(!confirm('Remove every imported ledger-affected row? The sweep file is unchanged and can be imported again. Rebuild afterwards.')) return;
+  const n = await window.taxDB.clearAffected();
+  try { await window.taxDB.setMeta('affectedImport', ''); } catch(_) {}
+  await refreshAffectedPanel();
+  alert(`Removed ${n.toLocaleString()} row(s). Rebuild to apply.`);
 }
 
 async function clearAmmLedgerUI() {
@@ -8506,6 +8675,7 @@ showPriceAsset('XRP');
 setAppVersion();
 refreshLocalDataPanel();
 refreshAmmLedgerPanel();
+refreshAffectedPanel();
 // Silently rebuild Form 8949 / Schedule D from whatever's already cached on
 // this computer, so results are ready the moment the user clicks over to
 // them — no click, no Payment-Claim, no waiting for a fetch. "Silent" here

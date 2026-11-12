@@ -431,4 +431,8 @@ function registerIpcHandlers(db, dbPath) {
   ipcMain.handle('db:getAmmStats', guarded(() => db.getAmmStats()));
 
   ipcMain.handle('db:clearAmmLedger', guarded(() => db.clearAmmLedger()));
+
+  // Ledger-affected rows (lease income etc.), see db.js countAffected.
+  ipcMain.handle('db:countAffected', guarded(() => db.countAffected()));
+  ipcMain.handle('db:clearAffected', guarded(() => db.clearAffected()));
 }
