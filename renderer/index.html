@@ -455,8 +455,9 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
     </section>
 
     <div class="warn" style="margin-bottom:8px;background:#f0f4ff;border-color:#b0bcd8;color:#2a2a6e;">
-      ℹ <b>XRP Price Note:</b> XRP prices use <b>daily closing price</b> from CoinGecko (high = low = close).
-      This is a defensible FMV method per IRS Notice 2014-21. XAH/EVR use actual daily high/low from your CSV files.
+      ℹ <b>Price Note:</b> XRP, XAH and EVR all use CoinGecko's <b>daily high and low</b> for the UTC day of each
+      transaction (acquisitions and reward income at the high; this page's toggle picks high or low for proceeds).
+      A single consistent source across all three assets is a defensible FMV method per IRS Notice 2014-21.
       XRP holding period is now tracked from real on-chain acquisition dates (both wallet-to-wallet transfers and external receipts), the same FIFO approach used for XAH/EVR. Any portion of a disposal that draws on XRP from before the earliest transaction WinDB has for a wallet falls back to short-term/unknown-date (Box I), conservatively — confirm against your own records for very old holdings, or use the manual Term toggle on that row on the Form 8949 tab.
     </div>
     <div class="warn">
@@ -494,8 +495,8 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
         <tbody id="cmpTbl"></tbody>
       </table>
       <div class="warn" style="margin-top:14px">
-        ⚠ XAH and EVR prices use the embedded 2025 daily OHLC data from your original CSV files. XRP prices use CoinGecko's
-        daily closing price (high = low = close) as a defensible single-source FMV.
+        ⚠ XRP, XAH and EVR prices are CoinGecko daily high/low by UTC day, embedded in the app and refreshed with
+        <code>npm run prices:update</code>. Basis and reward income always use the daily high; this toggle changes proceeds only.
       </div>
     </section>
   </div>
@@ -2855,6 +2856,14 @@ const DUST_FLOOR = { XRP: 1.0, XAH: 1.0, EVR: 0.000001 };
 const DUST_MIN_UNITS = DUST_FLOOR.XRP;   // the XRP paths still read this name
 const dustOk = (ticker, qty) => qty >= (DUST_FLOOR[ticker] ?? 1.0) && qty < 1e9;
 let dustSkipped = 0;
+// Disposals whose proceeds AND basis both round to $0.00. With EVR booked
+// down to 1e-6, a host's 0.01 EVR fee payments became Form 8949 rows reading
+// $0.00 / $0.00 / $0.00: thirty of them on the 2025 form, carrying nothing.
+// The lots are still consumed (the coins did leave); the row is not printed,
+// and the count is disclosed. Only rows that are zero in BOTH columns and in
+// both price modes qualify, so no gain or loss is ever dropped.
+let zeroCentRows = 0;
+const zeroCentQty = {};   // ticker -> units
 
 // Format "now (minus the safety buffer)" the same way WinDB's own Timestamp
 // column reads (e.g. "2026-09-03 14:22:07"), so a lexical ">=" comparison in
@@ -3449,6 +3458,8 @@ function resetLedgerState() {
   transactionsScanned = 0;
   Object.keys(walletLedger).forEach(k => delete walletLedger[k]);
   dustSkipped = 0;
+  zeroCentRows = 0;
+  Object.keys(zeroCentQty).forEach(k => delete zeroCentQty[k]);
   missingPriceRows.length = 0;
   ledgerCountMismatch = null;
   rowsStreamedThisBuild = 0;
@@ -3491,7 +3502,7 @@ function snapshotLedgerState() {
     missingPriceRows: c(missingPriceRows),
     walletFlowStats: c(walletFlowStats), myVolumeByMonth: c(myVolumeByMonth),
     unvaluedSamples: c(unvaluedSamples), walletLedger: c(walletLedger),
-    transactionsScanned, dustSkipped, ledgerCountMismatch: c(ledgerCountMismatch),
+    transactionsScanned, dustSkipped, zeroCentRows, zeroCentQty: c(zeroCentQty), ledgerCountMismatch: c(ledgerCountMismatch),
     rowsStreamedThisBuild, rowsSkippedNotOwned, futureLotRows, futureLotSample: c(futureLotSample),
     rowsSkippedStaleType, ammLedgerUsed, ammLedgerMissing, ammLedgerUplift, ammNoXrpLeg,
     ammBookedDeposits, ammBookedWithdrawals, ammSkippedUnverified, ammBookedDepositQty, ammBookedWithdrawQty,
@@ -3510,6 +3521,7 @@ function restoreLedgerState(snap) {
   Object.assign(unvaluedSamples, c(snap.unvaluedSamples)); Object.assign(walletLedger, c(snap.walletLedger));
   _flowsCache = null;
   transactionsScanned = snap.transactionsScanned; dustSkipped = snap.dustSkipped;
+  zeroCentRows = snap.zeroCentRows; Object.assign(zeroCentQty, c(snap.zeroCentQty));
   ledgerCountMismatch = c(snap.ledgerCountMismatch);
   rowsStreamedThisBuild = snap.rowsStreamedThisBuild; rowsSkippedNotOwned = snap.rowsSkippedNotOwned;
   futureLotRows = snap.futureLotRows; futureLotSample = c(snap.futureLotSample);
@@ -3623,6 +3635,11 @@ const cents = (n) => {
   if(stQty > 0) rows.push(makeRow(stQty, stCost, 'ST', 'I', ltQty>0 ? 'VARIOUS' : (stEarliest ? fmtDate(new Date(stEarliest).getTime()) : 'VARIOUS')));
   if(ltQty > 0) rows.push(makeRow(ltQty, ltCost, 'LT', 'L', stQty>0 ? 'VARIOUS' : (ltEarliest ? fmtDate(new Date(ltEarliest).getTime()) : 'VARIOUS')));
   for(const r of rows.filter(Boolean)) {
+    if(r.proceedsH === 0 && r.proceedsL === 0 && r.basis === 0) {
+      zeroCentRows++;
+      zeroCentQty[ticker] = (zeroCentQty[ticker] || 0) + r.qty;
+      continue;
+    }
     // ONE master row per disposal. It already carries priceH/priceL,
     // proceedsH/proceedsL and gainH/gainL, so the "daily low" view is a
     // projection of the same row rather than a second copy of it — see
@@ -4209,6 +4226,14 @@ function dataQualityHTML() {
       The nearest available date was used instead, so those figures are estimates — e.g. ${sample}.
       This normally means the transaction is outside the embedded price history (which ends 2026-09-03),
       so it matters most for the current in-progress year.
+    </div>`);
+  }
+  if(zeroCentRows) {
+    const by = Object.entries(zeroCentQty).map(([t, q]) => `${q.toLocaleString(undefined,{maximumFractionDigits:6})} ${t}`).join(', ');
+    parts.push(`<div style="margin-top:8px;padding:8px 12px;background:#f4f4f4;border:1px solid #ccc;border-radius:4px;font-size:10.5px;color:#444">
+      <strong>${zeroCentRows.toLocaleString()} disposal(s) left off Form 8949 because proceeds and basis both round to $0.00</strong>
+      (${by} in total). Their coins were taken out of inventory like any other sale; the rows would have read
+      $0.00 / $0.00 / $0.00 and change no total. Typically a host's fee-sized EVR payments.
     </div>`);
   }
   if(dustSkipped) {

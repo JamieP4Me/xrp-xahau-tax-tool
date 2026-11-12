@@ -438,12 +438,21 @@ test('a sub-1 EVR reward is income with a basis lot; sub-1 XAH is still dust', a
     });
     processOneXahauRow(pay('E1', '0.0352', 'EVR', '0'), args.wallet, new Set([args.wallet]), 'in', helpers);
     processOneXahauRow(pay('X1', '', '', '0.33'), args.wallet, new Set([args.wallet]), 'in', helpers);
+    // A 0.01 EVR fee-sized payment out: the lot is consumed, but a row that
+    // would read $0.00 / $0.00 / $0.00 is not printed, only counted.
+    const out = pay('E2', '0.01', 'EVR', '0'); out.Account = args.wallet; out.Destination = args.other;
+    const before = allDisposalsHigh.length;
+    processOneXahauRow(out, args.wallet, new Set([args.wallet]), 'out', helpers);
+    const printed = allDisposalsHigh.length - before;
     const evr = (walletLedger[args.wallet] && walletLedger[args.wallet].EVR) || [];
     const xah = (walletLedger[args.wallet] && walletLedger[args.wallet].XAH) || [];
-    return { evrLots: evr.map(l => l.qty), xahLots: xah.map(l => l.qty),
-             income: allIncomeRows.map(r => [r.ticker, r.qty]), dust: dustSkipped };
+    return { evrLots: evr.map(l => l.qty), remaining: evr.reduce((s, l) => s + l.remaining, 0), xahLots: xah.map(l => l.qty),
+             income: allIncomeRows.map(r => [r.ticker, r.qty]), dust: dustSkipped, printed, zeroRows: zeroCentRows };
   }, { wallet: W_XAHAU, other: OTHER });
   expect(out.evrLots).toEqual([0.0352]);
+  expect(out.remaining).toBeCloseTo(0.0252, 6);   // the 0.01 left inventory
+  expect(out.printed).toBe(0);                     // but printed no $0.00 row
+  expect(out.zeroRows).toBe(1);
   expect(out.income).toEqual([['EVR', 0.0352]]);
   expect(out.xahLots).toEqual([]);
 });
