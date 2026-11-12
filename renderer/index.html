@@ -6402,7 +6402,9 @@ function parseAffectedCSV(text) {
     if(!R_ADDR_RE.test(row.wallet)) { errors.push(`Line ${i+1}: wallet "${row.wallet}" is not an address.`); continue; }
     if(row.chain !== 'Xahau' && row.chain !== 'XRPL') { errors.push(`Line ${i+1}: chain "${row.chain}" must be Xahau or XRPL.`); continue; }
     if(!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(row.ts)) { errors.push(`Line ${i+1}: bad timestamp "${row.ts}".`); continue; }
-    if(!/^[0-9A-F]{64}$/.test(row.hash)) { errors.push(`Line ${i+1}: bad ledger hash.`); continue; }
+    // A 64-hex ledger hash from the node sweep, or a 16-hex CTID from the
+    // WinDB route (WinDB returns the hash as NUL bytes).
+    if(!/^([0-9A-F]{64}|[0-9A-F]{16})$/.test(row.hash)) { errors.push(`Line ${i+1}: bad ledger hash / CTID.`); continue; }
     if(!R_ADDR_RE.test(row.account)) { errors.push(`Line ${i+1}: signer "${row.account}" is not an address.`); continue; }
     rows.push(row);
   }
