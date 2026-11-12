@@ -264,7 +264,7 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
       host had sent out 300 EVR more than the cache ever saw arrive. That is the "zero-basis EVR" on the host
       accounts: unrecorded lease income, not a basis problem. The same mechanism hides a resting DEX offer being
       filled by someone else.
-      <b>Since v1.10.7 the fetch collects lease sales itself</b>: every "Fetch All Transactions" asks WinDB for the
+      <b>The fetch now collects lease sales itself</b>: every "Fetch All Transactions" asks WinDB for the
       tenant purchases of each wallet's lease tokens (new ones only after the first time) and stores them here.
       This import is for anything that route cannot see — a ledger-node sweep
       (<code>npm run sweep</code>) also catches resting DEX offers filled by others and network XAH rewards.

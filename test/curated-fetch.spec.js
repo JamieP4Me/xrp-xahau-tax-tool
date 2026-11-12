@@ -550,9 +550,13 @@ test('an imported lease row is income with a lot, and an own-payer row is a tran
     };
   }, { wallet: W_XAHAU, other: OTHER, rep: 'rTESTreputation1111111111111111111' });
   expect(out.income).toEqual([[2, '2.0000 EVR lease income']]);
-  // the outside tenant's 2 EVR is a new lot; the own account's 3 EVR carried its 2024 lot forward
-  expect(out.hostLots.map(l => l[1])).toEqual(['reward', 'transfer_in']);
-  expect(out.hostLots[1][2]).toBe('2024-06-01');
+  // the outside tenant's 2 EVR is a new lot; the own account's 3 EVR carried
+  // its 2024 lot forward. Lots are kept in acquisition-date order, so the
+  // carried 2024 lot sorts ahead of the 2025 reward.
+  expect(out.hostLots.map(l => l[1]).sort()).toEqual(['reward', 'transfer_in']);
+  const carried = out.hostLots.find(l => l[1] === 'transfer_in');
+  expect(carried[0]).toBe(3);
+  expect(carried[2]).toBe('2024-06-01');
   expect(out.repRemaining).toBe(7);
 });
 
