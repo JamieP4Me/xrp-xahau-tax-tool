@@ -556,6 +556,30 @@ test('an imported lease row is income with a lot, and an own-payer row is a tran
   expect(out.repRemaining).toBe(7);
 });
 
+test('the fetch\'s lease pass keys rows exactly as the CSV import does, and asks WinDB the right question', async () => {
+  const out = await window.evaluate((args) => {
+    const sql = leaseSql(args.wallet, null, '2025-01-01 00:00:00', 1000, 2000);
+    const nul = '\u0000'.repeat(64);
+    const id = leaseIdOf({ TransactionHash: nul, CTID: 'c0a1b2c3d4e5f607' });
+    const fromFetch = affectedCacheRow({ wallet: args.wallet, chain: 'Xahau', ts: '2025-03-01 10:00:00', hash: id, type: 'URITokenBuy',
+      account: args.other, currency: 'EVR', issuer: 'rISSUER', delta: 0.0173, native: NaN }, new Set([args.wallet]));
+    const fromCsv = planAffectedImport(parseAffectedCSV('Wallet,Chain,Timestamp,LedgerHash,Type,Account,Destination,Currency,Issuer,Delta,NativeDelta,Fee\n' +
+      `${args.wallet},Xahau,2025-03-01 10:00:00,C0A1B2C3D4E5F607,URITokenBuy,${args.other},,EVR,rISSUER,0.0173,,`).rows, new Set([args.wallet]));
+    return { sql, id, fetchKey: fromFetch.row.tx_hash, csvKey: fromCsv.byPerspective.get(`${args.wallet}|Xahau`)[0].tx_hash,
+             sameRaw: fromFetch.row.raw_json === fromCsv.byPerspective.get(`${args.wallet}|Xahau`)[0].raw_json, cursorChain: LEASE_CURSOR_CHAIN };
+  }, { wallet: W_XAHAU, other: OTHER });
+  expect(out.id).toBe('C0A1B2C3D4E5F607');                       // NUL hash -> CTID
+  expect(out.fetchKey).toBe('AFFECTED:C0A1B2C3D4E5F607:EVR');
+  expect(out.csvKey).toBe(out.fetchKey);                          // a re-run of either replaces, never duplicates
+  expect(out.sameRaw).toBe(true);
+  expect(out.sql).toContain("TransactionType = 'URITokenBuy'");
+  expect(out.sql).toContain("TransactionType = 'URITokenCreateSellOffer'");
+  expect(out.sql).toContain(`Account != '${W_XAHAU}'`);          // the host's own buys are already cached
+  expect(out.sql).toContain("Timestamp >= '2025-01-01 00:00:00'");
+  expect(out.sql).toContain('OFFSET 2000');
+  expect(out.cursorChain).toBe('Xahau:lease');
+});
+
 test('a token name that is HTML is shown as text in the not-on-8949 panel', async () => {
   // The currency code is the token's own 20 bytes, decoded. Anyone can Remit
   // a token to this wallet, so the name is attacker-chosen.

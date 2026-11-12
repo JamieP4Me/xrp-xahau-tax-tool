@@ -264,8 +264,10 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
       host had sent out 300 EVR more than the cache ever saw arrive. That is the "zero-basis EVR" on the host
       accounts: unrecorded lease income, not a basis problem. The same mechanism hides a resting DEX offer being
       filled by someone else.
-      Produce the file by sweeping a ledger node:
-      <code>npm run sweep -- --all-xahau</code> (hours on public infrastructure; it resumes), then import it here.
+      <b>Since v1.10.7 the fetch collects lease sales itself</b>: every "Fetch All Transactions" asks WinDB for the
+      tenant purchases of each wallet's lease tokens (new ones only after the first time) and stores them here.
+      This import is for anything that route cannot see — a ledger-node sweep
+      (<code>npm run sweep</code>) also catches resting DEX offers filled by others and network XAH rewards.
       Each inbound amount becomes an ordinary cache row — a payment from the tenant to the host — so the engine
       books it exactly as it books any other receipt: income with a basis lot when the payer is an outside
       address, an internal transfer when the payer is one of your own wallets (your reputation accounts lease
@@ -3214,7 +3216,24 @@ LIMIT ${page} OFFSET ${offset}`.trim(),
     totalRaw += inPass.total;
     chainStats.Xahau.rawRows += inPass.total;
 
-    const walletTotal = outPass.total + inPass.total;
+    // Third pass: leases this wallet SOLD, paid inside the tenants' own
+    // transactions. Its own cursor, because it is not covered by the two
+    // passes above and must not move theirs. Skipped, and said so once, if
+    // the schema has no URITokenID column to join on.
+    let leasePass = { total: 0, ok: true };
+    if(!cols || cols.includes('URITokenID')) {
+      let leaseSince = null;
+      if(USE_LOCAL_DB) { try { leaseSince = await window.taxDB.getSyncState(w, LEASE_CURSOR_CHAIN); } catch(e) { leaseSince = null; } }
+      leasePass = await fetchLeaseSales(claim, w, walletSet, cols, leaseSince, PAGE);
+      if(leasePass.total) log(`  ${w.slice(0,14)}… → ${leasePass.total.toLocaleString()} lease(s) sold: ${leasePass.external} to outside tenants (income), ${leasePass.internal} to your own accounts (transfers), ${leasePass.evr.toFixed(4)} EVR`, 'ok');
+      totalRaw += leasePass.total;
+      chainStats.Xahau.rawRows += leasePass.total;
+      if(USE_LOCAL_DB && leasePass.ok && !leasePass.truncated) await advanceSyncCursor(w, LEASE_CURSOR_CHAIN, [leasePass]);
+    } else if(i === 0) {
+      log('  WinDB schema has no URITokenID column: lease income cannot be fetched here. Use npm run sweep and import the file.', 'wa');
+    }
+
+    const walletTotal = outPass.total + inPass.total + leasePass.total;
 
     if(USE_LOCAL_DB) {
       if(outPass.ok && inPass.ok) {
@@ -6411,6 +6430,30 @@ function parseAffectedCSV(text) {
   return { rows, errors };
 }
 
+// One inbound affected row -> the cache row the engine will book, and the
+// wallet perspective it must be stored under. Used by the CSV import AND by
+// the fetch's own lease pass, so both produce identical keys and a re-run of
+// either replaces rather than duplicates. r = { wallet, chain, ts, hash, type,
+// account, currency, issuer, delta, native }.
+function affectedCacheRow(r, owned) {
+  const isIou = !!r.currency;
+  const amt = isIou ? r.delta : r.native;
+  if(!(amt > 0)) return null;
+  const internal = owned.has(r.account);
+  const raw = {
+    TransactionType: 'Payment', TransactionResult: 'tesSUCCESS',
+    Account: r.account, Destination: r.wallet, Timestamp: r.ts, TransactionHash: r.hash,
+    Amount_XRP: isIou ? '' : String(amt), delivered_amount_XRP: isIou ? '' : String(amt),
+    Amount_value: isIou ? String(amt) : '', Amount_currency: isIou ? r.currency : '', Amount_issuer: isIou ? r.issuer : '',
+    delivered_amount_value: isIou ? String(amt) : '', delivered_amount_currency: isIou ? r.currency : '',
+    _affected: { type: r.type, hash: r.hash, internal },
+  };
+  return {
+    perspective: internal ? r.account : r.wallet, chain: r.chain, internal, isIou, amt,
+    row: { tx_hash: `AFFECTED:${r.hash}:${isIou ? r.currency : 'native'}`, timestamp: r.ts, raw_json: JSON.stringify(raw) },
+  };
+}
+
 // Shape the rows the way the cache holds a Payment, grouped by the wallet
 // perspective they must be stored under. Returns what will be inserted and
 // what is only counted.
@@ -6418,28 +6461,83 @@ function planAffectedImport(rows, owned) {
   const byPerspective = new Map();   // `${wallet}|${chain}` -> [{tx_hash,timestamp,raw_json}]
   const stats = { inbound: 0, internal: 0, external: 0, outbound: 0, native: 0, evr: 0, byCurrency: {}, wallets: new Set() };
   for(const r of rows) {
-    const isIou = !!r.currency;
-    const amt = isIou ? r.delta : r.native;
-    if(!(amt > 0)) { stats.outbound++; continue; }
-    const internal = owned.has(r.account);
-    const perspective = internal ? r.account : r.wallet;
-    const raw = {
-      TransactionType: 'Payment', TransactionResult: 'tesSUCCESS',
-      Account: r.account, Destination: r.wallet, Timestamp: r.ts, TransactionHash: r.hash,
-      Amount_XRP: isIou ? '' : String(amt), delivered_amount_XRP: isIou ? '' : String(amt),
-      Amount_value: isIou ? String(amt) : '', Amount_currency: isIou ? r.currency : '', Amount_issuer: isIou ? r.issuer : '',
-      delivered_amount_value: isIou ? String(amt) : '', delivered_amount_currency: isIou ? r.currency : '',
-      _affected: { type: r.type, hash: r.hash, internal },
-    };
-    const key = `${perspective}|${r.chain}`;
+    const c = affectedCacheRow(r, owned);
+    if(!c) { stats.outbound++; continue; }
+    const key = `${c.perspective}|${c.chain}`;
     if(!byPerspective.has(key)) byPerspective.set(key, []);
-    byPerspective.get(key).push({ tx_hash: `AFFECTED:${r.hash}:${isIou ? r.currency : 'native'}`, timestamp: r.ts, raw_json: JSON.stringify(raw) });
+    byPerspective.get(key).push(c.row);
     stats.inbound++; stats.wallets.add(r.wallet);
-    if(internal) stats.internal++; else stats.external++;
-    if(isIou) { stats.byCurrency[r.currency] = (stats.byCurrency[r.currency] || 0) + amt; if(r.currency === 'EVR') stats.evr += amt; }
+    if(c.internal) stats.internal++; else stats.external++;
+    if(c.isIou) { stats.byCurrency[r.currency] = (stats.byCurrency[r.currency] || 0) + c.amt; if(r.currency === 'EVR') stats.evr += c.amt; }
     else stats.native++;
   }
   return { byPerspective, stats };
+}
+
+// ── The fetch's own lease pass ───────────────────────────────────────────
+//
+// A lease sold by one of your hosts is paid inside the TENANT's URITokenBuy,
+// so neither Account = w nor Destination = w ever finds it. But the buy names
+// the token, and the host named the same token in its URITokenCreateSellOffer,
+// so one server-side query per wallet returns every tenant purchase. Each one
+// is stored as a Payment from the tenant to the host (affectedCacheRow), under
+// the key the CSV import uses, with its own sync cursor (pseudo-chain
+// 'Xahau:lease') so a routine sync asks only for new leases.
+//
+// Measured on one host before this existed: 17,890 tenant buys, 340.7 EVR,
+// none of it in the cache; the host had "sent 300 EVR it never had".
+const LEASE_CURSOR_CHAIN = 'Xahau:lease';
+const NUL_CHAR = String.fromCharCode(0);
+function leaseIdOf(r) {
+  const h = String(r.TransactionHash || '').split(NUL_CHAR).join('').trim().toUpperCase();
+  if(/^[0-9A-F]{64}$/.test(h)) return h;
+  const c = String(r.CTID || '').split(NUL_CHAR).join('').trim().toUpperCase();
+  return /^[0-9A-F]{16}$/.test(c) ? c : '';
+}
+function leaseSql(w, cols, sinceTs, page, offset) {
+  const sel = ['CTID', 'TransactionHash', 'Timestamp', 'Account', 'Amount_XRP', 'Amount_value', 'Amount_currency', 'Amount_issuer', 'URITokenID']
+    .filter(c => !cols || cols.includes(c));
+  return `SELECT ${sel.join(', ')}
+FROM xahau.transactions
+WHERE TransactionType = 'URITokenBuy' AND TransactionResult = 'tesSUCCESS' AND Account != '${w}'
+  AND URITokenID IN (SELECT DISTINCT URITokenID FROM xahau.transactions
+                     WHERE Account = '${w}' AND TransactionType = 'URITokenCreateSellOffer' AND TransactionResult = 'tesSUCCESS')
+  ${sinceTs ? `AND Timestamp >= '${sinceTs}'` : ''}
+ORDER BY Timestamp ASC
+LIMIT ${page} OFFSET ${offset}`.trim();
+}
+async function fetchLeaseSales(claim, w, walletSet, cols, sinceTs, page = 1000) {
+  let offset = 0, total = 0, pages = 0, maxTs = null, ok = true, truncated = false, evr = 0, internal = 0, external = 0;
+  while(true) {
+    if(pages >= MAX_PAGES_PER_PASS) { truncated = true; break; }
+    if(abortFlag) { ok = false; break; }
+    let rows;
+    try { rows = await windbQuery(leaseSql(w, cols, sinceTs, page, offset), claim); }
+    catch(e) { log(`  ${w.slice(0,14)}… (leases) page ${pages + 1} error: ${e.message}`, 'er'); ok = false; break; }
+    const byPerspective = new Map();
+    for(const r of rows) {
+      const id = leaseIdOf(r);
+      if(!id) continue;
+      const ts = String(r.Timestamp || '').replace('T', ' ').slice(0, 19);
+      const cur = (r.Amount_currency || '').toUpperCase().trim();
+      const val = parseFloat(r.Amount_value), nat = parseFloat(r.Amount_XRP);
+      const c = affectedCacheRow({ wallet: w, chain: 'Xahau', ts, hash: id, type: 'URITokenBuy', account: String(r.Account || '').trim(),
+        currency: cur && val > 0 ? cur : '', issuer: String(r.Amount_issuer || '').trim(), delta: val, native: nat }, walletSet);
+      if(!c) continue;
+      const key = `${c.perspective}|${c.chain}`;
+      if(!byPerspective.has(key)) byPerspective.set(key, []);
+      byPerspective.get(key).push(c.row);
+      if(c.internal) internal++; else external++;
+      if(c.isIou && cur === 'EVR') evr += c.amt;
+      if(r.Timestamp && (!maxTs || r.Timestamp > maxTs)) maxTs = r.Timestamp;
+    }
+    if(USE_LOCAL_DB) {
+      for(const [key, list] of byPerspective) await window.taxDB.insertRows(key.split('|')[0], 'Xahau', list);
+    }
+    total += rows.length; offset += rows.length; pages++;
+    if(rows.length < page) break;
+  }
+  return { total, pages, maxTs, ok, truncated, evr, internal, external };
 }
 
 function handleAffectedCSV(input) {
@@ -6494,10 +6592,10 @@ async function refreshAffectedPanel() {
     const c = await window.taxDB.countAffected();
     const m = JSON.parse((await window.taxDB.getMeta('affectedImport')) || 'null');
     if(!c.rows) {
-      box.innerHTML = '<span style="color:#b06000">No ledger sweep imported.</span> Lease income paid to your hosts by tenants, and any ' +
-        'other balance change made by someone else\'s transaction, is not in the figures.';
+      box.innerHTML = '<span style="color:#b06000">No lease sales or sweep rows yet.</span> They arrive with the next ' +
+        '"Fetch All Transactions" (lease sales, from WinDB) or from an imported ledger sweep.';
     } else {
-      box.innerHTML = `<b>${c.rows.toLocaleString()}</b> ledger-affected row(s) across <b>${c.wallets}</b> wallet perspective(s)` +
+      box.innerHTML = `<b>${c.rows.toLocaleString()}</b> lease-sale / ledger-affected row(s) across <b>${c.wallets}</b> wallet perspective(s)` +
         (m ? ` &nbsp;·&nbsp; ${(m.external || 0).toLocaleString()} from outside (income), ${(m.internal || 0).toLocaleString()} internal` +
              (m.evr ? ` &nbsp;·&nbsp; <b>${m.evr.toLocaleString(undefined, {maximumFractionDigits: 2})} EVR</b> in total` : '') +
              `<br>Last import: <b>${new Date(m.at).toLocaleString()}</b>${m.file ? ` (${escapeHTML(m.file)})` : ''}` +
