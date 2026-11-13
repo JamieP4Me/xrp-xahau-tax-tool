@@ -92,6 +92,21 @@ test('the renderer offers no require() or AMD route for that loader to use', () 
   assert.ok(/nodeIntegration:\s*false/.test(main), 'nodeIntegration is no longer false');
 });
 
+test('the ledger route ships, and nothing on its method list can write', () => {
+  // ledger-rpc.js is required by main.js, so it must be in the packaged file
+  // list or the installed app fails at launch while every test passes.
+  const files = JSON.parse(read('package.json')).build.files;
+  assert.ok(files.includes('ledger-rpc.js'), 'ledger-rpc.js is not in build.files');
+  const { READ_ONLY_METHODS, ALLOWED_HOSTS } = require(path.join(ROOT, 'ledger-rpc.js'));
+  for (const m of ['submit', 'sign', 'sign_for', 'submit_multisigned', 'channel_authorize', 'wallet_propose']) {
+    assert.ok(!READ_ONLY_METHODS.has(m), m + ' is on the read-only list');
+  }
+  assert.deepStrictEqual([...ALLOWED_HOSTS].sort(), ['run.api.dhali.io', 's2.ripple.com', 'xahau.network', 'xrplcluster.com'],
+    'the ledger host list changed: update SECURITY.md, which names each host');
+  // The page itself still reaches WinDB only.
+  assert.ok(read('main.js').includes(`"connect-src 'self' https://run.api.dhali.io"`), 'the renderer connect-src changed');
+});
+
 test('Electron is pinned at or above the November 2026 patched release', () => {
   // 44.0.0-alpha.1 through 44.9.0 carry a high-severity advisory. A range
   // floor below 44.10.2 lets a fresh install resolve into it.

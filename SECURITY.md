@@ -14,7 +14,30 @@ Everything stays on the machine it runs on:
   the "shareable copy" export.
 
 Nothing is transmitted anywhere except the WinDB/Dhali queries you explicitly
-run, and CoinGecko price data is embedded rather than fetched.
+run and, since 1.10.8, the on-chain balance check's read-only ledger queries
+(below). CoinGecko price data is embedded rather than fetched.
+
+### The on-chain balance check (1.10.8)
+
+After each build the app asks a full-history ledger server for the balance of
+every fetched wallet, and "Explain" asks for one wallet's transaction history.
+What that means for privacy and safety:
+
+- **What is sent:** your wallet addresses and ledger numbers, to
+  `xrplcluster.com` (XRPL) and `xahau.network` (Xahau) by default. Those
+  servers, like WinDB, can see which addresses are being looked up from your
+  IP address. Turn off "run automatically after each build" on the Holdings tab
+  if you do not want that to happen without a click.
+- **How:** from the main process (`ledger-rpc.js`), never from the page. The
+  renderer's `connect-src` still allows WinDB only. `ledger-rpc.js` accepts
+  only https, only the hosts `xrplcluster.com`, `s2.ripple.com`,
+  `xahau.network` and `run.api.dhali.io`, and only read-only methods
+  (`account_info`, `account_lines`, `account_objects`, `account_tx`,
+  `amm_info`, `ledger`, `server_info`). Nothing in it can submit or sign.
+- **The Payment-Claim** is attached only when you set a Dhali server for the
+  check, and only to `run.api.dhali.io`. It is never sent to the public
+  servers, never logged, and never stored. `test/ledger-rpc.test.js` pins all
+  of this.
 
 ## Before you share a build or a working copy
 

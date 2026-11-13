@@ -690,6 +690,24 @@ test('importAmmLedger on an empty list is a no-op, not an error', () => {
   db.close();
 });
 
+test('getSyncTimes and getTxHashes answer the on-chain check, read-only', () => {
+  const db = createDb(tmpDbPath());
+  db.insertRows('rTESTsyncA', 'XRPL', [
+    { tx_hash: 'A'.repeat(64), timestamp: '2026-01-01 00:00:00', raw_json: '{}' },
+    { tx_hash: 'AFFECTED:' + 'B'.repeat(64) + ':native', timestamp: '2026-01-02 00:00:00', raw_json: '{}' },
+  ]);
+  db.insertRows('rTESTsyncA', 'Xahau', [{ tx_hash: 'C'.repeat(64), timestamp: '2026-01-01 00:00:00', raw_json: '{}' }]);
+  db.upsertSyncState('rTESTsyncA', 'XRPL', '2026-01-02 00:00:00');
+  const st = db.getSyncTimes();
+  assert.strictEqual(st.length, 1);
+  assert.strictEqual(st[0].wallet, 'rTESTsyncA');
+  assert.strictEqual(st[0].chain, 'XRPL');
+  assert.ok(st[0].last_synced_at);
+  assert.deepStrictEqual(db.getTxHashes('rTESTsyncA', 'XRPL').sort(), ['A'.repeat(64), 'AFFECTED:' + 'B'.repeat(64) + ':native']);
+  assert.deepStrictEqual(db.getTxHashes('rTESTsyncA', 'Xahau'), ['C'.repeat(64)]);
+  db.close();
+});
+
 console.log('');
 if (failures > 0) {
   console.log(`${failures} test(s) FAILED`);

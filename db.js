@@ -639,6 +639,26 @@ function makeApi(db) {
       stmts.clearAmmLedger.run();
     },
 
+    /**
+     * When each wallet+chain was last synced. The on-chain balance check uses
+     * it to choose the ledger it compares at: a point every wallet's download
+     * had already reached.
+     * @returns {{wallet:string, chain:string, last_timestamp:string|null, last_synced_at:string|null}[]}
+     */
+    getSyncTimes() {
+      return db.prepare('SELECT wallet, chain, last_timestamp, last_synced_at FROM sync_state ORDER BY wallet, chain').all();
+    },
+
+    /**
+     * Every cached tx_hash for one wallet+chain, as stored (64-hex, doubled
+     * 128-hex, AFFECTED:<id>:<asset>, or a synthetic id). The explain view
+     * uses it to tell "never downloaded" from "downloaded but not booked".
+     * @returns {string[]}
+     */
+    getTxHashes(wallet, chain) {
+      return db.prepare('SELECT tx_hash FROM raw_transactions WHERE wallet = ? AND chain = ?').pluck().all(wallet, chain);
+    },
+
     close() {
       db.close();
     },

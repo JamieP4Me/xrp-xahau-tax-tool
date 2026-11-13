@@ -156,6 +156,8 @@ Local Data panel (Setup tab) actions:
   transaction, last sync time).
 - **View Report From Cache (offline)** — rebuilds Form 8949 / Schedule D from
   every wallet with cached data, with no Payment-Claim and no network call.
+  (The on-chain balance check that follows a build does query the ledger
+  servers — see "On-chain balance check" below — and can be switched off.)
   Runs automatically and silently on every startup; use the button to force
   a re-run on demand (e.g. right after switching the tax-year dropdown).
 - **Force Full Re-sync** — clears sync cursors only. Cached rows stay, so the
@@ -1086,3 +1088,32 @@ silently assumed — each is either surfaced in the UI or listed here.
 - **"Daily Low" is not a symmetric scenario.** Acquisition lots always take
   the daily *high*, so the low view is low proceeds against high basis — the
   most pessimistic combination, not a lower bound.
+
+
+## On-chain balance check (1.10.8)
+
+Every other check in this app compares the cache with itself. This one
+compares the app's books with the ledger.
+
+After each build, for every fetched wallet and asset (XRP on XRPL; XAH and EVR
+on Xahau), the Holdings tab shows what the app holds beside what the ledger
+held **at the same moment**: the ledger that closed ten minutes before the last
+download began. Bookings the app made for transactions after that moment are
+taken back out of its figure, using a small per-transaction booking journal,
+so a host earning rewards during the download does not show as a difference.
+Escrows and payment channels count as held; an AMM pool share is shown but not
+counted. Differences under $5 are "minor".
+
+**Explain** walks one wallet's full ledger history up to that moment, reads
+what the ledger recorded each transaction did to the balance (metadata), and
+sets it beside what the app booked for the same transaction. Every disagreement
+is listed with its hash and a cause — never downloaded (yours, or someone
+else's transaction such as a resting DEX offer being filled), network fees,
+dust, a type the app does not book, a DEX offer booked at full terms, a
+different amount, coins taken that the app never saw arrive, or a booking with
+no ledger transaction — and the causes add up to the difference, or the panel
+says by how much they do not. Both views export to CSV.
+
+Servers: `xrplcluster.com` and `xahau.network` by default, or a Dhali API
+(`https://run.api.dhali.io/<api id>/`), in which case the Setup Payment-Claim
+is sent to Dhali only. See SECURITY.md for exactly what is sent.

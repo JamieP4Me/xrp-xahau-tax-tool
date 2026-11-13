@@ -23,6 +23,7 @@ const path = require('path');
 const http = require('http');
 const fs = require('fs');
 const { createDb } = require('./db');
+const ledgerRpc = require('./ledger-rpc');
 
 const RENDERER_DIR = path.resolve(__dirname, 'renderer');
 const DB_FILENAME = 'tax-data.sqlite3';
@@ -435,4 +436,15 @@ function registerIpcHandlers(db, dbPath) {
   // Ledger-affected rows (lease income etc.), see db.js countAffected.
   ipcMain.handle('db:countAffected', guarded(() => db.countAffected()));
   ipcMain.handle('db:clearAffected', guarded(() => db.clearAffected()));
+
+  // On-chain balance check: when each wallet was last synced, and which
+  // transactions the cache holds for one wallet. Both read-only.
+  ipcMain.handle('db:getSyncTimes', guarded(() => db.getSyncTimes()));
+  ipcMain.handle('db:getTxHashes', guarded((_evt, wallet, chain) => db.getTxHashes(wallet, chain)));
+
+  // Read-only JSON-RPC to a full-history XRPL/Xahau node. ledger-rpc.js
+  // decides what is allowed: a short list of hosts, read-only methods only,
+  // and the Payment-Claim sent to Dhali alone. The renderer's CSP is not
+  // widened for this; the request is made here.
+  ipcMain.handle('ledger:rpc', guarded((_evt, req) => ledgerRpc.call(req)));
 }

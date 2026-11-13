@@ -72,6 +72,19 @@ contextBridge.exposeInMainWorld('taxDB', {
   clearAmmLedger: () => ipcRenderer.invoke('db:clearAmmLedger'),
   countAffected: () => ipcRenderer.invoke('db:countAffected'),
   clearAffected: () => ipcRenderer.invoke('db:clearAffected'),
+
+  /** @returns {Promise<{wallet,chain,last_timestamp,last_synced_at}[]>} */
+  getSyncTimes: () => ipcRenderer.invoke('db:getSyncTimes'),
+  /** @returns {Promise<string[]>} every cached tx_hash for one wallet+chain */
+  getTxHashes: (wallet, chain) => ipcRenderer.invoke('db:getTxHashes', wallet, chain),
+});
+
+// Read-only ledger queries for the on-chain balance check. The main process
+// (ledger-rpc.js) enforces the host list, the read-only method list, and
+// that a Payment-Claim only ever goes to Dhali.
+contextBridge.exposeInMainWorld('chainRpc', {
+  /** req: {chain:'XRPL'|'Xahau', method, params, endpoint?, claim?} */
+  call: (req) => ipcRenderer.invoke('ledger:rpc', req),
 });
 
 contextBridge.exposeInMainWorld('appInfo', {
@@ -82,4 +95,7 @@ contextBridge.exposeInMainWorld('appInfo', {
   getVersion: () => ipcRenderer.invoke('app:getVersion'),
   // false only when XRPTAX_BACKGROUND_COMPARE=off, which the test suite sets.
   backgroundCompare: process.env.XRPTAX_BACKGROUND_COMPARE !== 'off',
+  // false only when XRPTAX_ONCHAIN_CHECK=off, which the test suite sets: the
+  // automatic on-chain check would otherwise reach real ledger servers.
+  onchainCheck: process.env.XRPTAX_ONCHAIN_CHECK !== 'off',
 });

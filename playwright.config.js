@@ -19,6 +19,9 @@
 // extra builds would race the assertions, so they are off here; specs spread
 // process.env into electron.launch, so this reaches every app instance.
 process.env.XRPTAX_BACKGROUND_COMPARE = process.env.XRPTAX_BACKGROUND_COMPARE || 'off';
+// The on-chain balance check runs after every build and talks to real ledger
+// servers. Tests drive it with a stubbed RPC instead, so the automatic run is off.
+process.env.XRPTAX_ONCHAIN_CHECK = process.env.XRPTAX_ONCHAIN_CHECK || 'off';
 
 module.exports = {
   testDir: './test',

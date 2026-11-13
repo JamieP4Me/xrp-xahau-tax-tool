@@ -1338,7 +1338,7 @@ async function main() {
 
 // Exported for the unit tests — the network path cannot be tested offline,
 // but the balance-delta arithmetic is the part that can silently be wrong.
-module.exports = { ammMode, AMM_FLAGS, xrpDeltaFor, feeXrp, rippleTimeToIso, toSecond, cachedAmountXrp, REAL_HASH, DOUBLED_HASH, ledgerHashOf, decodeDoubled, retryHintMs, RATE_LIMIT_ERRORS, DUST_MIN_UNITS, reconcileAmm, parseArgs, PAID };
+module.exports = { rpc, ammMode, AMM_FLAGS, xrpDeltaFor, feeXrp, rippleTimeToIso, toSecond, cachedAmountXrp, REAL_HASH, DOUBLED_HASH, ledgerHashOf, decodeDoubled, retryHintMs, RATE_LIMIT_ERRORS, DUST_MIN_UNITS, reconcileAmm, parseArgs, PAID };
 
 if (require.main === module) {
   main().catch((e) => { console.error('\nverify-xrpl failed: ' + (e && e.stack ? e.stack : e)); process.exit(1); });
