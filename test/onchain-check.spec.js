@@ -203,7 +203,10 @@ test('the Payment-Claim goes along only when the server is Dhali', async () => {
 
 async function setUpScenario(fullJournalFor) {
   return window.evaluate(async ({ A, B, OTHER, ISSUER, h1, h2, h3, h4, full }) => {
-    const T0 = Date.parse('2026-01-01T00:00:00Z');
+    // Ledger 500 closes two seconds before midnight UTC on 1 Jan 2026, and the
+    // download begins at 08:00 on 2 Jan: the comparison point is the end of
+    // 1 Jan, i.e. ledger 500.
+    const T0 = Date.parse('2026-01-01T23:59:58Z') - 500 * 4000;
     const closeMs = (i) => T0 + i * 4000;
     const iso = (ms) => new Date(ms).toISOString().replace('T', ' ').slice(0, 19);
     const rippleSec = (ms) => Math.round(ms / 1000) - 946684800;
@@ -211,7 +214,8 @@ async function setUpScenario(fullJournalFor) {
     for (const w of [A, B]) if (!WALLETS.includes(w)) WALLETS.push(w);
     await window.taxDB.upsertSyncState(A, 'XRPL', '2026-01-01 01:00:00');
     await window.taxDB.upsertSyncState(B, 'Xahau', '2026-01-01 01:00:00');
-    await window.taxDB.setMeta('onchainFetchStartV1', new Date(closeMs(500) + 10 * 60 * 1000 + 1000).toISOString());
+    await window.taxDB.setMeta('onchainFetchStartV1', '2026-01-02T08:00:00.000Z');
+    saveOnchainSettings({ source: 'rpc' });
     await window.taxDB.setMeta('onchainCheckV1', '');
     await window.taxDB.setMeta('onchainPinLedgerV1', '{}');
     _onchainResult = null; _onchainExplain = null;
@@ -366,4 +370,142 @@ test('the page loads the module before the main script, and the renderer CSP is 
   expect(main).toBeGreaterThan(mod);
   const mainJs = fs.readFileSync(path.join(APP_DIR, 'main.js'), 'utf8');
   expect(mainJs).toContain(`"connect-src 'self' https://run.api.dhali.io"`);
+});
+
+// ── WinDB as the source (the default since 1.10.10) ────────────────────────
+
+const C = 'rTESTonchainC11111111111111111111';
+
+async function setUpWinDB() {
+  await setUpScenario(null);
+  return window.evaluate(async ({ A, B, C, OTHER, h1 }) => {
+    saveOnchainSettings({ source: 'windb' });
+    document.getElementById('paymentClaim').value = 'TEST-CLAIM-NOT-SENT';
+    if (!WALLETS.includes(C)) WALLETS.push(C);
+    await window.taxDB.upsertSyncState(C, 'XRPL', '2026-01-01 01:00:00');
+    processOneXRPLRow({ TransactionType: 'Payment', TransactionResult: 'tesSUCCESS', Account: OTHER, Destination: C,
+      Timestamp: '2025-06-01 00:00:00', TransactionHash: '', Amount_XRP: '3', delivered_amount_XRP: '3' }, C, new Set([A, B, C]), 'in', makeXrplPriceHelpers());
+    // a downloaded row for A on 1 Jan, for the day listing
+    await window.taxDB.insertRows(A, 'XRPL', [{ tx_hash: h1, timestamp: '2026-01-01 23:33:18', raw_json: JSON.stringify({
+      TransactionType: 'Payment', TransactionResult: 'tesSUCCESS', Account: OTHER, Destination: A, Timestamp: '2026-01-01 23:33:18', Amount_XRP: '1000' }) }]);
+    window.__sql = [];
+    windbCall = async (sql) => {
+      window.__sql.push(sql);
+      const has = (w) => sql.includes(`'${w}'`);
+      if (sql.includes('.ledgers')) return [{ LedgerIndex: 500, Timestamp: '2026-01-01 23:59:58' }];
+      if (sql.includes('GROUP BY Date')) {   // explain: A's daily XRP balances
+        return has(A) && sql.includes('xrpl.account_balance_history') ? [{ d: '2025-12-31', bal: 5000000 }, { d: '2026-01-01', bal: 699999990 }] : [];
+      }
+      if (sql.includes('account_balance_history')) {
+        const out = [];
+        if (sql.includes('xrpl.') && has(A)) out.push({ Account: A, bal: 699999990, li: 450, first: '2025-12-31' });
+        if (sql.includes('xrpl.') && has(C)) out.push({ Account: C, bal: 0, li: 0, first: '2026-01-02' });   // history starts after the comparison day
+        if (sql.includes('xahau.') && has(B)) out.push({ Account: B, bal: 5000000, li: 300, first: '2025-12-01' });
+        return out;
+      }
+      if (sql.includes('.accounts')) {
+        const out = [];
+        if (sql.includes('xrpl.') && has(A)) out.push({ Account: A, bal: 749999990, li: 900, active: 1 });
+        if (sql.includes('xrpl.') && has(C)) out.push({ Account: C, bal: 3000000, li: 950, active: 1 });
+        if (sql.includes('xahau.') && has(B)) out.push({ Account: B, bal: 5000000, li: 300, active: 1 });
+        return out;
+      }
+      // B holds 10 EVR from the main issuer and 0.5 from another: counted together, as the engine counts EVR.
+      if (sql.includes('token_balance_history')) return has(B) ? [{ Holder: B, Issuer: 'rTESTissuerOne1111111111111111111', bal: 10, li: 300 }, { Holder: B, Issuer: 'rTESTissuerTwo1111111111111111111', bal: 0.5, li: 310 }] : [];
+      if (sql.includes('token_balances')) return has(B) ? [{ Holder: B, Issuer: 'rTESTissuerOne1111111111111111111', bal: 10, li: 300 }, { Holder: B, Issuer: 'rTESTissuerTwo1111111111111111111', bal: 0.5, li: 310 }] : [];
+      return [];
+    };
+    return true;
+  }, { A, B, C, OTHER, h1: H('1') });
+}
+
+test('WinDB: the check reads end-of-day balances, newest row by ledger, and flags what it cannot determine', async () => {
+  await setUpWinDB();
+  const out = await window.evaluate(async () => {
+    const r = await runOnchainCheck();
+    return { source: r.source, pin: r.pins.XRPL, errors: r.errors,
+      rows: r.rows.map((x) => ({ w: x.wallet.slice(0, 13), t: x.ticker, app: x.app, ledger: x.ledger, v: x.variance, st: x.status })),
+      batched: window.__sql.some((q) => q.includes(`IN ('rTESTonchainA11111111111111111111','rTESTonchainC11111111111111111111')`)),
+      argmax: window.__sql.filter((q) => q.includes('argMax')).length,
+      claimInSql: window.__sql.some((q) => q.includes('TEST-CLAIM')) };
+  });
+  expect(out.source).toBe('windb');
+  expect(out.errors).toEqual([]);
+  expect(out.pin.index).toBe(500);
+  const a = out.rows.find((x) => x.w === 'rTESTonchainA' && x.t === 'XRP');
+  expect(a.app).toBeCloseTo(1007, 9);
+  expect(a.ledger).toBeCloseTo(699.99999, 9);       // the snapshot at or before ledger 500, not the current 749.99999
+  expect(a.st).toBe('material');
+  const evr = out.rows.find((x) => x.t === 'EVR');
+  expect(evr.ledger).toBeCloseTo(10.5, 9);
+  expect(evr.v).toBeCloseTo(-0.5, 9);
+  expect(out.rows.find((x) => x.t === 'XAH').v).toBeCloseTo(-5, 9);
+  expect(out.rows.find((x) => x.w === 'rTESTonchainC').st).toBe('unknown');
+  expect(out.argmax).toBeGreaterThan(3);
+  expect(out.batched).toBe(true);                    // several wallets per query
+  expect(out.claimInSql).toBe(false);
+});
+
+test('WinDB: Explain finds the day the books and the ledger parted, and lists what was downloaded that day', async () => {
+  const out = await window.evaluate(async ({ A }) => {
+    await explainOnchain(A, 'XRPL');
+    const x = _onchainExplain;
+    const c = x.assets.XRP;
+    let csv = null;
+    const saved = downloadCSV;
+    downloadCSV = (lines, name) => { csv = { lines, name }; };
+    exportExplainCSV();
+    downloadCSV = saved;
+    await renderOnchainPanel();
+    const jan1 = Math.floor(Date.UTC(2026, 0, 1) / 86400000);
+    return { kind: x.kind, first: c.firstDay, startDiff: c.startDiff, events: c.events.map((e) => ({ day: e.day, ledger: e.ledger, app: e.app, delta: e.delta })),
+      finalDiff: c.finalDiff, jan1, txJan1: (x.txByDay[jan1] || []).map((t) => t.type), csvName: csv.name,
+      panel: document.getElementById('onchainPanel').innerText };
+  }, { A });
+  expect(out.kind).toBe('daily');
+  expect(out.startDiff).toBeCloseTo(-5, 9);          // 5 XRP on the ledger before the app saw any
+  expect(out.events.length).toBe(1);
+  expect(out.events[0].day).toBe(out.jan1);
+  expect(out.events[0].ledger).toBeCloseTo(694.99999, 9);
+  expect(out.events[0].app).toBeCloseTo(1007, 9);
+  expect(out.events[0].delta).toBeCloseTo(312.00001, 6);
+  expect(out.finalDiff).toBeCloseTo(307.00001, 6);   // the same difference the check found
+  expect(out.txJan1).toEqual(['Payment']);
+  expect(out.csvName).toMatch(/^Onchain-Explain-Daily-/);
+  expect(out.panel).toContain('adds up to the difference');
+});
+
+test('WinDB: addresses are checked before they reach SQL, and no claim means no query', async () => {
+  const out = await window.evaluate(async () => {
+    let refused = false;
+    try { onchainSqlAddr("rX'); DROP TABLE x; --"); } catch (e) { refused = true; }
+    document.getElementById('paymentClaim').value = '';
+    window.__sql = [];
+    let msg = '';
+    try { await runOnchainCheck(); } catch (e) { msg = e.message; }
+    document.getElementById('paymentClaim').value = 'TEST-CLAIM-NOT-SENT';
+    return { refused, msg, queries: window.__sql.length };
+  });
+  expect(out.refused).toBe(true);
+  expect(out.msg).toContain('Payment-Claim');
+  expect(out.queries).toBe(0);
+});
+
+test('daily totals carry each issuer\'s last balance forward', async () => {
+  const out = await window.evaluate(() => explainDailyTotals([
+    { d: '2026-01-01', Issuer: 'i1', bal: 10 }, { d: '2026-01-02', Issuer: 'i2', bal: 1 }, { d: '2026-01-03', Issuer: 'i1', bal: 7 },
+  ], 1).map((x) => x.bal));
+  expect(out).toEqual([10, 11, 8]);
+});
+
+test('the day-by-day arithmetic adds up whatever the shape of the history', async () => {
+  const out = await window.evaluate(() => {
+    const net = new Map([[10, 5], [12, -2], [15, 1]]);
+    const c = explainDailyCompute({ ledgerDays: [{ day: 9, bal: 1 }, { day: 12, bal: 3 }, { day: 14, bal: 3.5 }], appDaily: net, appAtD: 6, dayD: 16, threshold: 1 });
+    const total = c.startDiff + c.small.sum + c.events.reduce((s, e) => s + e.delta, 0);
+    return { total, finalDiff: c.finalDiff, first: c.firstDay, events: c.events.length, small: c.small.n };
+  });
+  expect(out.first).toBe(9);
+  expect(out.total).toBeCloseTo(out.finalDiff, 9);
+  expect(out.finalDiff).toBeCloseTo(6 - 3.5, 9);
 });

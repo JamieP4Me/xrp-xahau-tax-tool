@@ -23,11 +23,16 @@ After each build the app asks a full-history ledger server for the balance of
 every fetched wallet, and "Explain" asks for one wallet's transaction history.
 What that means for privacy and safety:
 
-- **What is sent:** your wallet addresses and ledger numbers, to
-  `xrplcluster.com` (XRPL) and `xahau.network` (Xahau) by default. Those
-  servers, like WinDB, can see which addresses are being looked up from your
-  IP address. Turn off "run automatically after each build" on the Holdings tab
-  if you do not want that to happen without a click.
+- **What is sent:** since 1.10.10 the check reads WinDB through Dhali by
+  default, with the same Payment-Claim and the same endpoint as the download,
+  so nothing goes anywhere the download does not already go: your wallet
+  addresses, in a few small read-only SQL queries. Addresses are checked
+  against the address alphabet before they are placed in a query. If you
+  switch the source to the public ledger servers, your addresses and ledger
+  numbers go to `xrplcluster.com` (XRPL) and `xahau.network` (Xahau), which
+  can see which addresses are being looked up from your IP address. Turn off
+  "run automatically after each build" on the Holdings tab if you do not
+  want either to happen without a click.
 - **How:** from the main process (`ledger-rpc.js`), never from the page. The
   renderer's `connect-src` still allows WinDB only. `ledger-rpc.js` accepts
   only https, only the hosts `xrplcluster.com`, `s2.ripple.com`,

@@ -77,6 +77,8 @@ contextBridge.exposeInMainWorld('taxDB', {
   getSyncTimes: () => ipcRenderer.invoke('db:getSyncTimes'),
   /** @returns {Promise<string[]>} every cached tx_hash for one wallet+chain */
   getTxHashes: (wallet, chain) => ipcRenderer.invoke('db:getTxHashes', wallet, chain),
+  /** One wallet's cached rows between two Timestamp strings, oldest first, capped. */
+  getRowsBetween: (wallet, chain, from, to, limit) => ipcRenderer.invoke('db:getRowsBetween', wallet, chain, from, to, limit),
 
   /** Bumped by every change to cached data (see db.js bumpDataVersion). */
   getDataVersion: () => ipcRenderer.invoke('db:getDataVersion'),

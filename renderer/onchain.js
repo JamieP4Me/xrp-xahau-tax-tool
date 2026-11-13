@@ -25,7 +25,21 @@
 // disagrees is listed with its hash and a cause, and the causes add up to the
 // difference — or the report says by how much they do not.
 //
-// Network: through window.chainRpc (main process, ledger-rpc.js), read-only.
+// Source (1.10.10): WinDB through Dhali by default, with the same
+// Payment-Claim as the download. WinDB keeps each account's balance as
+// daily snapshots (account_balance_history, token_balance_history) and the
+// current state (accounts, token_balances), so the check reads the balance at
+// the END OF A UTC DAY — the day before the last download began — and
+// Explain compares the app's books with the ledger day by day, inside the
+// window WinDB's history covers (measured: XRPL from 2024-11-16, Xahau from
+// 2026-04-28). Every query takes the newest row by ledger index, because
+// these tables hold unmerged duplicates (one account returned seven rows).
+// The public ledger servers stay available as the other source, and for the
+// transaction-exact walk.
+//
+// Network for the public-server source: window.chainRpc (main process,
+// ledger-rpc.js), read-only. WinDB: the renderer's own windbQuery(), the
+// same call the download makes.
 // Loaded before the main script; top-level code here must not touch the main
 // script's bindings, only declare functions and its own state.
 
@@ -47,6 +61,13 @@ const ONCHAIN_RIPPLE_EPOCH = 946684800;
 const ONCHAIN_NETWORK_ID = { XRPL: 0, Xahau: 21337 };
 const ONCHAIN_ASSETS = { XRPL: ['XRP'], Xahau: ['XAH', 'EVR'] };
 const ONCHAIN_NATIVE = { XRPL: 'XRP', Xahau: 'XAH' };
+const ONCHAIN_DB = { XRPL: 'xrpl', Xahau: 'xahau' };
+const ONCHAIN_BATCH = 25;
+// Daily differences smaller than this are listed as a total rather than one
+// by one: network fees (which the app does not book) move native balances by
+// fractions of a coin almost every active day.
+const ONCHAIN_DAY_THRESHOLD = { XRP: 1, XAH: 1, EVR: 0.01 };
+const DAY_MS = 86400000;
 
 let _onchainResult = null;        // last completed check (also in app_meta)
 let _onchainRunning = false;
@@ -59,10 +80,12 @@ let _fetchStartedAt = null;       // set while a fetch runs
 // The renderer's one call into the ledger. A variable, not a direct call, so
 // the test suite can stand a fake ledger in its place.
 let chainRpcCall = (req) => window.chainRpc.call(req);
+// The renderer's one call into WinDB for the check. Same reason.
+let windbCall = (sql) => windbQuery(sql, getClaim());
 
 // ── Settings ───────────────────────────────────────────────────────────────
 function onchainSettings() {
-  const d = { auto: true, xrplEndpoint: '', xahauEndpoint: '' };
+  const d = { auto: true, source: 'windb', xrplEndpoint: '', xahauEndpoint: '' };
   try { return Object.assign(d, JSON.parse(localStorage.getItem(ONCHAIN_SETTINGS_KEY) || '{}')); }
   catch (e) { return d; }
 }
@@ -74,13 +97,15 @@ function onchainEndpoint(chain) {
   return String((chain === 'XRPL' ? s.xrplEndpoint : s.xahauEndpoint) || '').trim();
 }
 function onchainUsesDhali(chain) { return /^https:\/\/run\.api\.dhali\.io\//i.test(onchainEndpoint(chain)); }
+function onchainSource() { return onchainSettings().source === 'rpc' ? 'rpc' : 'windb'; }
 function onchainServerName(chain) {
+  if (onchainSource() === 'windb') return 'WinDB (Dhali)';
   const ep = onchainEndpoint(chain);
   if (!ep) return chain === 'XRPL' ? 'xrplcluster.com' : 'xahau.network';
   try { return new URL(ep).hostname; } catch (e) { return ep; }
 }
 function onchainAutoEnabled() {
-  return typeof USE_LOCAL_DB !== 'undefined' && USE_LOCAL_DB && !!window.chainRpc &&
+  return typeof USE_LOCAL_DB !== 'undefined' && USE_LOCAL_DB && (onchainSource() === 'windb' || !!window.chainRpc) &&
     !(window.appInfo && window.appInfo.onchainCheck === false) && onchainSettings().auto;
 }
 
@@ -180,6 +205,13 @@ function onchainStatusOf(variance, usd) {
 }
 
 // ── The comparison point ───────────────────────────────────────────────────
+// The comparison point is the END of a UTC day: the day before the download
+// began. WinDB's balance history is daily, and every booking after that
+// moment is taken back out of the app's side by day (dailyJournal).
+function onchainEndOfPreviousDay(ms) {
+  const d = new Date(ms);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - 1;
+}
 async function onchainPinTimes() {
   let start = null, sync = [];
   try { const v = await window.taxDB.getMeta(ONCHAIN_FETCH_START_KEY); if (v) start = Date.parse(v); } catch (e) {}
@@ -191,10 +223,10 @@ async function onchainPinTimes() {
       .map((r) => Date.parse(r.last_synced_at)).filter(Number.isFinite);
     const latest = times.length ? Math.max(...times) : null;
     if (Number.isFinite(start) && start > 0 && (latest == null || start <= latest)) {
-      out[chain] = { ms: start - ONCHAIN_PIN_MARGIN_MS, source: 'download start' };
+      out[chain] = { ms: onchainEndOfPreviousDay(start - ONCHAIN_PIN_MARGIN_MS), source: 'the day before the last download' };
     } else if (latest != null) {
       const recent = times.filter((t) => t >= latest - ONCHAIN_RECENT_RUN_MS);
-      out[chain] = { ms: Math.min(...recent) - ONCHAIN_SYNC_MARGIN_MS, source: 'last sync times (approximate)' };
+      out[chain] = { ms: onchainEndOfPreviousDay(Math.min(...recent) - ONCHAIN_SYNC_MARGIN_MS), source: 'the day before the last sync (approximate)' };
     } else {
       out[chain] = null;
     }
@@ -208,7 +240,7 @@ async function prepareBookingJournal() {
   try { if (window.taxDB) pins = await onchainPinTimes(); } catch (e) {}
   for (const chain of ['XRPL', 'Xahau']) {
     let ms = pins && pins[chain] ? pins[chain].ms : Infinity;
-    if (_fetchStartedAt) ms = Math.min(ms, _fetchStartedAt - ONCHAIN_PIN_MARGIN_MS);
+    if (_fetchStartedAt) ms = Math.min(ms, onchainEndOfPreviousDay(_fetchStartedAt - ONCHAIN_PIN_MARGIN_MS));
     journalCutoffMs[chain] = Number.isFinite(ms) ? ms - 60000 : Infinity;
   }
   journalConfigChanged();
@@ -351,6 +383,105 @@ async function onchainReadAccount(chain, wallet, ledgerIndex) {
   return out;
 }
 
+// ── WinDB as the source ────────────────────────────────────────────────────
+// Addresses go into SQL text, so each one is checked against the address
+// alphabet first; anything else is refused rather than quoted.
+function onchainSqlAddr(a) {
+  if (!/^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(String(a))) throw new Error('not an XRPL/Xahau address: ' + String(a).slice(0, 12));
+  return "'" + a + "'";
+}
+function onchainSqlTime(ms) { return "'" + new Date(ms).toISOString().slice(0, 19).replace('T', ' ') + "'"; }
+function onchainWinDbTimeMs(s) { const t = Date.parse(String(s || '').replace(' ', 'T') + 'Z'); return Number.isFinite(t) ? t : null; }
+
+// The last ledger that closed at or before ms, from WinDB's ledger table.
+// Read newest-first, so it stops almost at once for a recent time.
+async function onchainLedgerAtWinDB(chain, ms) {
+  const r = await windbCall(`SELECT LedgerIndex, Timestamp FROM ${ONCHAIN_DB[chain]}.ledgers WHERE Timestamp <= ${onchainSqlTime(ms)} ORDER BY LedgerIndex DESC LIMIT 1`);
+  if (!r || !r[0]) throw new Error(`WinDB has no ${chain} ledger at or before ${new Date(ms).toISOString()}`);
+  return { index: Number(r[0].LedgerIndex), closeMs: onchainWinDbTimeMs(r[0].Timestamp) };
+}
+
+// One balance at ledger L from WinDB's two views of it (pure). `hist` is the
+// newest daily snapshot at or before L (li = 0 when there is none), `cur`
+// the current state. Returns {bal, how} or {unknown: reason}.
+function onchainResolveAt(hist, cur, L, scale) {
+  const sc = (v) => Number(v || 0) / scale;
+  const hli = hist ? Number(hist.li || 0) : 0, cli = cur ? Number(cur.li || 0) : 0;
+  if (cur && cli > 0 && cli <= L) return { bal: sc(cur.bal), how: 'current state (no activity since the comparison day)' };
+  if (hist && hli > 0) return { bal: sc(hist.bal), how: 'daily history' };
+  if (!cur && !hist) return { bal: 0, how: 'none', missing: true };
+  return { unknown: "WinDB's daily history does not reach back to the comparison day for this account" };
+}
+
+async function onchainBatches(wallets, fn) {
+  const out = [];
+  for (let i = 0; i < wallets.length; i += ONCHAIN_BATCH) {
+    const batch = wallets.slice(i, i + ONCHAIN_BATCH);
+    try { out.push(...(await fn(batch))); }
+    catch (e) {
+      if (batch.length === 1) throw e;
+      // A batch WinDB refused: one wallet at a time (the transactions table
+      // refused multi-wallet IN () lists once; these tables accepted them).
+      for (const w of batch) out.push(...(await fn([w])));
+    }
+    if (_onchainCancel) break;
+  }
+  return out;
+}
+
+// Every wallet's balances on one chain at ledger L. About four small
+// queries per 25 wallets.
+async function onchainReadWinDB(chain, wallets, L, onStep = () => {}) {
+  const db = ONCHAIN_DB[chain];
+  const byW = (rows, key = 'Account') => { const m = new Map(); for (const r of rows || []) m.set(r[key], r); return m; };
+  onStep(`Reading ${chain} balances from WinDB…`);
+  const hist = byW(await onchainBatches(wallets, (b) => windbCall(
+    `SELECT Account, argMaxIf(Balance, LastActiveLedgerIndex, LastActiveLedgerIndex <= ${L}) AS bal, maxIf(LastActiveLedgerIndex, LastActiveLedgerIndex <= ${L}) AS li, toString(min(Date)) AS first ` +
+    `FROM ${db}.account_balance_history WHERE Account IN (${b.map(onchainSqlAddr).join(',')}) GROUP BY Account`)));
+  const cur = byW(await onchainBatches(wallets, (b) => windbCall(
+    `SELECT Account, argMax(Balance, LastActiveLedgerIndex) AS bal, max(LastActiveLedgerIndex) AS li, argMax(isActive, LastActiveLedgerIndex) AS active ` +
+    `FROM ${db}.accounts WHERE Account IN (${b.map(onchainSqlAddr).join(',')}) GROUP BY Account`)));
+  // EVR is counted the way the engine counts it: every trust line whose
+  // currency is EVR, whatever the issuer, each resolved on its own and summed.
+  const byWI = (rows) => { const m = new Map(); for (const r of rows || []) { const k = r.Holder; if (!m.has(k)) m.set(k, new Map()); m.get(k).set(r.Issuer, r); } return m; };
+  let evrHist = new Map(), evrCur = new Map();
+  if (chain === 'Xahau') {
+    onStep('Reading EVR balances from WinDB…');
+    const tokenWhere = (b) => `Holder IN (${b.map(onchainSqlAddr).join(',')}) AND Currency = 'EVR'`;
+    evrHist = byWI(await onchainBatches(wallets, (b) => windbCall(
+      `SELECT Holder, Issuer, argMaxIf(Balance, LastActiveLedgerIndex, LastActiveLedgerIndex <= ${L}) AS bal, maxIf(LastActiveLedgerIndex, LastActiveLedgerIndex <= ${L}) AS li ` +
+      `FROM xahau.token_balance_history WHERE ${tokenWhere(b)} GROUP BY Holder, Issuer`)));
+    evrCur = byWI(await onchainBatches(wallets, (b) => windbCall(
+      `SELECT Holder, Issuer, argMax(Balance, LastActiveLedgerIndex) AS bal, max(LastActiveLedgerIndex) AS li ` +
+      `FROM xahau.token_balances WHERE ${tokenWhere(b)} GROUP BY Holder, Issuer`)));
+  }
+  const out = new Map();
+  for (const w of wallets) {
+    const acct = { exists: true, native: 0, nativeEscrow: 0, nativeChannel: 0, lines: {}, issuers: {}, iouEscrow: {}, amm: [],
+                   ownerCount: 0, ledger: L, notes: [], unknown: {}, source: 'windb' };
+    const n = onchainResolveAt(hist.get(w), cur.get(w), L, 1e6);
+    if (n.unknown) acct.unknown[ONCHAIN_NATIVE[chain]] = n.unknown;
+    else { acct.native = n.bal; if (n.missing) acct.exists = false; }
+    const c = cur.get(w);
+    if (c && Number(c.active) === 0) acct.notes.push('WinDB marks this account inactive (deleted?)');
+    if (chain === 'Xahau') {
+      const hi = evrHist.get(w) || new Map(), ci = evrCur.get(w) || new Map();
+      const issuers = new Set([...hi.keys(), ...ci.keys()]);
+      let sum = 0, unknown = null, held = 0;
+      for (const iss of issuers) {
+        const e = onchainResolveAt(hi.get(iss), ci.get(iss), L, 1);
+        if (e.unknown) unknown = e.unknown;
+        else { sum += e.bal; if (e.bal > 0) held++; }
+      }
+      if (unknown) acct.unknown.EVR = unknown;
+      else acct.lines.EVR = sum;
+      if (held > 1) acct.notes.push(`EVR held from ${held} issuers (counted together, as the app counts them)`);
+    }
+    out.set(w, acct);
+  }
+  return out;
+}
+
 // ── App side, captured under the ledger lock ───────────────────────────────
 function onchainCaptureApp(pins) {
   const pinMs = { XRPL: pins.XRPL ? pins.XRPL.ms : null, Xahau: pins.Xahau ? pins.Xahau.ms : null };
@@ -362,21 +493,20 @@ function onchainCaptureApp(pins) {
       qty[w + '|' + tk] = { held: q, post: 0, postN: 0 };
     }
   }
-  for (const [jk, m] of bookingJournal) {
+  // Bookings after the comparison day come back out, summed by UTC day.
+  for (const [jk, m] of dailyJournal) {
     const tk = jk.slice(jk.lastIndexOf('|') + 1);
     const p = pinMs[tk === 'XRP' ? 'XRPL' : 'Xahau'];
     if (p == null) continue;
-    for (const e of m.values()) {
-      if (!(e.ms > p)) continue;
+    const lastDay = Math.floor(p / DAY_MS);
+    for (const [day, e] of m) {
+      if (!(day > lastDay)) continue;
       const r = qty[jk] || (qty[jk] = { held: 0, post: 0, postN: 0 });
       r.post += e.add - e.used; r.postN++;
     }
   }
-  const info = journalBuildInfo;
-  const journalOk = {
-    XRPL: !!(info && pinMs.XRPL != null && (info.all || info.cutoff.XRPL <= pinMs.XRPL)),
-    Xahau: !!(info && pinMs.Xahau != null && (info.all || info.cutoff.Xahau <= pinMs.Xahau)),
-  };
+  const haveDaily = dailyJournal.size > 0 || Object.keys(walletLedger).length === 0;
+  const journalOk = { XRPL: haveDaily && pinMs.XRPL != null, Xahau: haveDaily && pinMs.Xahau != null };
   return { qty, journalOk };
 }
 
@@ -392,7 +522,7 @@ async function onchainStamp(pins, app) {
   try { ds = await dataStamp(); } catch (e) {}
   return JSON.stringify({ ds, t: typeof ammTreatment !== 'undefined' ? ammTreatment : '',
     pins: { XRPL: pins.XRPL && pins.XRPL.ms, Xahau: pins.Xahau && pins.Xahau.ms },
-    ep: [onchainServerName('XRPL'), onchainServerName('Xahau')], h: onchainHoldingsHash(app.qty) });
+    ep: [onchainSource(), onchainServerName('XRPL'), onchainServerName('Xahau')], h: onchainHoldingsHash(app.qty) });
 }
 
 async function loadOnchainResult() {
@@ -450,8 +580,31 @@ async function runOnchainCheck(opts = {}) {
       if (v.held > ONCHAIN_MATCH_QTY && !checked.has(w + '|' + chain)) notChecked.push({ wallet: w, ticker: tk, qty: v.held });
     }
 
-    // 3. The ledger that is the comparison point, per chain.
+    const source = onchainSource();
+    if (source === 'windb' && !(typeof getClaim === 'function' && getClaim())) {
+      throw new Error('enter your Payment-Claim on the Setup tab — the check reads WinDB through Dhali, like the download');
+    }
     const pins = {};
+    const readings = new Map();
+    const errors = [];
+    if (source === 'windb') {
+      for (const chain of ['XRPL', 'Xahau']) {
+        const ws = pairs.filter((x) => x.chain === chain).map((x) => x.wallet);
+        if (!ws.length) continue;
+        const p = snap.pins[chain];
+        if (!p) { errors.push({ wallet: '(all)', chain, message: 'no sync record to choose a comparison day from' }); continue; }
+        try {
+          _onchainStatus = `Finding the ${chain} ledger that closed the comparison day…`; renderOnchainPanel();
+          const lg = await onchainLedgerAtWinDB(chain, p.ms);
+          pins[chain] = { ms: p.ms, source: p.source, index: lg.index, closeMs: lg.closeMs, fallback: false, via: 'windb' };
+          const got = await onchainReadWinDB(chain, ws, lg.index, (m) => { _onchainStatus = m; renderOnchainPanel(); });
+          for (const [w, acct] of got) readings.set(w + '|' + chain, acct);
+        } catch (e) {
+          errors.push({ wallet: '(all)', chain, message: e.message });
+        }
+      }
+    } else {
+    // 3. The ledger that is the comparison point, per chain.
     for (const chain of ['XRPL', 'Xahau']) {
       const p = snap.pins[chain];
       if (!pairs.some((x) => x.chain === chain)) continue;
@@ -467,8 +620,6 @@ async function runOnchainCheck(opts = {}) {
     }
 
     // 4. Read every account at its chain's comparison point.
-    const readings = new Map();
-    const errors = [];
     let done = 0;
     const queue = pairs.slice();
     const workers = Math.min(queue.length, onchainUsesDhali('XRPL') || onchainUsesDhali('Xahau') ? 4 : 2);
@@ -495,6 +646,7 @@ async function runOnchainCheck(opts = {}) {
       }
     };
     await Promise.all(Array.from({ length: Math.max(workers, 1) }, work));
+    }
 
     // 5. Compare.
     const rows = [];
@@ -509,6 +661,14 @@ async function runOnchainCheck(opts = {}) {
         const amm = acct.amm.reduce((s, x) => s + x.legs.filter((l) => l.asset === tk).reduce((t, l) => t + l.qty, 0), 0);
         const usePost = !acct.atCurrent && snap.app.journalOk[p.chain];
         const appAtPin = a.held - (usePost ? a.post : 0);
+        if (acct.unknown && acct.unknown[tk]) {
+          if (Math.abs(appAtPin) < ONCHAIN_MATCH_QTY) continue;
+          rows.push({ wallet: p.wallet, chain: p.chain, ticker: tk, type: walletTypeOf(p.wallet), label: labelFor(p.wallet),
+            lastSync: lastSync[p.wallet + '|' + p.chain], appHeld: a.held, appPost: usePost ? a.post : 0, app: appAtPin,
+            balance: NaN, escrow: 0, amm: 0, ledger: NaN, variance: 0, price: latestPriceFor(tk).price || 0, usd: 0,
+            status: 'unknown', atCurrent: false, notes: [acct.unknown[tk] + ' — use the public ledger servers for this one'] });
+          continue;
+        }
         if (Math.abs(appAtPin) < ONCHAIN_MATCH_QTY && Math.abs(bal + escrow) < ONCHAIN_MATCH_QTY && Math.abs(amm) < ONCHAIN_MATCH_QTY) continue;
         const ledger = bal + escrow;
         const variance = appAtPin - ledger;
@@ -530,7 +690,7 @@ async function runOnchainCheck(opts = {}) {
     rows.sort((x, y) => Math.abs(y.usd) - Math.abs(x.usd));
     const result = {
       version: 1, at: Date.now(), stamp: snap.stamp, cancelled: _onchainCancel, pins, rows, notChecked, errors,
-      journalOk: snap.app.journalOk, servers: { XRPL: onchainServerName('XRPL'), Xahau: onchainServerName('Xahau') },
+      journalOk: snap.app.journalOk, source, servers: { XRPL: onchainServerName('XRPL'), Xahau: onchainServerName('Xahau') },
       pairs: pairs.length, read: readings.size,
     };
     _onchainResult = result;
@@ -601,7 +761,149 @@ async function explainOnchainRow(i) {
   return explainOnchain(r.wallet, r.chain);
 }
 
+// "Explain": day by day from WinDB when that is the source, otherwise the
+// transaction-exact walk on a public ledger server.
 async function explainOnchain(wallet, chain) {
+  const r = await loadOnchainResult();
+  if (r && r.source === 'windb') return explainDaily(wallet, chain);
+  return explainExact(wallet, chain);
+}
+
+const dayStr = (day) => new Date(day * DAY_MS).toISOString().slice(0, 10);
+
+// The day-by-day comparison (pure). ledgerDays: [{day, bal}] — WinDB's
+// end-of-day balance on each active day up to the comparison day. appDaily:
+// Map(day -> app's net booking that day). appAtD / dayD: the app's holding at
+// the end of the comparison day, and that day's number.
+function explainDailyCompute({ ledgerDays, appDaily, appAtD, dayD, threshold }) {
+  const out = { firstDay: null, startDiff: null, events: [], small: { n: 0, sum: 0 }, finalDiff: null, ledgerAtD: null, appAtD };
+  const days = ledgerDays.filter((x) => x.day <= dayD).sort((a, b) => a.day - b.day);
+  if (!days.length) return out;
+  const F = days[0].day;
+  out.firstDay = F;
+  // App holding at the end of day F: walk back from the comparison day.
+  let appAtF = appAtD;
+  for (const [day, net] of appDaily) if (day > F && day <= dayD) appAtF -= net;
+  out.startDiff = appAtF - days[0].bal;
+  // Every later day on which either side moved.
+  const ledgerOn = new Map(days.map((x) => [x.day, x.bal]));
+  const active = new Set([...ledgerOn.keys(), ...[...appDaily.keys()].filter((d) => d > F && d <= dayD)]);
+  const order = [...active].filter((d) => d > F).sort((a, b) => a - b);
+  let lastBal = days[0].bal, running = out.startDiff;
+  for (const d of order) {
+    const bal = ledgerOn.has(d) ? ledgerOn.get(d) : lastBal;
+    const ledgerChange = bal - lastBal;
+    const app = appDaily.get(d) || 0;
+    const delta = app - ledgerChange;
+    lastBal = bal;
+    if (Math.abs(delta) <= ONCHAIN_EPS) continue;
+    running += delta;
+    if (Math.abs(delta) < threshold) { out.small.n++; out.small.sum += delta; continue; }
+    out.events.push({ day: d, ledger: ledgerChange, app, delta, running });
+  }
+  out.ledgerAtD = lastBal;
+  out.finalDiff = appAtD - lastBal;
+  return out;
+}
+
+// Daily rows -> one end-of-day total per day. Several issuers' lines (EVR)
+// each carry their last balance forward until they next change.
+function explainDailyTotals(rows, scale) {
+  const byDay = new Map();
+  for (const r of rows) {
+    const day = Math.floor(Date.parse(r.d + 'T00:00:00Z') / DAY_MS);
+    if (!byDay.has(day)) byDay.set(day, new Map());
+    byDay.get(day).set(r.Issuer || '', Number(r.bal) / scale);
+  }
+  const last = new Map(), out = [];
+  for (const day of [...byDay.keys()].sort((a, b) => a - b)) {
+    for (const [iss, bal] of byDay.get(day)) last.set(iss, bal);
+    out.push({ day, bal: [...last.values()].reduce((s, v) => s + v, 0) });
+  }
+  return out;
+}
+
+async function explainDaily(wallet, chain) {
+  if (_explainRunning) return;
+  const result = await loadOnchainResult();
+  const pin = result && result.pins && result.pins[chain];
+  if (!pin || pin.index == null) { alert('Run the on-chain check first.'); return; }
+  _explainRunning = true; _explainCancel = false;
+  const setStatus = (m) => { _onchainStatus = m; renderOnchainPanel(); };
+  try {
+    const L = pin.index, dayD = Math.floor(pin.ms / DAY_MS), db = ONCHAIN_DB[chain];
+    const app = await withLedgerLock('explain', async () => {
+      const o = {};
+      for (const tk of ONCHAIN_ASSETS[chain]) {
+        const lots = (walletLedger[wallet] || {})[tk] || [];
+        const held = lots.reduce((s, l) => s + (l.remaining > 0 ? l.remaining : 0), 0);
+        const net = new Map();
+        for (const [day, e] of (dailyJournal.get(wallet + '|' + tk) || new Map())) net.set(day, e.add - e.used);
+        let later = 0;
+        for (const [day, v] of net) if (day > dayD) later += v;
+        o[tk] = { appAtD: held - later, net };
+      }
+      return o;
+    });
+    const assets = {};
+    for (const tk of ONCHAIN_ASSETS[chain]) {
+      setStatus(`Reading ${tk} daily balances for this wallet from WinDB…`);
+      const native = tk === ONCHAIN_NATIVE[chain];
+      const sql = native
+        ? `SELECT toString(Date) AS d, argMax(Balance, LastActiveLedgerIndex) AS bal FROM ${db}.account_balance_history ` +
+          `WHERE Account = ${onchainSqlAddr(wallet)} AND LastActiveLedgerIndex <= ${L} GROUP BY Date ORDER BY Date`
+        : `SELECT toString(Date) AS d, Issuer, argMax(Balance, LastActiveLedgerIndex) AS bal FROM xahau.token_balance_history ` +
+          `WHERE Holder = ${onchainSqlAddr(wallet)} AND Currency = 'EVR' AND LastActiveLedgerIndex <= ${L} GROUP BY Date, Issuer ORDER BY Date`;
+      const rows = await windbCall(sql);
+      const ledgerDays = explainDailyTotals(rows || [], native ? 1e6 : 1);
+      const c = explainDailyCompute({ ledgerDays, appDaily: app[tk].net, appAtD: app[tk].appAtD, dayD, threshold: ONCHAIN_DAY_THRESHOLD[tk] || 1 });
+      c.events.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+      assets[tk] = c;
+    }
+    // What was downloaded on the days that matter most, from the local cache.
+    setStatus('Listing the downloaded transactions on those days…');
+    const wanted = new Set();
+    for (const c of Object.values(assets)) for (const e of c.events.slice(0, 25)) wanted.add(e.day);
+    const txByDay = {};
+    for (const d of wanted) {
+      let rows = [];
+      try { rows = await window.taxDB.getRowsBetween(wallet, chain, dayStr(d) + ' 00:00:00', dayStr(d + 1) + ' 00:00:00', 80); } catch (e) {}
+      txByDay[d] = rows.map((r) => explainTxSummary(r, wallet));
+    }
+    _onchainExplain = { kind: 'daily', wallet, chain, pin, at: Date.now(), assets, txByDay, balanceAtPin: {} };
+    for (const x of (result.rows || []).filter((y) => y.wallet === wallet && y.chain === chain)) {
+      _onchainExplain.balanceAtPin[x.ticker] = { balance: x.balance, escrow: x.escrow, variance: x.variance };
+    }
+    setStatus('');
+  } catch (e) {
+    setStatus('Explain stopped: ' + e.message);
+  } finally {
+    _explainRunning = false;
+    renderOnchainPanel();
+  }
+}
+
+// One cached row in a line: time, type, direction, amount.
+function explainTxSummary(r, wallet) {
+  let raw = {};
+  try { raw = JSON.parse(r.raw_json); } catch (e) {}
+  const pick = (...v) => { for (const x of v) { const s = String(x == null ? '' : x).trim(); if (s && s !== '0') return s; } return ''; };
+  const native = pick(raw.delivered_amount_XRP, raw.Amount_XRP);
+  const val = pick(raw.delivered_amount_value, raw.Amount_value);
+  const cur = onchainDecodeCurrency(pick(raw.delivered_amount_currency, raw.Amount_currency));
+  let amount = native ? `${native} native` : val ? `${val} ${cur}` : '';
+  if (raw.TransactionType === 'OfferCreate') {
+    const g = pick(raw.TakerGets_XRP) ? `${raw.TakerGets_XRP} native` : `${pick(raw.TakerGets_value)} ${onchainDecodeCurrency(raw.TakerGets_currency)}`;
+    const p = pick(raw.TakerPays_XRP) ? `${raw.TakerPays_XRP} native` : `${pick(raw.TakerPays_value)} ${onchainDecodeCurrency(raw.TakerPays_currency)}`;
+    amount = `offers ${g} for ${p}`;
+  }
+  const dir = raw.Account === wallet ? (raw.Destination ? 'out to ' + String(raw.Destination).slice(0, 10) + '…' : 'signed') :
+              raw.Destination === wallet ? 'in from ' + String(raw.Account || '').slice(0, 10) + '…' : 'other';
+  return { ts: String(r.timestamp || '').slice(0, 19), type: raw.TransactionType || '?', dir, amount: amount.trim(),
+           result: raw.TransactionResult || '', affected: String(r.tx_hash || '').startsWith('AFFECTED:') };
+}
+
+async function explainExact(wallet, chain) {
   if (_explainRunning) return;
   const result = await loadOnchainResult();
   if (!result) { alert('Run the on-chain check first.'); return; }
@@ -640,6 +942,7 @@ async function explainOnchain(wallet, chain) {
     rep.balanceAtPin = {};
     const row = (result.rows || []).filter((x) => x.wallet === wallet && x.chain === chain);
     for (const x of row) rep.balanceAtPin[x.ticker] = { balance: x.balance, escrow: x.escrow };
+    rep.kind = 'exact';
     _onchainExplain = rep;
     setStatus('');
   } catch (e) {
@@ -788,11 +1091,13 @@ async function renderOnchainPanel() {
   const busy = _onchainRunning || _explainRunning;
   const head = `<h3 style="font-size:13px;margin:0 0 4px">On-chain balance check</h3>
     <div style="font-size:11px;color:#555;line-height:1.6;margin-bottom:8px">
-      Compares what the app holds for each fetched wallet with what the ledger held at the same moment
-      (the ledger that closed just before the last download began). Bookings made after that moment are left out of
-      the app's side. A difference means the app's books for that wallet are missing or misreading something —
-      <b>Explain</b> lists the exact transactions. Read-only queries to ${escapeHTML(onchainServerName('XRPL'))} and
-      ${escapeHTML(onchainServerName('Xahau'))}; no Payment-Claim is used unless a Dhali server is set below.
+      Compares what the app holds for each fetched wallet with what the ledger held at the same moment: the end of the
+      UTC day before the last download began. Bookings made after that are left out of the app's side. A difference means
+      the app's books for that wallet are missing or misreading something — <b>Explain</b> shows the days it happened and
+      what was downloaded on them.
+      ${onchainSource() === 'windb'
+        ? 'Source: <b>WinDB through Dhali</b>, with the Payment-Claim from Setup (a few small queries per 25 wallets).'
+        : `Source: <b>public ledger servers</b> (${escapeHTML(onchainServerName('XRPL'))}, ${escapeHTML(onchainServerName('Xahau'))}); no Payment-Claim unless a Dhali server is set.`}
     </div>
     <div class="row" style="margin-bottom:8px;gap:6px;flex-wrap:wrap">
       <button class="sml" style="background:#1a3a7a;color:#fff;border-color:#1a3a7a" ${busy ? 'disabled' : ''} onclick="runOnchainCheck().catch(()=>{})">↻ Run check now</button>
@@ -801,8 +1106,12 @@ async function renderOnchainPanel() {
       <label style="font-size:11px;margin-left:8px"><input type="checkbox" id="onchainAutoChk" ${s.auto ? 'checked' : ''}
         onchange="saveOnchainSettings({auto:this.checked})"> run automatically after each build</label>
     </div>
-    <details style="font-size:11px;margin-bottom:8px"><summary>Ledger servers</summary>
+    <details style="font-size:11px;margin-bottom:8px"><summary>Source and servers</summary>
       <div style="padding:6px 0;line-height:1.8">
+        <label><input type="radio" name="onchainSrc" ${onchainSource() === 'windb' ? 'checked' : ''} onchange="saveOnchainSettings({source:'windb'}); renderOnchainPanel();">
+          WinDB through Dhali (default) — uses the Payment-Claim; balances as WinDB records them each day</label><br>
+        <label><input type="radio" name="onchainSrc" ${onchainSource() === 'rpc' ? 'checked' : ''} onchange="saveOnchainSettings({source:'rpc'}); renderOnchainPanel();">
+          Public full-history ledger servers — reads each balance at the exact ledger; Explain walks every transaction</label><br>
         XRPL <input id="onchainXrplEp" style="width:340px;font-size:11px" placeholder="https://xrplcluster.com/ (default)" value="${escapeHTML(s.xrplEndpoint)}"><br>
         Xahau <input id="onchainXahauEp" style="width:340px;font-size:11px" placeholder="https://xahau.network/ (default)" value="${escapeHTML(s.xahauEndpoint)}">
         <button class="sml" onclick="saveOnchainSettings({xrplEndpoint:document.getElementById('onchainXrplEp').value.trim(), xahauEndpoint:document.getElementById('onchainXahauEp').value.trim()}); renderOnchainPanel();">Save</button><br>
@@ -825,7 +1134,8 @@ async function renderOnchainPanel() {
     const t = totals[x.ticker] || (totals[x.ticker] = { qty: 0, usd: 0 });
     if (x.status !== 'match') { t.qty += x.variance; t.usd += x.usd; }
   }
-  const color = (st) => st === 'material' ? '#8b0000' : st === 'minor' ? '#7a4a00' : '#1a5c2a';
+  const color = (st) => st === 'material' ? '#8b0000' : st === 'minor' ? '#7a4a00' : st === 'unknown' ? '#666' : '#1a5c2a';
+  const unknownN = by('unknown').length;
   const list = r.rows.map((x, i) => ({ x, i })).filter(({ x }) => x.status !== 'match');
   const table = list.length ? `<table style="border-collapse:collapse;font-size:10px;width:100%;margin-top:6px">
       <tr style="background:#eef"><th style="text-align:left;padding:3px 5px">Wallet</th><th style="text-align:left;padding:3px 5px">Type</th>
@@ -838,8 +1148,8 @@ async function renderOnchainPanel() {
         <td style="padding:3px 5px">${escapeHTML(x.ticker)} <span style="color:#888">${escapeHTML(x.chain)}</span></td>
         <td style="padding:3px 5px;text-align:right">${fmtOnchainQty(x.app)}</td>
         <td style="padding:3px 5px;text-align:right">${fmtOnchainQty(x.ledger)}</td>
-        <td style="padding:3px 5px;text-align:right;color:${color(x.status)};font-weight:700">${fmtOnchainQty(x.variance)}</td>
-        <td style="padding:3px 5px;text-align:right;color:${color(x.status)}">$${fmt(x.usd)}</td>
+        <td style="padding:3px 5px;text-align:right;color:${color(x.status)};font-weight:700">${x.status === 'unknown' ? '—' : fmtOnchainQty(x.variance)}</td>
+        <td style="padding:3px 5px;text-align:right;color:${color(x.status)}">${x.status === 'unknown' ? '—' : '$' + fmt(x.usd)}</td>
         <td style="padding:3px 5px;color:#555">${x.notes.map(escapeHTML).join('; ')}</td>
         <td style="padding:3px 5px"><button class="sml" ${busy ? 'disabled' : ''} onclick="explainOnchainRow(${i})">Explain</button></td>
       </tr>`).join('')}
@@ -854,7 +1164,8 @@ async function renderOnchainPanel() {
       ${r.read} of ${r.pairs} wallet/chain pairs read ·
       <span style="color:#1a5c2a">${match.length} agree</span> ·
       <span style="color:#7a4a00">${minor.length} differ by under $${ONCHAIN_MINOR_USD}</span> ·
-      <span style="color:#8b0000;font-weight:700">${mat.length} differ by more</span></div>
+      <span style="color:#8b0000;font-weight:700">${mat.length} differ by more</span>${unknownN ? ` · <span style="color:#666">${unknownN} not determinable from WinDB</span>` : ''} ·
+      source ${escapeHTML(r.source === 'rpc' ? 'public ledger servers' : 'WinDB (Dhali)')}</div>
     <div style="font-size:10px;color:#666;margin-bottom:4px">Comparison point — ${pinLine || 'none'}</div>
     <div style="font-size:10px;color:#666">Net difference: ${Object.entries(totals).map(([t, v]) => `${fmtOnchainQty(v.qty)} ${escapeHTML(t)} ($${fmt(v.usd)})`).join(' · ') || 'none'}</div>
     ${journalNote}${table}${notChecked}${errs}` + explainHTML();
@@ -863,6 +1174,7 @@ async function renderOnchainPanel() {
 function explainHTML() {
   const x = _onchainExplain;
   if (!x) return '<div id="onchainExplain"></div>';
+  if (x.kind === 'daily') return explainDailyHTML(x);
   const label = labelFor(x.wallet);
   const sections = Object.entries(x.summary).map(([tk, s]) => {
     const bal = (x.balanceAtPin || {})[tk];
@@ -920,8 +1232,9 @@ function exportOnchainCSV() {
   if (!r || !r.rows) return;
   const lines = ['Wallet,Description,Type,Chain,Asset,App Holds (at comparison point),App Bookings After Comparison Point,Ledger Balance,Ledger Escrow/Channels,Ledger Total,Difference (app - ledger),Unit Price USD,Difference USD,Status,AMM Share (not counted),Last Synced,Notes'];
   for (const x of r.rows) {
-    lines.push([x.wallet, x.label || '', x.type || '', x.chain, x.ticker, x.app.toFixed(6), x.appPost.toFixed(6), x.balance.toFixed(6),
-      x.escrow.toFixed(6), x.ledger.toFixed(6), x.variance.toFixed(6), x.price.toFixed(6), x.usd.toFixed(2), x.status,
+    const f6 = (v) => Number.isFinite(v) ? v.toFixed(6) : '';
+    lines.push([x.wallet, x.label || '', x.type || '', x.chain, x.ticker, f6(x.app), f6(x.appPost), f6(x.balance),
+      f6(x.escrow), f6(x.ledger), x.status === 'unknown' ? '' : f6(x.variance), f6(x.price), x.status === 'unknown' ? '' : x.usd.toFixed(2), x.status,
       x.amm ? x.amm.toFixed(6) : '', x.lastSync || '', x.notes.join('; ')].map(csvField).join(','));
   }
   for (const n of r.notChecked || []) lines.push([n.wallet, labelFor(n.wallet), walletTypeOf(n.wallet), '', n.ticker, n.qty.toFixed(6), '', '', '', '', '', '', '', 'not checked', '', '', 'not fetched by the app'].map(csvField).join(','));
@@ -929,9 +1242,82 @@ function exportOnchainCSV() {
   downloadCSV(lines, `Onchain-Check-${new Date(r.at).toISOString().slice(0, 10)}.csv`);
 }
 
+function explainDailyHTML(x) {
+  const label = labelFor(x.wallet);
+  const sections = Object.entries(x.assets).map(([tk, c]) => {
+    const chk = (x.balanceAtPin || {})[tk];
+    if (c.firstDay == null) {
+      return `<div style="font-size:11px;margin:6px 0"><b>${escapeHTML(tk)}</b>: WinDB has no daily balance for this wallet up to the comparison day
+        (its history starts ${x.chain === 'XRPL' ? '2024-11-16' : '2026-04-28'} and this wallet had no ${escapeHTML(tk)} activity since, or none at all).
+        The app holds ${fmtOnchainQty(c.appAtD)}. Use the exact walk below to trace it.</div>`;
+    }
+    const evTotal = c.events.reduce((s, e) => s + e.delta, 0);
+    const closes = Math.abs(c.startDiff + c.small.sum + evTotal - c.finalDiff) <= 1e-4;
+    const top = c.events.slice(0, 25);
+    return `<div style="margin:8px 0">
+      <div style="font-size:11px"><b>${escapeHTML(tk)}</b> — at the end of ${dayStr(Math.floor(x.pin.ms / DAY_MS))} the app holds ${fmtOnchainQty(c.appAtD)}
+        and WinDB's daily balance is ${fmtOnchainQty(c.ledgerAtD)}: difference <b>${fmtOnchainQty(c.finalDiff)}</b>${chk && Number.isFinite(chk.variance) ? ` (the check found ${fmtOnchainQty(chk.variance)})` : ''}.</div>
+      <table style="border-collapse:collapse;font-size:10px;width:100%;margin-top:4px">
+        <tr style="background:#f3f3f3"><th style="text-align:left;padding:3px 5px">Where the difference comes from</th><th style="text-align:right;padding:3px 5px">Days</th><th style="text-align:right;padding:3px 5px">Difference</th></tr>
+        <tr style="border-top:1px solid #eee"><td style="padding:3px 5px">Already there on ${dayStr(c.firstDay)}, the first day of WinDB's history for this wallet (older than WinDB's history: trace it with the exact walk)</td><td></td>
+          <td style="padding:3px 5px;text-align:right;font-weight:700">${fmtOnchainQty(c.startDiff)}</td></tr>
+        <tr style="border-top:1px solid #eee"><td style="padding:3px 5px">Small daily differences, each under ${ONCHAIN_DAY_THRESHOLD[tk]} ${escapeHTML(tk)} (mostly network fees, which the app does not book)</td>
+          <td style="padding:3px 5px;text-align:right">${c.small.n.toLocaleString()}</td><td style="padding:3px 5px;text-align:right;font-weight:700">${fmtOnchainQty(c.small.sum)}</td></tr>
+        <tr style="border-top:1px solid #eee"><td style="padding:3px 5px">Days the books and the ledger part (listed below)</td>
+          <td style="padding:3px 5px;text-align:right">${c.events.length.toLocaleString()}</td><td style="padding:3px 5px;text-align:right;font-weight:700">${fmtOnchainQty(evTotal)}</td></tr>
+        <tr style="border-top:2px solid #999"><td style="padding:3px 5px"><b>${closes ? 'Total — adds up to the difference' : 'Total (does not add up: see the note)'}</b></td><td></td>
+          <td style="padding:3px 5px;text-align:right;font-weight:700;color:${closes ? '#1a5c2a' : '#8b0000'}">${fmtOnchainQty(c.startDiff + c.small.sum + evTotal)}</td></tr>
+      </table>
+      ${top.length ? `<table style="border-collapse:collapse;font-size:10px;width:100%;margin-top:6px">
+        <tr style="background:#f3f3f3"><th style="text-align:left;padding:3px 5px">Day (UTC)</th><th style="text-align:right;padding:3px 5px">Ledger moved</th>
+          <th style="text-align:right;padding:3px 5px">App booked</th><th style="text-align:right;padding:3px 5px">Difference</th>
+          <th style="text-align:right;padding:3px 5px">Running</th><th style="text-align:left;padding:3px 5px">Downloaded transactions that day</th></tr>
+        ${top.map((e) => {
+          const txs = (x.txByDay || {})[e.day] || [];
+          const brief = txs.length
+            ? `<details><summary>${txs.length}${txs.length >= 80 ? '+' : ''}: ${escapeHTML([...new Set(txs.map((t) => t.type))].join(', '))}</summary>${txs.map((t) =>
+                `<div style="font-family:monospace;font-size:9px">${escapeHTML(t.ts.slice(11))} ${escapeHTML(t.type)} ${escapeHTML(t.dir)} ${escapeHTML(t.amount)}${t.result && t.result !== 'tesSUCCESS' ? ' ' + escapeHTML(t.result) : ''}${t.affected ? ' (lease/affected import)' : ''}</div>`).join('')}</details>`
+            : '<span style="color:#8b0000">none — the ledger moved without a transaction the app downloaded (e.g. a resting DEX offer filled by someone else)</span>';
+          return `<tr style="border-top:1px solid #eee;vertical-align:top"><td style="padding:3px 5px">${dayStr(e.day)}</td>
+            <td style="padding:3px 5px;text-align:right">${fmtOnchainQty(e.ledger)}</td><td style="padding:3px 5px;text-align:right">${fmtOnchainQty(e.app)}</td>
+            <td style="padding:3px 5px;text-align:right;font-weight:700">${fmtOnchainQty(e.delta)}</td><td style="padding:3px 5px;text-align:right">${fmtOnchainQty(e.running)}</td>
+            <td style="padding:3px 5px">${brief}</td></tr>`;
+        }).join('')}
+      </table>` : ''}
+    </div>`;
+  }).join('');
+  return `<div id="onchainExplain" style="margin-top:12px;padding:10px;border:1px solid #ccd;border-radius:4px;background:#fafaff">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+      <div style="font-size:12px"><b>Explain (day by day):</b> ${label ? escapeHTML(label) + ' · ' : ''}<span style="font-family:monospace">${escapeHTML(x.wallet)}</span> on ${escapeHTML(x.chain)}</div>
+      <div><button class="sml" onclick="exportExplainCSV()">⬇ Explain CSV</button>
+        <button class="sml" title="Walks every transaction on a public full-history server; slower, needs those servers reachable" onclick="explainExact('${escapeHTML(x.wallet)}','${escapeHTML(x.chain)}')">Exact transactions (public server)</button>
+        <button class="sml" onclick="_onchainExplain=null; renderOnchainPanel()">Close</button></div>
+    </div>
+    <div style="font-size:10px;color:#666;margin:4px 0">Each day the wallet was active, WinDB's end-of-day balance is set beside what the app booked that day.
+      A difference shows the day the app's books and the ledger part company, and lists what was downloaded that day. Differences are app minus ledger:
+      positive means the app thinks the wallet holds more.</div>
+    ${sections}</div>`;
+}
+
 function exportExplainCSV() {
   const x = _onchainExplain;
   if (!x) return;
+  if (x.kind === 'daily') {
+    const lines = ['Day (UTC),Asset,Kind,Ledger Moved,App Booked,Difference (app - ledger),Running Difference,Downloaded Transactions,Types'];
+    for (const [tk, c] of Object.entries(x.assets)) {
+      if (c.firstDay == null) { lines.push(['', tk, 'no WinDB history up to the comparison day', '', c.appAtD.toFixed(6), '', '', '', ''].map(csvField).join(',')); continue; }
+      lines.push([dayStr(c.firstDay), tk, 'difference already present at the start of WinDB history', '', '', c.startDiff.toFixed(6), c.startDiff.toFixed(6), '', ''].map(csvField).join(','));
+      for (const e of c.events.slice().sort((a, b) => a.day - b.day)) {
+        const txs = (x.txByDay || {})[e.day];
+        lines.push([dayStr(e.day), tk, 'day the books and the ledger part', e.ledger.toFixed(6), e.app.toFixed(6), e.delta.toFixed(6), e.running.toFixed(6),
+          txs ? String(txs.length) : '', txs ? [...new Set(txs.map((t) => t.type))].join(' ') : ''].map(csvField).join(','));
+      }
+      lines.push(['', tk, `small daily differences (${c.small.n} days)`, '', '', c.small.sum.toFixed(6), '', '', ''].map(csvField).join(','));
+      lines.push([dayStr(Math.floor(x.pin.ms / DAY_MS)), tk, 'difference at the comparison day', c.ledgerAtD.toFixed(6), c.appAtD.toFixed(6), c.finalDiff.toFixed(6), '', '', ''].map(csvField).join(','));
+    }
+    downloadCSV(lines, `Onchain-Explain-Daily-${x.wallet.slice(0, 10)}-${x.chain}-${new Date(x.at).toISOString().slice(0, 10)}.csv`);
+    return;
+  }
   const lines = ['Date (UTC),Asset,Cause,Cause Detail,Transaction Type,Role,Counterparty,Ledger Moved (excl. fee),Fee,App Booked,App Shortfall,Difference (app - ledger),In Cache,Result,Ledger Hash,CTID'];
   for (const t of x.rows) {
     lines.push([t.dateMs ? new Date(t.dateMs).toISOString().replace('T', ' ').slice(0, 19) : '', t.ticker, t.category, EXPLAIN_CATEGORIES[t.category] || '',

@@ -1142,3 +1142,31 @@ opening a report, the on-chain check — shows in a strip under the tabs, on
 every page, with progress and an estimate of the time left. An export clicked
 while the report is being rebuilt is remembered, listed in the strip, and
 downloads by itself when the build finishes.
+
+
+## The on-chain check reads WinDB (1.10.10)
+
+The balance check and its Explain view now use WinDB through Dhali by
+default, with the download's Payment-Claim. WinDB keeps every account's
+balance as daily snapshots (`account_balance_history`, `token_balance_history`)
+beside the current state (`accounts`, `token_balances`), so:
+
+- The comparison point is the **end of the UTC day before the last download**.
+  The app's side is its holdings minus everything it booked after that day,
+  from a per-day booking record the engine now keeps for every wallet.
+- WinDB's tables hold unmerged duplicate rows, so every query takes the newest
+  row by ledger index (`argMax`). Balances come from the newest snapshot at or
+  before the ledger that closed the comparison day, or from the current state
+  when the account has not moved since. When neither can say (WinDB's history
+  does not reach back that far for an account that moved afterwards), the row
+  is marked "not determinable" rather than guessed.
+- **Explain** compares, day by day, what WinDB says the wallet held at the end
+  of each active day with what the app booked that day. It reports the
+  difference already present when WinDB's history begins (XRPL: 16 Nov 2024;
+  Xahau: 28 Apr 2026), the small daily differences (mostly network fees), and
+  each day the books and the ledger part, with the transactions downloaded that
+  day — or a note that nothing was downloaded, which is what a resting DEX
+  offer filled by someone else looks like. The transaction-exact walk on a
+  public full-history server is still one click away.
+- Escrows and payment channels are not in WinDB's balance tables; the public
+  server source still counts them.

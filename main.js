@@ -446,6 +446,7 @@ function registerIpcHandlers(db, dbPath) {
   // transactions the cache holds for one wallet. Both read-only.
   ipcMain.handle('db:getSyncTimes', guarded(() => db.getSyncTimes()));
   ipcMain.handle('db:getTxHashes', guarded((_evt, wallet, chain) => db.getTxHashes(wallet, chain)));
+  ipcMain.handle('db:getRowsBetween', guarded((_evt, wallet, chain, from, to, limit) => db.getRowsBetween(wallet, chain, from, to, limit)));
 
   // Read-only JSON-RPC to a full-history XRPL/Xahau node. ledger-rpc.js
   // decides what is allowed: a short list of hosts, read-only methods only,

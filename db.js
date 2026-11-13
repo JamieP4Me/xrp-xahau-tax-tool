@@ -715,6 +715,18 @@ function makeApi(db) {
      * uses it to tell "never downloaded" from "downloaded but not booked".
      * @returns {string[]}
      */
+    /**
+     * One wallet's cached rows between two Timestamp strings (from inclusive,
+     * to exclusive), oldest first, at most `limit`. The explain view lists the
+     * downloaded transactions of each day where the books and the ledger part.
+     * @returns {{tx_hash:string, timestamp:string, raw_json:string}[]}
+     */
+    getRowsBetween(wallet, chain, from, to, limit) {
+      return db.prepare(`SELECT tx_hash, timestamp, raw_json FROM raw_transactions
+                         WHERE wallet = ? AND chain = ? AND timestamp >= ? AND timestamp < ?
+                         ORDER BY timestamp LIMIT ?`).all(wallet, chain, String(from), String(to), Math.max(1, Math.min(Number(limit) || 100, 1000)));
+    },
+
     getTxHashes(wallet, chain) {
       return db.prepare('SELECT tx_hash FROM raw_transactions WHERE wallet = ? AND chain = ?').pluck().all(wallet, chain);
     },

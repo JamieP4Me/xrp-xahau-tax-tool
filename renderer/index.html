@@ -3345,6 +3345,12 @@ const journalWallets = new Set();   // wallets whose every booking is journaled
 let journalAll = false;             // every wallet, every booking (tests only)
 const journalCutoffMs = { XRPL: Infinity, Xahau: Infinity };   // journal anything later than this
 let journalBuildInfo = null;        // what the current build journaled, for the check to verify
+// The same bookings summed per UTC day, for EVERY wallet: a few hundred
+// thousand small entries on a large cache, cheap enough to keep always. The
+// on-chain check compares end-of-day balances, and "Explain" walks a wallet
+// day by day against WinDB's daily balance history, so neither needs a
+// rebuild. Day = Math.floor(ms / 86400000), the UTC day number.
+const dailyJournal = new Map();     // `${wallet}|${ticker}` -> Map(dayNum -> {add, used, short})
 let _journalOn = false;
 function journalConfigChanged() {
   _journalOn = journalAll || journalWallets.size > 0 ||
@@ -3385,12 +3391,19 @@ function cacheTxKey(txHash) {
 }
 
 function journalRecord(wallet, ticker, field, qty) {
-  if(!_journalOn || !_bookRow || !(qty > 0)) return;
+  if(!_bookRow || !(qty > 0)) return;
   if(_bookMs === undefined) _bookMs = parseWinDbTs(_bookRow.Timestamp || '');
+  const jk = wallet + '|' + ticker;
+  let dm = dailyJournal.get(jk);
+  if(!dm) dailyJournal.set(jk, dm = new Map());
+  const day = Math.floor(_bookMs / 86400000);
+  let de = dm.get(day);
+  if(!de) dm.set(day, de = { add: 0, used: 0, short: 0 });
+  de[field] += qty;
+  if(!_journalOn) return;
   const chain = ticker === 'XRP' ? 'XRPL' : 'Xahau';
   if(!(journalAll || journalWallets.has(wallet) || _bookMs > journalCutoffMs[chain])) return;
   if(_bookKey === undefined) _bookKey = journalKeyOf(_bookRow, _bookWallet);
-  const jk = wallet + '|' + ticker;
   let m = bookingJournal.get(jk);
   if(!m) bookingJournal.set(jk, m = new Map());
   let e = m.get(_bookKey);
@@ -3475,10 +3488,8 @@ function ledgerFIFODetailed(wallet, ticker, qty) {
     basisShortfalls.push({ wallet, ticker, qty: rem });
     consumed.push({qty: rem, unitCost: 0, acqDate: null});
   }
-  if(_journalOn) {
-    journalRecord(wallet, ticker, 'used', qty - Math.max(rem, 0));
-    if(rem > 0) journalRecord(wallet, ticker, 'short', rem);
-  }
+  journalRecord(wallet, ticker, 'used', qty - Math.max(rem, 0));
+  if(rem > 0) journalRecord(wallet, ticker, 'short', rem);
   return consumed;
 }
 
@@ -3628,6 +3639,7 @@ function resetLedgerState() {
   // (journalWallets, journalCutoffMs) is set by the caller before the build
   // and survives the reset on purpose.
   bookingJournal.clear();
+  dailyJournal.clear();
   journalBuildInfo = null;
 }
 
@@ -3658,7 +3670,7 @@ function snapshotLedgerState(opts = {}) {
     rowsStreamedThisBuild, rowsSkippedNotOwned, futureLotRows, futureLotSample: c(futureLotSample),
     rowsSkippedStaleType, ammLedgerUsed, ammLedgerMissing, ammLedgerUplift, ammNoXrpLeg,
     ammBookedDeposits, ammBookedWithdrawals, ammSkippedUnverified, ammBookedDepositQty, ammBookedWithdrawQty,
-    bookingJournal: c(bookingJournal), journalBuildInfo: c(journalBuildInfo),
+    bookingJournal: c(bookingJournal), journalBuildInfo: c(journalBuildInfo), dailyJournal: c(dailyJournal),
   };
 }
 function restoreLedgerState(snap, opts = {}) {
@@ -3688,6 +3700,7 @@ function restoreLedgerState(snap, opts = {}) {
   ammSkippedUnverified = snap.ammSkippedUnverified;
   ammBookedDepositQty = snap.ammBookedDepositQty; ammBookedWithdrawQty = snap.ammBookedWithdrawQty;
   for(const [k, v] of c(snap.bookingJournal || new Map())) bookingJournal.set(k, v);
+  for(const [k, v] of c(snap.dailyJournal || new Map())) dailyJournal.set(k, v);
   journalBuildInfo = c(snap.journalBuildInfo || null);
   syncTaxYearSelects();
   applyReportingYear(taxYear());
