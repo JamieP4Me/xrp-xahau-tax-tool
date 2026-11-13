@@ -708,6 +708,28 @@ test('getSyncTimes and getTxHashes answer the on-chain check, read-only', () => 
   db.close();
 });
 
+test('the data version moves on every real change and only then, and clearAll drops saved reports', () => {
+  const db = createDb(tmpDbPath());
+  assert.strictEqual(db.getDataVersion(), '0');
+  const row = { tx_hash: 'D'.repeat(64), timestamp: '2026-01-01 00:00:00', raw_json: '{"a":1}' };
+  db.insertRows('rTESTdv', 'XRPL', [row]);
+  const v1 = db.getDataVersion();
+  assert.notStrictEqual(v1, '0');
+  db.insertRows('rTESTdv', 'XRPL', [row]);                       // identical: nothing changed
+  assert.strictEqual(db.getDataVersion(), v1);
+  db.insertRows('rTESTdv', 'XRPL', [{ ...row, raw_json: '{"a":2}' }]);   // same key, new content
+  const v2 = db.getDataVersion();
+  assert.notStrictEqual(v2, v1);
+  db.saveReport('report:none', 'stamp-1', Buffer.from('payload'));
+  assert.strictEqual(db.loadReport('report:none', 'stamp-2'), null, 'loaded under a different stamp');
+  assert.strictEqual(db.loadReport('report:none', 'stamp-1').data.toString(), 'payload');
+  assert.strictEqual(db.reportInfo().length, 1);
+  db.clearAll();
+  assert.strictEqual(db.reportInfo().length, 0, 'clearAll kept a saved report of data that no longer exists');
+  assert.notStrictEqual(db.getDataVersion(), v2);
+  db.close();
+});
+
 console.log('');
 if (failures > 0) {
   console.log(`${failures} test(s) FAILED`);

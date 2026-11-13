@@ -71,6 +71,15 @@ a:hover{text-decoration:underline}
 .step p{font-size:12px;color:#444;line-height:1.7;margin-top:8px}
 footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px;font-family:'Arial',sans-serif;margin-top:20px}
 .empty{text-align:center;color:#999;padding:70px;font-size:15px}
+/* Progress strip under the tabs: visible from every page while anything builds. */
+#appProgress{display:none;position:sticky;top:0;z-index:60;background:#fffbe8;border-bottom:1px solid #e3d48a;padding:6px 18px;font-family:Arial,sans-serif;font-size:11px;color:#5a4a00}
+#appProgress .ap-row{display:flex;align-items:center;gap:10px;margin:2px 0}
+#appProgress .ap-label{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#appProgress .ap-track{flex:0 0 220px;height:8px;background:#efe6b8;border-radius:4px;overflow:hidden}
+#appProgress .ap-fill{height:100%;background:#b8960c;width:0}
+#appProgress .ap-fill.ap-indef{width:35%;animation:apSlide 1.4s ease-in-out infinite}
+#appProgress .ap-eta{flex:0 0 auto;color:#7a6a20;font-variant-numeric:tabular-nums}
+@keyframes apSlide{0%{margin-left:-35%}100%{margin-left:100%}}
 </style>
 <!-- PDF generation: client-side only, and now offline-capable.-->
 <!-- jsPDF, VENDORED rather than loaded from cdnjs.
@@ -125,6 +134,7 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
   <button class="tab" onclick="showTab('prices')">📅 Price History</button>
   <button class="tab" onclick="showTab('guide')">📖 Dhali Guide</button>
 </nav>
+<div id="appProgress" role="status" aria-live="polite"></div>
 
 <div class="body">
 
@@ -1573,6 +1583,7 @@ function log(msg,cls='in'){
   logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight;
 }
 function setProgress(done,total,status){
+  progressSet('fetch', 'Downloading: ' + status, done, total);
   document.getElementById('progStatus').textContent=status;
   document.getElementById('progBar').style.width=total?`${Math.round((done/total)*100)}%`:'0%';
 }
@@ -3631,8 +3642,10 @@ function resetLedgerState() {
 // walletLedger's FIFO cursors (_fifoCursor, a WeakMap keyed by the lot
 // arrays) are not carried: the clone makes new arrays, so the cursor restarts
 // at 0 and the next scan simply walks the spent prefix once more.
-function snapshotLedgerState() {
-  const c = (v) => structuredClone(v);
+function snapshotLedgerState(opts = {}) {
+  // opts.live: hand back the live objects (for a save, where the IPC layer
+  // makes the one copy). Otherwise a deep copy, as the comparison needs.
+  const c = opts.live ? (v) => v : (v) => structuredClone(v);
   return {
     allDisposalsHigh: c(allDisposalsHigh), allIncomeRows: c(allIncomeRows),
     allGiftRows: c(allGiftRows), allLostSpendRows: c(allLostSpendRows),
@@ -3648,10 +3661,13 @@ function snapshotLedgerState() {
     bookingJournal: c(bookingJournal), journalBuildInfo: c(journalBuildInfo),
   };
 }
-function restoreLedgerState(snap) {
+function restoreLedgerState(snap, opts = {}) {
   resetLedgerState();
   const fill = (dst, src) => { for(let i = 0; i < src.length; i++) dst.push(src[i]); };   // no spread: arrays can be large
-  const c = (v) => structuredClone(v);   // the snapshot stays intact for a second restore
+  // The snapshot stays intact for a second restore — unless the caller owns
+  // it outright (a freshly loaded saved report), where copying it again
+  // would only double the memory and the time.
+  const c = opts.take ? (v) => v : (v) => structuredClone(v);
   fill(allDisposalsHigh, c(snap.allDisposalsHigh)); fill(allIncomeRows, c(snap.allIncomeRows));
   fill(allGiftRows, c(snap.allGiftRows)); fill(allLostSpendRows, c(snap.allLostSpendRows));
   fill(inferredBasisRows, c(snap.inferredBasisRows)); fill(unvaluedRows, c(snap.unvaluedRows));
@@ -5020,7 +5036,11 @@ async function runFetch(){
   // A fetch builds the ledger by its own path. The comparison is always made
   // from two CACHE builds, so both sides come from the same code; clearing
   // the base makes the background run rebuild your side from the cache first.
-  await withLedgerLock('fetch', async () => { await _runFetchLocked(); _lastBuildBase = null; });
+  await withLedgerLock('fetch', async () => {
+    await _runFetchLocked();
+    _lastBuildBase = null;
+    if(!abortFlag) await saveCurrentReport();
+  });
   if(USE_LOCAL_DB && !abortFlag) refreshCompareAfterBuild('fetch');
   if(USE_LOCAL_DB && !abortFlag && typeof scheduleOnchainCheck === 'function') scheduleOnchainCheck('fetch');
 }
@@ -5130,6 +5150,7 @@ async function _runFetchLocked(){
     // Records when this download began, which is where the on-chain check
     // will compare. Only a download that finished moves it.
     if(typeof noteFetchFinished === 'function') await noteFetchFinished(fetchOk);
+    progressDone('fetch'); progressDone('build');
     document.getElementById('fetchBtn').disabled=false;
     document.getElementById('stopBtn').style.display='none';
     refreshLocalDataPanel();
@@ -5722,7 +5743,12 @@ function withLedgerLock(label, fn) {
   _ledgerQueue++;
   const start = async () => {
     _ledgerLockHeld = label;
-    try { return await fn(); } finally { _ledgerLockHeld = null; _ledgerQueue--; }
+    try { return await fn(); } finally {
+      _ledgerLockHeld = null; _ledgerQueue--;
+      // Exports clicked while the report was being rebuilt run now, once
+      // nothing is touching the ledger.
+      if(_ledgerQueue === 0 && typeof runAfterLedger === 'function') setTimeout(runAfterLedger, 0);
+    }
   };
   // Idle: start NOW, synchronously, so _ledgerBuildInFlight is set before
   // this returns, exactly as it was before the lock existed (the tests and
@@ -5748,7 +5774,7 @@ async function buildReportFromCache(opts = {}) {
   if(_ledgerLockHeld && !opts.silent) log(`Waiting for the running ${_ledgerLockHeld} to finish before rebuilding…`, 'wa');
   const ok = await withLedgerLock('rebuild', async () => {
     const r = await _runLedgerBuild(opts);
-    if(r) await captureBuildBase();
+    if(r) { await captureBuildBase(); await saveCurrentReport(); }
     return r;
   });
   if(ok) refreshCompareAfterBuild('rebuild');
@@ -5769,6 +5795,7 @@ async function _runLedgerBuild(opts = {}) {
     throw e;
   } finally {
     _ledgerBuildInFlight = null;
+    progressDone('build');
     // Repaint HERE, not at the end of _buildReportFromCacheInner.
     //
     // Putting it at the end of the inner function meant any early return or
@@ -6005,7 +6032,8 @@ async function setAmmTreatmentUI(value) {
         : 'WARNING: no ledger-verified AMM amounts are imported, so NOTHING will be\n' +
           'booked. Import the verifier CSV above first, or this setting will have no\n' +
           'effect at all.\n\n') +
-      'The report rebuilds now.');
+      'The report switches now: instantly if this setting has already been built for the\n' +
+      'current data (the background comparison does that), otherwise after one rebuild.');
     if(!ok) { syncAmmTreatmentSelect(); return; }
   }
 
@@ -6018,7 +6046,12 @@ async function setAmmTreatmentUI(value) {
     renderAmmTreatmentNote();
     // A figure produced under one treatment must never sit alongside a figure
     // produced under another, so this is not optional and not deferred.
-    if(USE_LOCAL_DB) { await _runLedgerBuild({ silent: true }); await captureBuildBase(); }
+    // Already built for this data? Then it is a load, not a rebuild.
+    if(USE_LOCAL_DB) {
+      const fast = await loadSavedReport(next);
+      if(!fast) { await _runLedgerBuild({ silent: true }); await saveCurrentReport(); }
+      await captureBuildBase();
+    }
   });
   renderResults();
   renderDataSummary();
@@ -6122,11 +6155,243 @@ function setAutoCompare(on) {
 
 // Exports read the live ledger arrays. While anything holds the ledger lock
 // those arrays are being rebuilt, possibly under the other treatment.
-function ledgerBusy() {
+//
+// An export clicked during a rebuild used to answer with an alert ("try again
+// in a minute"), so the only way to know when it was ready was to keep
+// clicking. Now the click is remembered: the progress strip says it is
+// waiting, and it runs by itself the moment the build finishes. Passing no
+// retry keeps the old alert, for actions that must not run later unattended.
+const _afterLedger = new Map();   // label -> fn
+function ledgerBusy(retry, what) {
   if(!_ledgerLockHeld) return false;
+  if(typeof retry === 'function') {
+    const label = what || 'your export';
+    _afterLedger.set(label, retry);
+    log(`${label} will download as soon as the ${_ledgerLockHeld} finishes.`, 'in');
+    renderAppProgress();
+    return true;
+  }
   alert(`The report is being recalculated (${_ledgerLockHeld}).\n\n` +
-        'Exports are paused until it finishes, so a file can never mix two calculations. ' +
-        'Try again in a minute.');
+        'This is paused until it finishes, so nothing can mix two calculations. ' +
+        'The progress strip at the top shows how far along it is.');
+  return true;
+}
+function runAfterLedger() {
+  if(_ledgerLockHeld || !_afterLedger.size) return;
+  const jobs = [..._afterLedger.entries()];
+  _afterLedger.clear();
+  renderAppProgress();
+  for(const [label, fn] of jobs) {
+    try { const r = fn(); if(r && typeof r.catch === 'function') r.catch(e => log(`${label} failed: ${e.message}`, 'err')); }
+    catch(e) { log(`${label} failed: ${e.message}`, 'err'); }
+  }
+}
+
+// ── Progress, visible from every tab ───────────────────────────────────────
+//
+// A build reads millions of rows and can take minutes. Until now the only
+// sign of it was the Setup log and a button that said "still building" when
+// clicked. Every long operation now reports here: what it is doing, how far
+// along, and roughly how long is left once that can be estimated.
+const _progressTasks = new Map();   // id -> {label, done, total, phaseStart, phaseDone0}
+function progressSet(id, label, done, total) {
+  const t = _progressTasks.get(id) || {};
+  if(t.label !== label) { t.phaseStart = Date.now(); t.phaseDone0 = Number(done) || 0; }
+  t.label = label; t.done = done; t.total = total;
+  _progressTasks.set(id, t);
+  renderAppProgress();
+}
+function progressDone(id) { if(_progressTasks.delete(id)) renderAppProgress(); }
+function progressEta(t) {
+  if(!(t.total > 0) || !(t.done > t.phaseDone0)) return '';
+  const secs = (Date.now() - t.phaseStart) / 1000;
+  if(secs < 5) return '';
+  const left = (t.total - t.done) / ((t.done - t.phaseDone0) / secs);
+  if(!Number.isFinite(left) || left < 0) return '';
+  return left < 60 ? 'under a minute left' : `about ${Math.round(left / 60)} min left`;
+}
+function renderAppProgress() {
+  const box = document.getElementById('appProgress');
+  if(!box) return;
+  if(!_progressTasks.size && !_afterLedger.size) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  const rows = [..._progressTasks.values()].map((t) => {
+    const pct = t.total > 0 ? Math.max(0, Math.min(100, (t.done / t.total) * 100)) : null;
+    const eta = progressEta(t);
+    return `<div class="ap-row"><span class="ap-label">⏳ ${escapeHTML(t.label)}${pct != null ? ` — ${Number(t.done).toLocaleString()} of ${Number(t.total).toLocaleString()}` : ''}</span>
+      <span class="ap-track"><span class="ap-fill${pct == null ? ' ap-indef' : ''}" style="${pct != null ? `width:${pct.toFixed(1)}%` : ''};display:block"></span></span>
+      <span class="ap-eta">${pct != null ? Math.floor(pct) + '%' : ''}${eta ? ' · ' + eta : ''}</span></div>`;
+  });
+  if(_afterLedger.size) {
+    rows.push(`<div class="ap-row"><span class="ap-label">⤓ Waiting to download when this finishes: ${[..._afterLedger.keys()].map(escapeHTML).join(', ')}</span></div>`);
+  }
+  box.innerHTML = rows.join('');
+  box.style.display = 'block';
+}
+// Let the strip paint before a long synchronous step (serializing a saved
+// report blocks the page while it runs).
+const yieldPaint = () => new Promise((r) => setTimeout(r, 40));
+
+// ── Saved reports: build once per change in the data, then just load ──────
+//
+// The report depends only on the cached rows and a handful of settings. Until
+// they change, rebuilding it (millions of rows through the FIFO engine) on
+// every launch and every treatment switch produced the same answer, slowly.
+// Now each finished, consistent build is saved — one per AMM treatment — and
+// loaded instead of rebuilt whenever its fingerprint still matches. Switching
+// Standard <-> Treatment A becomes a load once both have been built (the
+// background comparison builds the other one), and launching the app loads
+// the report rather than rebuilding it.
+//
+// The fingerprint (savedReportStamp) covers everything a build reads: the
+// data version (bumped by db.js on every change to cached rows, AMM figures
+// or ledger-affected imports), the app version (engine changes), the
+// embedded price tables, the wallet list and classifications, and the basis
+// inputs. Anything that changes the numbers changes the stamp, and a saved
+// report with a different stamp is never loaded: it would be stale, which
+// is worse than slow.
+const REPORT_KEY = (t) => 'report:' + (t === 'A' ? 'A' : 'none');
+const treatmentWord = (t) => t === 'A' ? 'Treatment A' : 'standard';
+function stampHash(str) {
+  let h = 5381;
+  for(let i = 0; i < str.length; i++) h = ((h * 33) ^ str.charCodeAt(i)) >>> 0;
+  return h.toString(16);
+}
+function buildSettingsFingerprint() {
+  return JSON.stringify({
+    w: [...WALLETS].sort(),
+    lost: lostWallets.map(e => [e.addr, e.lostDate || '']).sort(),
+    gift: giftAddresses.map(e => e.addr).sort(),
+    mine: [...transferOnlyAddresses].sort(),
+    xrpBasis: (document.getElementById('xrpBasis') || {}).value || '',
+    xahBasis: (document.getElementById('xahAirdropBasis') || {}).value || '',
+  });
+}
+async function savedReportStamp(treatment) {
+  let dv = '0', ver = '';
+  try { if(window.taxDB.getDataVersion) dv = await window.taxDB.getDataVersion(); } catch(e) {}
+  try { ver = (window.appInfo && window.appInfo.getVersion) ? await window.appInfo.getVersion() : ''; } catch(e) {}
+  const last = (t) => { const k = Object.keys(t); return k.length ? k.sort()[k.length - 1] : ''; };
+  return JSON.stringify({ dv, ver, t: treatment === 'A' ? 'A' : 'none',
+    prices: [last(XRP_PRICES), last(XAH_PRICES), last(EVR_PRICES)], s: stampHash(buildSettingsFingerprint()) });
+}
+
+// Lots are the bulk of the state (one per reward, transfer and purchase:
+// around a million on a large cache). As objects they cross the process
+// boundary slowly; as columns of typed arrays they are a memory copy.
+function packWalletLedger(wl) {
+  const srcList = [], srcIdx = new Map(), lots = [];
+  for(const [w, tickers] of Object.entries(wl)) {
+    for(const [tk, arr] of Object.entries(tickers)) {
+      const n = arr.length;
+      const qty = new Float64Array(n), uc = new Float64Array(n), rem = new Float64Array(n);
+      const src = new Uint16Array(n), dates = new Array(n);
+      for(let i = 0; i < n; i++) {
+        const l = arr[i];
+        qty[i] = l.qty; uc[i] = l.unitCost; rem[i] = l.remaining; dates[i] = l.date;
+        let k = srcIdx.get(l.source);
+        if(k === undefined) { k = srcList.length; srcList.push(l.source); srcIdx.set(l.source, k); }
+        src[i] = k;
+      }
+      lots.push([w, tk, qty, uc, rem, dates, src]);
+    }
+  }
+  return { v: 1, srcList, lots };
+}
+function unpackWalletLedger(p) {
+  const out = {};
+  for(const [w, tk, qty, uc, rem, dates, src] of p.lots) {
+    const arr = new Array(qty.length);
+    for(let i = 0; i < qty.length; i++) arr[i] = { date: dates[i], qty: qty[i], unitCost: uc[i], remaining: rem[i], source: p.srcList[src[i]] };
+    (out[w] = out[w] || {})[tk] = arr;
+  }
+  return out;
+}
+function ledgerStateForSave() {
+  const s = snapshotLedgerState({ live: true });   // live references: IPC copies them once
+  s.walletLedger = null;
+  s.walletLedgerPacked = packWalletLedger(walletLedger);
+  s.chainStats = chainStats;
+  s.v = 1;
+  return s;
+}
+
+// MUST be called with the ledger lock held, after a finished build.
+async function saveCurrentReport() {
+  if(!USE_LOCAL_DB || !window.taxDB.saveReport || !buildIsConsistent()) return false;
+  const t = ammTreatment;
+  progressSet('report', `Saving the ${treatmentWord(t)} report so it opens instantly next time…`);
+  await yieldPaint();
+  try {
+    const stamp = await savedReportStamp(t);
+    const t0 = performance.now();
+    const r = await window.taxDB.saveReport(REPORT_KEY(t), stamp, ledgerStateForSave());
+    log(`✓ Saved the ${treatmentWord(t)} report (${(r.bytes / 1048576).toFixed(1)} MB, ${((performance.now() - t0) / 1000).toFixed(1)} s). ` +
+        `Until the data changes it loads instead of rebuilding.`, 'ok');
+    return true;
+  } catch(e) {
+    log(`The report could not be saved for instant loading (${e.message}); it will be rebuilt next time.`, 'wa');
+    return false;
+  } finally {
+    progressDone('report');
+  }
+}
+
+// MUST be called with the ledger lock held. Loads the saved report for
+// treatment `t` if its fingerprint still matches. The caller sets
+// ammTreatment to `t` first.
+async function loadSavedReport(t) {
+  if(!USE_LOCAL_DB || !window.taxDB.loadReport) return false;
+  progressSet('report', `Opening the saved ${treatmentWord(t)} report…`);
+  await yieldPaint();
+  try {
+    const stamp = await savedReportStamp(t);
+    const t0 = performance.now();
+    const r = await window.taxDB.loadReport(REPORT_KEY(t), stamp);
+    if(!r || !r.state || !r.state.walletLedgerPacked) return false;
+    const s = r.state;
+    s.walletLedger = unpackWalletLedger(s.walletLedgerPacked);
+    delete s.walletLedgerPacked;
+    restoreLedgerState(s, { take: true });
+    if(s.chainStats) for(const k of Object.keys(s.chainStats)) Object.assign(chainStats[k] || (chainStats[k] = {}), s.chainStats[k]);
+    _lastBuildOutcome = 'ok';
+    log(`✓ Opened the saved ${treatmentWord(t)} report from ${new Date(r.savedAt).toLocaleString()} in ${((performance.now() - t0) / 1000).toFixed(1)} s — ` +
+        `nothing has changed since it was built, so no rebuild was needed.`, 'ok');
+    return true;
+  } catch(e) {
+    log(`The saved report could not be opened (${e.message}); rebuilding instead.`, 'wa');
+    return false;
+  } finally {
+    progressDone('report');
+  }
+}
+
+// Launch: open the saved report if it still matches, otherwise build.
+//
+// The match is checked first, outside the lock, against the stamps alone
+// (no report is read). With nothing to load, the build starts exactly as it
+// always has: a launch with no saved report is not made any slower.
+async function openReportAtStartup() {
+  let has = false;
+  try {
+    if(window.taxDB.reportInfo) {
+      const stamp = await savedReportStamp(ammTreatment);
+      has = (await window.taxDB.reportInfo()).some(r => r.key === REPORT_KEY(ammTreatment) && r.stamp === stamp);
+    }
+  } catch(e) { has = false; }
+  if(!has) return buildReportFromCache({ silent: true });
+  let loaded = false;
+  try {
+    loaded = await withLedgerLock('opening the saved report', async () => {
+      const ok = await loadSavedReport(ammTreatment);
+      if(ok) await captureBuildBase();
+      return ok;
+    });
+  } catch(e) { loaded = false; }
+  if(!loaded) return buildReportFromCache({ silent: true });
+  renderDataSummary();
+  try { renderPriceHistory(); } catch(_) {}
+  refreshCompareAfterBuild('startup');
+  if(typeof scheduleOnchainCheck === 'function') scheduleOnchainCheck('startup');
   return true;
 }
 
@@ -6189,6 +6454,7 @@ async function _compareInsideLock(onProgress) {
     await _runLedgerBuild({ silent: true });
     if(!buildIsConsistent()) throw new Error(`the build with your current setting failed its consistency check: ${consistencyDetail()}`);
     await captureBuildBase();
+    await saveCurrentReport();
     base = _lastBuildBase;
   }
   // Your report, as it stands, so it can be handed back without a third
@@ -6198,8 +6464,13 @@ async function _compareInsideLock(onProgress) {
   try {
     say(`Building with ${other === 'A' ? 'Treatment A' : 'the standard (not booked) setting'}…`);
     ammTreatment = other;
-    await _runLedgerBuild({ silent: true });
-    if(!buildIsConsistent()) throw new Error(`the ${other === 'A' ? 'Treatment A' : 'not-booked'} build failed its consistency check: ${consistencyDetail()}`);
+    // Built before for this same data? Load it; otherwise build it once and
+    // save it, which is what makes switching to it instant afterwards.
+    if(!(await loadSavedReport(other))) {
+      await _runLedgerBuild({ silent: true });
+      if(!buildIsConsistent()) throw new Error(`the ${other === 'A' ? 'Treatment A' : 'not-booked'} build failed its consistency check: ${consistencyDetail()}`);
+      await saveCurrentReport();
+    }
     otherSnap = treatmentSnapshot();
     otherRows = allDisposalsHigh.slice();   // the row objects outlive the next reset
   } finally {
@@ -6245,6 +6516,7 @@ function scheduleBackgroundCompare(reason) {
       await _compareInsideLock((m) => {
         const el = document.getElementById('treatmentCompareStatus');
         if(el) el.textContent = 'Updating in the background: ' + m;
+        progressSet('compare', 'Standard vs Treatment A comparison: ' + m);
       });
       _compareState = 'current';
       log(`✓ Treatment comparison updated in the background (${reason}).`, 'ok');
@@ -6254,6 +6526,7 @@ function scheduleBackgroundCompare(reason) {
       log(`Treatment comparison not updated: ${e.message}`, 'wa');
     }
   }).catch(() => { _bgCompareQueued = false; }).finally(() => {
+    progressDone('compare');
     // Outside the lock: renderResults/renderDataSummary refuse to paint while
     // the background run holds it.
     renderResults();
@@ -6924,7 +7197,7 @@ async function downloadCSVChunked(header, rows, rowToLine, filename, onProgress)
 }
 
 function exportCSV() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportCSV(), 'Form 8949 CSV')) return;   // live arrays may be mid-rebuild
   // Key includes box so a disposal split into ST+LT portions exports as two
   // distinct rows (exactly how they appear on the actual Form 8949 pages).
   const map = {};
@@ -6949,7 +7222,7 @@ function exportCSV() {
 // Amount is deliberately blank rather than 0 where no column carries it — a
 // zero here would read as "nothing moved", which is the one wrong answer.
 function exportUnvaluedCSV() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportUnvaluedCSV(), 'Not-on-Form-8949 CSV')) return;   // live arrays may be mid-rebuild
   const rows = [...unvaluedRows].sort((a,b) =>
     (a.dk < b.dk ? -1 : a.dk > b.dk ? 1 : 0) || a.type.localeCompare(b.type));
   // "Amount Source" and "Submitted Amount" are not padding. An AMM figure read
@@ -7101,7 +7374,7 @@ function exportForm8949PDF(source) {
   // rows, so it may be exported while the lock is held. Without it, the live
   // arrays are read and must not be mid-rebuild.
   const src = (source && Array.isArray(source.rows)) ? source : null;
-  if(!src && ledgerBusy()) return;
+  if(!src && ledgerBusy(() => exportForm8949PDF(source), `Form 8949 PDF (${taxYear()}, ${treatmentWord(ammTreatment)})`)) return;
   if(typeof window.jspdf === 'undefined' || !window.jspdf.jsPDF) {
     alert('The PDF library did not load. This needs no internet: jsPDF ships with the app at renderer/vendor/jspdf.umd.min.js. If you are seeing this, that file is missing from the build — please report it.');
     return;
@@ -7233,7 +7506,7 @@ function exportForm8949PDF(source) {
 }
 
 function exportIncome() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportIncome(), 'Income Report')) return;   // live arrays may be mid-rebuild
   const yr = taxYear();
   const lines = [
     'Description,Date Received,FMV (USD),Quantity,Ticker,Wallet,TX Hash,Tax Treatment',
@@ -7259,7 +7532,7 @@ function allTxCsvLine(r) {
 }
 
 async function exportAllTx() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportAllTx(), 'All Transactions CSV')) return;   // live arrays may be mid-rebuild
   const btn = document.getElementById('exportAllTxBtn');
   if(btn) { btn.disabled = true; btn.textContent = '⏳ Exporting…'; }
   try {
@@ -7532,6 +7805,7 @@ async function streamChainIntoLedger(chain, walletSet) {
     page.rows.length = 0;
     cursor = page.cursor;
     log(`    …${done.toLocaleString()} / ${total.toLocaleString()}`, 'in');
+    progressSet('build', `Building the ${treatmentWord(ammTreatment)} report: ${chain} rows`, done, total);
     await new Promise(res => setTimeout(res, 0)); // yield, and let the page be collected
     if(!cursor) break;
   }
@@ -7743,7 +8017,7 @@ function coinLedgerRow(e) {
 }
 
 async function exportKoinlyCSV() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportKoinlyCSV(), 'Koinly CSV')) return;   // live arrays may be mid-rebuild
   const btn = document.getElementById('exportKoinlyBtn');
   if(btn) { btn.disabled = true; btn.textContent = '⏳ Building…'; }
   try {
@@ -7774,7 +8048,7 @@ async function exportKoinlyCSV() {
 }
 
 async function exportCoinLedgerCSV() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportCoinLedgerCSV(), 'CoinLedger CSV')) return;   // live arrays may be mid-rebuild
   const btn = document.getElementById('exportCoinLedgerBtn');
   if(btn) { btn.disabled = true; btn.textContent = '⏳ Building…'; }
   try {
@@ -8051,7 +8325,7 @@ function walletActivityHTML(yr) {
 }
 
 function exportWalletActivityCSV() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportWalletActivityCSV(), 'Wallet activity CSV')) return;   // live arrays may be mid-rebuild
   const yr = taxYear();
   const acts = computeWalletActivity(yr);
   if(acts.length === 0) { alert('No disposals for this tax year — build the report first.'); return; }
@@ -8421,7 +8695,7 @@ function lostWalletHTML(lostHoldings) {
 }
 
 function exportLostWalletCSV() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportLostWalletCSV(), 'Lost-wallet CSV')) return;   // live arrays may be mid-rebuild
   if(lostWallets.length === 0) { alert('No wallets marked as lost yet.'); return; }
   const lostHoldings = computeHoldings().filter(h => isLostWallet(h.wallet));
   const lines = ['LOST WALLET BASIS REPORT — documentation only, not a deduction'];
@@ -8542,7 +8816,7 @@ function giftSummaryHTML() {
 }
 
 function exportGiftsCSV() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportGiftsCSV(), 'Gifts CSV')) return;   // live arrays may be mid-rebuild
   if(allGiftRows.length === 0) { alert('No gifts recorded. Mark a destination as a gift, then rebuild.'); return; }
   const lines = ['Date,Recipient,Recipient Address,From Wallet,Asset,Quantity,Price USD,Value When Given USD,Your Cost Basis (carryover for gain),Basis If They Sell At A Loss,Dual Basis Applies,Your Holding Period,Earliest Lot Acquired,Tx Hash'];
   for(const g of [...allGiftRows].sort((a,b)=> (a.dk<b.dk?-1:a.dk>b.dk?1:0))) {
@@ -8599,7 +8873,7 @@ async function rebuildAfterOwnershipChange() {
 // and a single "total" that blends them is the misleading number this whole
 // tool has spent its life trying to stop producing.
 function exportHoldingsPDF() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportHoldingsPDF(), 'Holdings PDF')) return;   // live arrays may be mid-rebuild
   if(typeof window.jspdf === 'undefined' || !window.jspdf.jsPDF) {
     alert('The PDF library did not load. This needs no internet: jsPDF ships with the app at renderer/vendor/jspdf.umd.min.js. If you are seeing this, that file is missing from the build — please report it.');
     return;
@@ -8714,7 +8988,7 @@ function exportHoldingsPDF() {
 // 1 Jan 2025, which is precisely what this ledger does — so this file is also
 // the substantiation for that allocation.
 function exportExchangeBasisCSV() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportExchangeBasisCSV(), 'Exchange basis CSV')) return;   // live arrays may be mid-rebuild
   const rows = [];
   for(const [wallet, tickers] of Object.entries(walletLedger)) {
     if(!isTransferOnly(wallet)) continue;
@@ -8773,7 +9047,7 @@ function exportExchangeBasisCSV() {
 }
 
 function exportHoldingsCSV() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportHoldingsCSV(), 'Holdings CSV')) return;   // live arrays may be mid-rebuild
   const rows = computeHoldings();
   if(rows.length === 0) { alert('No holdings to export — build the report first.'); return; }
   const lines = ['Wallet,Description,Type,Asset,Quantity,Cost Basis USD,Unit Price USD,Price As Of,Current Value USD'];
@@ -8784,7 +9058,7 @@ function exportHoldingsCSV() {
 }
 
 async function exportDestinationsCSV() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportDestinationsCSV(), 'Disposal Destinations CSV')) return;   // live arrays may be mid-rebuild
   const yr = taxYear();
   const dests = computeDisposalDestinations(yr);
   if(dests.length === 0) { alert('No disposals for this tax year — build the report first.'); return; }
@@ -8820,7 +9094,7 @@ async function exportDestinationsCSV() {
 }
 
 function exportLedger() {
-  if(ledgerBusy()) return;   // live arrays may be mid-rebuild
+  if(ledgerBusy(() => exportLedger(), 'Basis Ledger CSV')) return;   // live arrays may be mid-rebuild
   if(Object.keys(walletLedger).length === 0) {
     alert('No basis ledger built. Run a full history fetch first.');
     return;
@@ -8898,7 +9172,7 @@ if(USE_LOCAL_DB) {
   // Before the rebuild, not after: the rebuild paints the Data Summary, and
   // the scope warning belongs in it the first time it appears rather than on
   // the second paint.
-  checkFetchScope().then(() => buildReportFromCache({ silent: true })).finally(() => {
+  checkFetchScope().then(() => openReportAtStartup()).finally(() => {
     if(startupBtn) { startupBtn.disabled = false; startupBtn.textContent = '📄 View Report From Cache (offline)'; }
   }).then(ok => {
     if(ok) log(`\n✓ Loaded ${transactionsScanned.toLocaleString()} cached transactions from previous sessions — Form 8949 is ready without fetching anything.`, 'ok');

@@ -774,6 +774,12 @@ function onchainWalletCell(w, label) {
 }
 
 async function renderOnchainPanel() {
+  // Mirror a running check or explain into the progress strip, so it is
+  // visible from any tab, not only Holdings.
+  if (typeof progressSet === 'function') {
+    if ((_onchainRunning || _explainRunning) && _onchainStatus) progressSet('onchain', 'On-chain check: ' + _onchainStatus);
+    else progressDone('onchain');
+  }
   const box = document.getElementById('onchainPanel');
   if (!box) return;
   if (typeof USE_LOCAL_DB === 'undefined' || !USE_LOCAL_DB) { box.innerHTML = ''; return; }

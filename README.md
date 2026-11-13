@@ -1117,3 +1117,28 @@ says by how much they do not. Both views export to CSV.
 Servers: `xrplcluster.com` and `xahau.network` by default, or a Dhali API
 (`https://run.api.dhali.io/<api id>/`), in which case the Setup Payment-Claim
 is sent to Dhali only. See SECURITY.md for exactly what is sent.
+
+
+## Saved reports and the progress strip (1.10.9)
+
+Building the report reads every cached row through the FIFO engine — minutes
+on a cache of several million rows — and produces the same answer until the
+data or a deciding setting changes. So each finished, consistent build is now
+saved in the app's database (compressed; a few MB), one copy per AMM
+treatment, and loaded instead of rebuilt while its fingerprint matches:
+
+- **Launching the app** opens the saved report in seconds.
+- **Switching Standard ↔ Treatment A** loads the other saved report. The
+  background comparison builds and saves the other treatment after each
+  download, so switching is a load rather than a rebuild from then on.
+- **What forces a rebuild:** new or changed cached rows (any download that
+  brings something new, a ledger-affected import or removal, AMM figures),
+  a new app version, new embedded prices, a change to the wallet list or a
+  wallet's classification (lost, gift, marked as mine), or the XRP/XAH basis
+  inputs. Changing the tax year or the high/low price mode never needed one.
+
+Anything long — a download, a build, the treatment comparison, saving or
+opening a report, the on-chain check — shows in a strip under the tabs, on
+every page, with progress and an estimate of the time left. An export clicked
+while the report is being rebuilt is remembered, listed in the strip, and
+downloads by itself when the build finishes.

@@ -77,6 +77,14 @@ contextBridge.exposeInMainWorld('taxDB', {
   getSyncTimes: () => ipcRenderer.invoke('db:getSyncTimes'),
   /** @returns {Promise<string[]>} every cached tx_hash for one wallet+chain */
   getTxHashes: (wallet, chain) => ipcRenderer.invoke('db:getTxHashes', wallet, chain),
+
+  /** Bumped by every change to cached data (see db.js bumpDataVersion). */
+  getDataVersion: () => ipcRenderer.invoke('db:getDataVersion'),
+  /** Saved finished reports: one per AMM treatment, loaded only on an exact stamp match. */
+  saveReport: (key, stamp, state) => ipcRenderer.invoke('report:save', key, stamp, state),
+  loadReport: (key, stamp) => ipcRenderer.invoke('report:load', key, stamp),
+  reportInfo: () => ipcRenderer.invoke('report:info'),
+  clearReports: () => ipcRenderer.invoke('report:clear'),
 });
 
 // Read-only ledger queries for the on-chain balance check. The main process

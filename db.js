@@ -93,6 +93,22 @@ CREATE TABLE IF NOT EXISTS amm_ledger (
   imported_at TEXT NOT NULL,
   PRIMARY KEY (wallet, tx_type, timestamp)
 );
+
+-- A finished report, saved so it does not have to be rebuilt. Building the
+-- report means reading every cached row (millions) through the FIFO engine;
+-- the result is the same until the data or a setting that decides it changes.
+-- One row per AMM treatment, so switching between them is a load, not a
+-- rebuild. \`stamp\` fingerprints everything the build depends on (data
+-- version, app version, prices, wallet classifications, basis inputs); a
+-- saved report is only ever loaded when its stamp matches exactly.
+-- \`data\` is the engine's state, v8-serialized and gzipped by main.js.
+CREATE TABLE IF NOT EXISTS report_cache (
+  key       TEXT PRIMARY KEY,
+  stamp     TEXT NOT NULL,
+  saved_at  TEXT NOT NULL,
+  bytes     INTEGER NOT NULL,
+  data      BLOB NOT NULL
+);
 `;
 
 const SCHEMA_VERSION = 1;
@@ -322,6 +338,15 @@ function makeApi(db) {
   // Returns rows WRITTEN — inserted plus updated — not rows newly created.
   // A re-sync that refreshes a cached row with richer columns has done real
   // work and must not report zero.
+  // Every change to what a build would read bumps this number. A saved report
+  // records the number it was built from; a different number means rebuild.
+  // Counting changes is exact where a row count is not: an upsert that
+  // replaces a row's JSON changes the data without changing the count.
+  const bumpDataVersion = () => {
+    const cur = Number((stmts.getMeta.get('dataVersion') || {}).value || 0);
+    stmts.setMeta.run('dataVersion', String(cur + 1));
+  };
+
   const insertRowsTxn = db.transaction((wallet, chain, rows, nowIso) => {
     let inserted = 0;
     for (const r of rows) {
@@ -335,6 +360,7 @@ function makeApi(db) {
       });
       if (info.changes > 0) inserted++;
     }
+    if (inserted > 0) bumpDataVersion();
     return inserted;
   });
 
@@ -357,12 +383,14 @@ function makeApi(db) {
   // becomes a redundant re-fetch, never silent data loss.
   const clearWalletChainTxn = db.transaction((wallet, chain) => {
     stmts.clearWalletSync.run(wallet, chain);
-    stmts.clearWalletChain.run(wallet, chain);
+    if (stmts.clearWalletChain.run(wallet, chain).changes > 0) bumpDataVersion();
   });
 
   const clearAllTxn = db.transaction(() => {
     stmts.clearEverything_sync.run();
     stmts.clearEverything_tx.run();
+    db.prepare('DELETE FROM report_cache').run();
+    bumpDataVersion();
     // amm_ledger is deliberately NOT cleared here. It is not cached WinDB
     // data; it is an independent measurement that costs an hour of sweeping a
     // full-history node to reproduce, and it stays correct across a re-fetch
@@ -388,6 +416,7 @@ function makeApi(db) {
       });
       n++;
     }
+    if (n > 0) bumpDataVersion();
     return n;
   });
 
@@ -632,11 +661,42 @@ function makeApi(db) {
       return { rows: r.n || 0, wallets: r.w || 0 };
     },
     clearAffected() {
-      return db.prepare("DELETE FROM raw_transactions WHERE tx_hash LIKE 'AFFECTED:%'").run().changes;
+      const n = db.prepare("DELETE FROM raw_transactions WHERE tx_hash LIKE 'AFFECTED:%'").run().changes;
+      if (n > 0) bumpDataVersion();
+      return n;
     },
 
     clearAmmLedger() {
       stmts.clearAmmLedger.run();
+      bumpDataVersion();
+    },
+
+    /** The number every data change bumps (see bumpDataVersion). '0' on a cache that predates it. */
+    getDataVersion() {
+      return String((stmts.getMeta.get('dataVersion') || {}).value || '0');
+    },
+
+    /**
+     * Saved reports. `data` is a Buffer (main.js serializes and compresses);
+     * this layer only stores and returns bytes.
+     */
+    saveReport(key, stamp, data) {
+      db.prepare(`INSERT INTO report_cache (key, stamp, saved_at, bytes, data) VALUES (?, ?, ?, ?, ?)
+                  ON CONFLICT(key) DO UPDATE SET stamp = excluded.stamp, saved_at = excluded.saved_at,
+                  bytes = excluded.bytes, data = excluded.data`)
+        .run(key, stamp, new Date().toISOString(), data.length, data);
+    },
+    /** The saved bytes for key, only if saved under exactly this stamp. */
+    loadReport(key, stamp) {
+      const r = db.prepare('SELECT stamp, saved_at, data FROM report_cache WHERE key = ?').get(key);
+      if (!r || r.stamp !== stamp) return null;
+      return { savedAt: r.saved_at, data: r.data };
+    },
+    reportInfo() {
+      return db.prepare('SELECT key, stamp, saved_at, bytes FROM report_cache ORDER BY key').all();
+    },
+    clearReports() {
+      return db.prepare('DELETE FROM report_cache').run().changes;
     },
 
     /**

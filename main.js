@@ -24,6 +24,11 @@ const http = require('http');
 const fs = require('fs');
 const { createDb } = require('./db');
 const ledgerRpc = require('./ledger-rpc');
+const v8 = require('v8');
+const zlib = require('zlib');
+const { promisify } = require('util');
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
 
 const RENDERER_DIR = path.resolve(__dirname, 'renderer');
 const DB_FILENAME = 'tax-data.sqlite3';
@@ -447,4 +452,41 @@ function registerIpcHandlers(db, dbPath) {
   // and the Payment-Claim sent to Dhali alone. The renderer's CSP is not
   // widened for this; the request is made here.
   ipcMain.handle('ledger:rpc', guarded((_evt, req) => ledgerRpc.call(req)));
+
+  // Saved reports (see db.js report_cache). The renderer hands over the
+  // engine's finished state; it is serialized with v8 (keeps Maps and typed
+  // arrays, far faster than JSON) and gzipped off the main thread's critical
+  // path. Loading reverses it, and only for an exact stamp match.
+  ipcMain.handle('report:save', guarded(async (_evt, key, stamp, state) => {
+    if (typeof key !== 'string' || !/^[a-z0-9:_-]{1,40}$/i.test(key)) throw new Error('report: bad key');
+    if (typeof stamp !== 'string' || stamp.length > 20000) throw new Error('report: bad stamp');
+    const raw = v8.serialize(state);
+    const packed = await gzip(raw, { level: 4 });
+    db.saveReport(key, stamp, packed);
+    return { bytes: packed.length, raw: raw.length };
+  }));
+  ipcMain.handle('report:load', guarded(async (_evt, key, stamp) => {
+    const r = db.loadReport(String(key), String(stamp));
+    if (!r) return null;
+    try {
+      const state = v8.deserialize(await gunzip(r.data));
+      // v8.deserialize hands back each typed array as a VIEW onto the whole
+      // decompressed buffer. Cloning a view to the renderer copies its entire
+      // underlying buffer, so a few hundred lot columns became hundreds of
+      // copies of the full report, and a large report crashed the page.
+      // Each column gets its own exact-size buffer before it crosses.
+      const p = state && state.walletLedgerPacked;
+      if (p && Array.isArray(p.lots)) {
+        for (const row of p.lots) {
+          for (let i = 0; i < row.length; i++) if (ArrayBuffer.isView(row[i])) row[i] = row[i].slice();
+        }
+      }
+      return { savedAt: r.savedAt, state };
+    } catch (e) {
+      return null;   // unreadable (e.g. written by another Electron/V8): rebuild instead
+    }
+  }));
+  ipcMain.handle('report:info', guarded(() => db.reportInfo()));
+  ipcMain.handle('report:clear', guarded(() => db.clearReports()));
+  ipcMain.handle('db:getDataVersion', guarded(() => db.getDataVersion()));
 }

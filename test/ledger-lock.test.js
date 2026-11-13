@@ -109,14 +109,19 @@ test('a stored comparison is trusted only for the data and figures it was built 
   assert.strictEqual(f(stored, null), false);
 });
 
-test('every export that reads the live arrays waits for the lock', () => {
+test('every export that reads the live arrays waits for the lock, and queues itself to run after it', () => {
+  // Since 1.10.9 a click during a rebuild is remembered and runs when the
+  // lock frees (see runAfterLedger), instead of an alert asking to try again.
+  // Either way the export's first act is to check the lock.
   for (const n of ['exportCSV', 'exportUnvaluedCSV', 'exportIncome', 'exportAllTx', 'exportKoinlyCSV',
     'exportCoinLedgerCSV', 'exportWalletActivityCSV', 'exportLostWalletCSV', 'exportGiftsCSV', 'exportHoldingsPDF',
     'exportExchangeBasisCSV', 'exportHoldingsCSV', 'exportDestinationsCSV', 'exportLedger']) {
-    const re = new RegExp('function ' + n + '\\(\\) ?\\{\\n  if\\(ledgerBusy\\(\\)\\) return;');
-    assert.ok(re.test(html), n + ' does not check ledgerBusy() first');
+    const re = new RegExp('function ' + n + '\\(\\) ?\\{\\n  if\\(ledgerBusy\\(\\(\\) => ' + n + '\\(\\), \'[^\']+\'\\)\\) return;');
+    assert.ok(re.test(html), n + ' does not check ledgerBusy() first, queuing itself');
   }
-  assert.ok(/if\(!src && ledgerBusy\(\)\) return;/.test(body('function exportForm8949PDF(')));
+  assert.ok(/if\(!src && ledgerBusy\(\(\) => exportForm8949PDF\(source\), /.test(body('function exportForm8949PDF(')));
+  // and the queue is drained when the lock is released
+  assert.ok(/_ledgerQueue === 0 && typeof runAfterLedger === 'function'/.test(body('function withLedgerLock(')));
 });
 
 test('no caller outside the lock-holders reaches the raw build', () => {
