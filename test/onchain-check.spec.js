@@ -460,7 +460,13 @@ test('WinDB: Explain finds the day the books and the ledger parted, and lists wh
     const jan1 = Math.floor(Date.UTC(2026, 0, 1) / 86400000);
     return { kind: x.kind, first: c.firstDay, startDiff: c.startDiff, events: c.events.map((e) => ({ day: e.day, ledger: e.ledger, app: e.app, delta: e.delta })),
       finalDiff: c.finalDiff, jan1, txJan1: (x.txByDay[jan1] || []).map((t) => t.type), csvName: csv.name,
-      panel: document.getElementById('onchainPanel').innerText };
+      panel: document.getElementById('onchainPanel').innerText,
+      explainFirst: (() => {
+        const p = document.getElementById('onchainPanel');
+        const ex = p.querySelector('#onchainExplain');
+        const walletTable = [...p.querySelectorAll('table')].find((t) => !ex.contains(t) && t.innerText.includes('Difference (app − ledger)'));
+        return !!walletTable && !!(ex.compareDocumentPosition(walletTable) & Node.DOCUMENT_POSITION_FOLLOWING);
+      })() };
   }, { A });
   expect(out.kind).toBe('daily');
   expect(out.startDiff).toBeCloseTo(-5, 9);          // 5 XRP on the ledger before the app saw any
@@ -473,6 +479,7 @@ test('WinDB: Explain finds the day the books and the ledger parted, and lists wh
   expect(out.txJan1).toEqual(['Payment']);
   expect(out.csvName).toMatch(/^Onchain-Explain-Daily-/);
   expect(out.panel).toContain('adds up to the difference');
+  expect(out.explainFirst).toBe(true);             // the explanation sits above the wallet table, not under it
 });
 
 test('WinDB: addresses are checked before they reach SQL, and no claim means no query', async () => {

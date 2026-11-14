@@ -76,6 +76,7 @@ let _onchainCancel = false;
 let _onchainStatus = '';
 let _onchainExplain = null;       // last explain report
 let _explainRunning = false;
+let _onchainScrollToExplain = false;
 let _fetchStartedAt = null;       // set while a fetch runs
 // The renderer's one call into the ledger. A variable, not a direct call, so
 // the test suite can stand a fake ledger in its place.
@@ -825,6 +826,7 @@ function explainDailyTotals(rows, scale) {
 
 async function explainDaily(wallet, chain) {
   if (_explainRunning) return;
+  _onchainStatus = `Explaining ${labelFor(wallet) || wallet.slice(0, 10) + '…'} on ${chain}…`;
   const result = await loadOnchainResult();
   const pin = result && result.pins && result.pins[chain];
   if (!pin || pin.index == null) { alert('Run the on-chain check first.'); return; }
@@ -871,6 +873,7 @@ async function explainDaily(wallet, chain) {
       txByDay[d] = rows.map((r) => explainTxSummary(r, wallet));
     }
     _onchainExplain = { kind: 'daily', wallet, chain, pin, at: Date.now(), assets, txByDay, balanceAtPin: {} };
+    _onchainScrollToExplain = true;
     for (const x of (result.rows || []).filter((y) => y.wallet === wallet && y.chain === chain)) {
       _onchainExplain.balanceAtPin[x.ticker] = { balance: x.balance, escrow: x.escrow, variance: x.variance };
     }
@@ -944,6 +947,7 @@ async function explainExact(wallet, chain) {
     for (const x of row) rep.balanceAtPin[x.ticker] = { balance: x.balance, escrow: x.escrow };
     rep.kind = 'exact';
     _onchainExplain = rep;
+    _onchainScrollToExplain = true;
     setStatus('');
   } catch (e) {
     setStatus('Explain stopped: ' + e.message);
@@ -1136,13 +1140,17 @@ async function renderOnchainPanel() {
   }
   const color = (st) => st === 'material' ? '#8b0000' : st === 'minor' ? '#7a4a00' : st === 'unknown' ? '#666' : '#1a5c2a';
   const unknownN = by('unknown').length;
-  const list = r.rows.map((x, i) => ({ x, i })).filter(({ x }) => x.status !== 'match');
-  const table = list.length ? `<table style="border-collapse:collapse;font-size:10px;width:100%;margin-top:6px">
+  const indexed = r.rows.map((x, i) => ({ x, i }));
+  // The rows that matter first; the many small ones (under $5) folded away,
+  // so the table does not push the explanation off the bottom of the page.
+  const list = indexed.filter(({ x }) => x.status === 'material' || x.status === 'unknown');
+  const minorList = indexed.filter(({ x }) => x.status === 'minor');
+  const rowsTable = (items) => `<table style="border-collapse:collapse;font-size:10px;width:100%;margin-top:6px">
       <tr style="background:#eef"><th style="text-align:left;padding:3px 5px">Wallet</th><th style="text-align:left;padding:3px 5px">Type</th>
         <th style="text-align:left;padding:3px 5px">Asset</th><th style="text-align:right;padding:3px 5px">App holds</th>
         <th style="text-align:right;padding:3px 5px">Ledger holds</th><th style="text-align:right;padding:3px 5px">Difference (app − ledger)</th>
         <th style="text-align:right;padding:3px 5px">At today's price</th><th style="text-align:left;padding:3px 5px">Notes</th><th></th></tr>
-      ${list.map(({ x, i }) => `<tr style="border-top:1px solid #ddd">
+      ${items.map(({ x, i }) => `<tr style="border-top:1px solid #ddd${_onchainExplain && _onchainExplain.wallet === x.wallet && _onchainExplain.chain === x.chain ? ';background:#eef3ff' : ''}">
         <td style="padding:3px 5px">${onchainWalletCell(x.wallet, x.label)}</td>
         <td style="padding:3px 5px">${escapeHTML(x.type || '')}</td>
         <td style="padding:3px 5px">${escapeHTML(x.ticker)} <span style="color:#888">${escapeHTML(x.chain)}</span></td>
@@ -1153,7 +1161,9 @@ async function renderOnchainPanel() {
         <td style="padding:3px 5px;color:#555">${x.notes.map(escapeHTML).join('; ')}</td>
         <td style="padding:3px 5px"><button class="sml" ${busy ? 'disabled' : ''} onclick="explainOnchainRow(${i})">Explain</button></td>
       </tr>`).join('')}
-    </table>` : '<div style="font-size:11px;color:#1a5c2a;margin-top:6px">✓ Every checked balance agrees with the ledger.</div>';
+    </table>`;
+  const table = (list.length ? rowsTable(list) : (minorList.length ? '' : '<div style="font-size:11px;color:#1a5c2a;margin-top:6px">✓ Every checked balance agrees with the ledger.</div>')) +
+    (minorList.length ? `<details style="margin-top:6px;font-size:11px"><summary>${minorList.length} more wallet/asset pair(s) differ by under $${ONCHAIN_MINOR_USD} each — show them</summary>${rowsTable(minorList)}</details>` : '');
   const notChecked = (r.notChecked || []).length ? `<div style="font-size:10px;color:#555;margin-top:6px">Not checked (holdings in addresses the app does not fetch — exchanges and other addresses marked as yours):
       ${r.notChecked.map((n) => `${escapeHTML(n.wallet.slice(0, 10))}… ${fmtOnchainQty(n.qty)} ${escapeHTML(n.ticker)}`).join(' · ')}</div>` : '';
   const errs = (r.errors || []).length ? `<div style="font-size:10px;color:#8b0000;margin-top:6px">Could not read: ${r.errors.slice(0, 10).map((e) => `${escapeHTML(e.wallet.slice(0, 10))}… ${escapeHTML(e.chain)} (${escapeHTML(e.message)})`).join(' · ')}${r.errors.length > 10 ? ` …and ${r.errors.length - 10} more` : ''}</div>` : '';
@@ -1168,7 +1178,13 @@ async function renderOnchainPanel() {
       source ${escapeHTML(r.source === 'rpc' ? 'public ledger servers' : 'WinDB (Dhali)')}</div>
     <div style="font-size:10px;color:#666;margin-bottom:4px">Comparison point — ${pinLine || 'none'}</div>
     <div style="font-size:10px;color:#666">Net difference: ${Object.entries(totals).map(([t, v]) => `${fmtOnchainQty(v.qty)} ${escapeHTML(t)} ($${fmt(v.usd)})`).join(' · ') || 'none'}</div>
-    ${journalNote}${table}${notChecked}${errs}` + explainHTML();
+    ${journalNote}` + explainHTML() + `${table}${notChecked}${errs}`;
+  // Bring a just-finished explanation into view: it can be a long way down.
+  if (_onchainScrollToExplain) {
+    _onchainScrollToExplain = false;
+    const el = document.getElementById('onchainExplain');
+    if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
 }
 
 function explainHTML() {
