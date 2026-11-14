@@ -69,6 +69,12 @@ test('a token with a buyer is sold first, never trashed', () => {
   assert.match(r.why, /Schedule D loss/);
   assert.strictEqual(t.recommend({ ...base, proceeds: 7 }, opts).action, 'KEEP or SELL — your call');
   assert.strictEqual(t.recommend({ ...base, proceeds: 0.0001 }, opts).action, 'REMOVE (burn)');   // dust is not a buyer
+  // No basis and pennies of proceeds: trash it, a sale only adds an 8949 line.
+  const pennies = t.recommend({ ...base, proceeds: 0.3, basisUsd: 0 }, opts);
+  assert.strictEqual(pennies.action, 'REMOVE (burn)');
+  assert.match(pennies.why, /loses no deduction/);
+  assert.strictEqual(t.recommend({ ...base, proceeds: 2, basisUsd: 0 }, opts).action, 'SELL then REMOVE');
+  assert.strictEqual(t.recommend({ ...base, proceeds: 0.3, basisUsd: 4 }, opts).action, 'SELL then REMOVE');
 });
 
 test('no buyer: burning is fine without basis, and flagged when basis would be lost', () => {
@@ -93,7 +99,11 @@ test('the Holdings CSV supplies basis per wallet and token, and the XRP price', 
     'rEXAMPLE,"Main, active",active,XRP,10,5.00,2.250000,2026-11-13,22.50\n' +
     'rEXAMPLE,Main,active,abc,3,1.25,0,,0\n');
   const m = t.readHoldings(f);
-  assert.strictEqual(m.get('rEXAMPLE|ABC'), 1.25);
+  assert.deepStrictEqual(m.get('rEXAMPLE|ABC'), { basis: 1.25, qty: 3 });
+  // One wallet's EVR row is XRPL + Xahau together: a dust line gets its share, not the lot.
+  assert.ok(Math.abs(t.basisFor({ basis: 129, qty: 70000 }, 0.0000015) - 129 * 0.0000015 / 70000) < 1e-15);
+  assert.strictEqual(t.basisFor({ basis: 5, qty: 2 }, 10), 5);
+  assert.strictEqual(t.basisFor(undefined, 10), 0);
   assert.strictEqual(m.get('__XRPUSD'), 2.25);
   assert.throws(() => { fs.writeFileSync(f, 'a,b\n1,2\n'); t.readHoldings(f); }, /Holdings-By-Wallet/);
 });

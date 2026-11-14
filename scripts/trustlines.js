@@ -41,6 +41,8 @@
  *   npm run trustlines -- --wallet rG9RHCRS --wallet rLNZjhGPvA
  *   npm run trustlines -- --wallet rG9RHCRS --holdings ~/Downloads/Holdings-By-Wallet-2026-11-13.csv
  *   options: --keep-xrp 5     a token worth at least this many XRP is "your call", not "sell"
+ *            --min-sell 1     with no basis, a token worth less than this is trashed, not sold
+ *                             (a sale for pennies is a Form 8949 line for pennies)
  *            --out file.csv   CSV name (default Trustlines-<date>.csv; gitignored)
  *            --db <path>      cache file (default: the app's)
  *            XRPL_RPC=https://run.api.dhali.io/<api id>/   use Dhali instead of the public cluster
@@ -143,6 +145,9 @@ function recommend(l, opts) {
   if (l.frozenByIssuer && l.balance > 0) return out('LEAVE — frozen', 'the issuer froze this line; it cannot be sold or sent until they unfreeze');
   if (!(l.balance > 0)) return out('REMOVE', `empty line; ${frees}`);
   if (l.proceeds >= keepXrp) return out('KEEP or SELL — your call', `a buyer pays ~${l.proceeds.toFixed(2)} XRP for it; if you sell, trash the empty line after (${frees})`);
+  if (l.proceeds >= MIN_PROCEEDS_XRP && l.basisUsd != null && l.basisUsd <= 0.5 && l.proceeds < (opts.minSell || 1)) {
+    return out('REMOVE (burn)', `worth only ~${l.proceeds.toFixed(l.proceeds < 0.1 ? 4 : 2)} XRP and has no basis: trashing loses no deduction and saves a sale (and a Form 8949 line); ${frees}`);
+  }
   if (l.proceeds >= MIN_PROCEEDS_XRP) {
     const tax = l.basisUsd == null ? 'sell (not trash) so any loss counts on Schedule D'
       : l.basisUsd > 0.5 ? `basis $${l.basisUsd.toFixed(2)}: selling turns it into a Schedule D loss; trashing would forfeit it`
@@ -154,21 +159,34 @@ function recommend(l, opts) {
   return out('REMOVE (burn)', `no buyer and no basis: nothing is lost; ${frees}`);
 }
 
-// Holdings-By-Wallet CSV → Map "wallet|TICKER" → basis USD.
+// Holdings-By-Wallet CSV → Map "wallet|TICKER" → { basis USD, qty }.
+// The CSV has no chain column, so one wallet's EVR row is its XRPL and Xahau
+// EVR together. Callers prorate by quantity (basisFor) rather than pinning a
+// whole holding's basis on a dust trust line.
 function readHoldings(file) {
   const map = new Map();
   if (!file) return map;
   const text = fs.readFileSync(file, 'utf8');
   const rows = text.split(/\r?\n/).filter(Boolean).map(parseCsvLine);
   const head = rows.shift() || [];
-  const iW = head.indexOf('Wallet'), iA = head.indexOf('Asset'), iB = head.indexOf('Cost Basis USD'), iP = head.indexOf('Unit Price USD');
+  const iW = head.indexOf('Wallet'), iA = head.indexOf('Asset'), iB = head.indexOf('Cost Basis USD'), iP = head.indexOf('Unit Price USD'), iQ = head.indexOf('Quantity');
   if (iW < 0 || iA < 0 || iB < 0) throw new Error('not a Holdings-By-Wallet CSV (needs Wallet, Asset, Cost Basis USD columns)');
   for (const r of rows) {
     const k = r[iW] + '|' + String(r[iA] || '').toUpperCase();
-    map.set(k, (map.get(k) || 0) + num(r[iB]));
+    const h = map.get(k) || { basis: 0, qty: 0 };
+    h.basis += num(r[iB]); h.qty += iQ >= 0 ? num(r[iQ]) : 0;
+    map.set(k, h);
     if (String(r[iA]).toUpperCase() === 'XRP' && iP >= 0 && num(r[iP]) > 0) map.set('__XRPUSD', num(r[iP]));
   }
   return map;
+}
+
+// Basis that belongs to `balance` units: the holding's basis per unit times the
+// line's balance, never more than the whole holding.
+function basisFor(h, balance) {
+  if (!h) return 0;
+  if (!(h.qty > 0)) return h.basis;
+  return h.basis * Math.min(1, balance / h.qty);
 }
 
 function parseCsvLine(line) {
@@ -184,7 +202,7 @@ function parseCsvLine(line) {
 
 const csvField = (v) => { const s = String(v == null ? '' : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
 
-module.exports = { sellIntoBook, sellIntoAmm, poolSides, lpShare, recommend, readHoldings, parseCsvLine, LP_RE };
+module.exports = { sellIntoBook, sellIntoAmm, poolSides, lpShare, recommend, readHoldings, basisFor, parseCsvLine, LP_RE };
 
 // ─────────────────────────────────────────────────────────────────────────
 if (require.main === module) main().catch((e) => { console.error('\n' + (e && e.message || e)); process.exit(1); });
@@ -193,13 +211,14 @@ async function main() {
   const { parseArgs, openCache, decodeCurrency, nonNativeLegs } = require('./iou-inventory');
   const ledger = require(path.join(__dirname, '..', 'ledger-rpc.js'));
 
-  const prefixes = []; let holdingsFile = null, keepXrp = 5;
+  const prefixes = []; let holdingsFile = null, keepXrp = 5, minSell = 1;
   const rest = [];
   for (let i = 0; i < process.argv.length; i++) {
     const a = process.argv[i];
     if (a === '--wallet') { prefixes.push(String(process.argv[++i] || '')); continue; }
     if (a === '--holdings') { holdingsFile = String(process.argv[++i] || ''); continue; }
     if (a === '--keep-xrp') { keepXrp = num(process.argv[++i]) || 5; continue; }
+    if (a === '--min-sell') { minSell = num(process.argv[++i]); continue; }
     rest.push(a);
   }
   const args = parseArgs(rest);
@@ -313,8 +332,7 @@ async function main() {
       const rc = recv.get(issuer + '|' + cur);
       r.received = rc ? rc.n : 0;
       r.lastReceived = rc && rc.last ? String(rc.last).replace(' ', 'T') + 'Z' : null;
-      const hb = holdings.has(W + '|' + cur.toUpperCase()) ? holdings.get(W + '|' + cur.toUpperCase()) : null;
-      r.basisUsd = holdingsFile ? (hb == null ? 0 : hb) : null;
+      r.basisUsd = holdingsFile ? basisFor(holdings.get(W + '|' + cur.toUpperCase()), r.balance) : null;
 
       if (lp && chain === 'XRPL') {
         const a = await call('amm_info', { amm_account: issuer, ledger_index: 'validated' });
@@ -329,7 +347,7 @@ async function main() {
         }
         r.proceeds = Math.max(r.bookXrp, r.ammXrp);
       }
-      Object.assign(r, recommend(r, { keepXrp, reserveInc }));
+      Object.assign(r, recommend(r, { keepXrp, reserveInc, minSell }));
       rows.push(r);
     }
 
