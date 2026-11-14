@@ -58,7 +58,7 @@ test('only read-only methods are accepted', () => {
   for (const m of ['submit', 'sign', 'sign_for', 'submit_multisigned', 'wallet_propose', 'channel_authorize', 'stop', 'ledger_accept', '']) {
     assert.throws(() => rpc.validateRequest({ chain: 'XRPL', method: m, params: {} }), /not allowed/, m);
   }
-  for (const m of ['account_info', 'account_lines', 'account_objects', 'account_tx', 'amm_info', 'ledger']) {
+  for (const m of ['account_info', 'account_lines', 'account_objects', 'account_tx', 'amm_info', 'book_offers', 'ledger']) {
     assert.ok(rpc.validateRequest({ chain: 'XRPL', method: m, params: {} }));
   }
 });

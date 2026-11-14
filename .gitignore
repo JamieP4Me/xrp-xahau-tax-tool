@@ -65,3 +65,4 @@ Price-Sources-Needed.csv
 # ledger sweep of affected-only transactions - wallet addresses
 Affected-*.csv
 Bridge-*.csv
+Trustlines-*.csv

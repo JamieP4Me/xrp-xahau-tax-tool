@@ -115,7 +115,13 @@ let PAUSE_MS = 1200;           // between requests; lowered on a paid endpoint
 // project ever persists a Payment-Claim, and this is no exception.
 const PAYMENT_CLAIM = process.env.DHALI_PAYMENT_CLAIM || '';
 const PAID = !!PAYMENT_CLAIM;
-if (PAID) PAUSE_MS = 120;      // an order of magnitude faster, still polite
+// The claim is for Dhali and goes to Dhali ONLY. Until 2026-11-14 it was sent
+// as a header to whatever RPC_URL was — xrplcluster.com or xahau.network
+// included — whenever DHALI_PAYMENT_CLAIM happened to be exported in the
+// shell. Being exported is not the same as being meant for this server.
+const isDhaliUrl = (u) => /^https:\/\/run\.api\.dhali\.io\//i.test(String(u || ''));
+const paidHere = () => PAID && isDhaliUrl(RPC_URL);
+if (paidHere()) PAUSE_MS = 120; // an order of magnitude faster, still polite
 const MAX_RETRIES = 6;
 const RATE_LIMIT_ERRORS = new Set(['tooBusy', 'slowDown', 'noNetwork', 'noCurrent', 'tooManyRequests']);
 
@@ -137,7 +143,7 @@ async function rpc(method, params) {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       const headers = { 'Content-Type': 'application/json' };
-      if (PAID) headers['Payment-Claim'] = PAYMENT_CLAIM;
+      if (paidHere()) headers['Payment-Claim'] = PAYMENT_CLAIM;
       const res = await fetch(RPC_URL, {
         method: 'POST',
         headers,
@@ -655,7 +661,7 @@ async function reconcileAmm(dbPath, walletFilter, limit, csvPath) {
   if (walletFilter) targets = targets.filter((w) => w.wallet === walletFilter);
   else if (limit) targets = targets.slice(0, limit);
 
-  console.log(`\nAMM reconciliation — ${CHAIN} · ${RPC_URL}${PAID ? ' (paid)' : ''}`);
+  console.log(`\nAMM reconciliation — ${CHAIN} · ${RPC_URL}${paidHere() ? ' (paid)' : ''}`);
 
   // ── Plan the run before starting it ──
   //
@@ -1102,6 +1108,8 @@ async function main() {
   }
   // An explicit --endpoint always wins over the per-chain default.
   if (args.endpoint) RPC_URL = args.endpoint;
+  PAUSE_MS = paidHere() ? 120 : 1200;
+  if (PAID && !paidHere()) console.error('Note: DHALI_PAYMENT_CLAIM is set but the endpoint is not Dhali, so the claim is NOT sent and the public pace applies.');
 
   if (args.inspect) {
     console.log(`Cache: ${args.db}`);
@@ -1338,7 +1346,7 @@ async function main() {
 
 // Exported for the unit tests — the network path cannot be tested offline,
 // but the balance-delta arithmetic is the part that can silently be wrong.
-module.exports = { rpc, ammMode, AMM_FLAGS, xrpDeltaFor, feeXrp, rippleTimeToIso, toSecond, cachedAmountXrp, REAL_HASH, DOUBLED_HASH, ledgerHashOf, decodeDoubled, retryHintMs, RATE_LIMIT_ERRORS, DUST_MIN_UNITS, reconcileAmm, parseArgs, PAID };
+module.exports = { rpc, paidHere, isDhaliUrl, ammMode, AMM_FLAGS, xrpDeltaFor, feeXrp, rippleTimeToIso, toSecond, cachedAmountXrp, REAL_HASH, DOUBLED_HASH, ledgerHashOf, decodeDoubled, retryHintMs, RATE_LIMIT_ERRORS, DUST_MIN_UNITS, reconcileAmm, parseArgs, PAID };
 
 if (require.main === module) {
   main().catch((e) => { console.error('\nverify-xrpl failed: ' + (e && e.stack ? e.stack : e)); process.exit(1); });

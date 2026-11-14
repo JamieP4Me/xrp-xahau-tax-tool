@@ -32,7 +32,7 @@
 
 const fs = require('fs');
 const { parseArgs, openCache } = require('./iou-inventory');
-const { rpc, xrpDeltaFor, feeXrp, rippleTimeToIso, ledgerHashOf, PAID } = require('./verify-xrpl');
+const { rpc, xrpDeltaFor, feeXrp, rippleTimeToIso, ledgerHashOf, PAID, paidHere } = require('./verify-xrpl');
 
 let prefix = '', out = null;
 const argv = [];
@@ -63,10 +63,14 @@ for (const r of db.prepare("SELECT tx_hash FROM raw_transactions WHERE chain = '
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const PAUSE_MS = PAID ? 120 : 1200;
+// Paid only when the endpoint really is Dhali (XRPL_RPC=https://run.api.dhali.io/<id>/).
+// A claim in the environment with the public endpoint is not sent anywhere.
+const PAID_HERE = paidHere();
+const PAUSE_MS = PAID_HERE ? 120 : 1200;
 
 (async () => {
-  console.log(`wallet ${W}  endpoint ${PAID ? 'Dhali (paid)' : 'xrplcluster.com (public, slow)'}  cache ${args.db}`);
+  console.log(`wallet ${W}  endpoint ${PAID_HERE ? 'Dhali (paid)' : 'public (slow)'}  cache ${args.db}`);
+  if (PAID && !PAID_HERE) console.log('Note: DHALI_PAYMENT_CLAIM is set but XRPL_RPC is not a Dhali URL, so the claim is NOT sent.');
   console.log(`cache holds ${cached.size} ledger hashes for this wallet` + (synthetic ? ` (+${synthetic} synthetic ids, unmatchable)` : '') + '\n');
 
   const info = await rpc('account_info', { account: W, ledger_index: 'validated' });

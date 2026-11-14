@@ -354,12 +354,40 @@ test('paid mode only changes pacing, never what is verified', () => {
   const src = fs.readFileSync(require.resolve('../scripts/verify-xrpl'), 'utf8');
   // PAID may gate the header and the delay. If it ever gates a comparison,
   // a paid run and a free run would produce different findings.
-  const gated = src.match(/if \(PAID\)[^\n]*/g) || [];
-  assert.ok(gated.length > 0, 'PAID should gate something');
+  // Paid mode is decided by paidHere() (claim present AND endpoint is Dhali).
+  // It may gate the header, the delay and the banner — nothing else.
+  const gated = [...(src.match(/if \((?:PAID|paidHere\(\))[^\n]*/g) || []),
+                 ...(src.match(/[^\n]*paidHere\(\) \?[^\n]*/g) || [])];
+  assert.ok(gated.length > 0, 'paid mode should gate something');
   for (const line of gated) {
-    assert.ok(/PAUSE_MS|Payment-Claim/.test(line),
-      'PAID must only affect pacing and the auth header, not verification: ' + line);
+    assert.ok(/PAUSE_MS|Payment-Claim|console\.(log|error)/.test(line),
+      'paid mode must only affect pacing, the auth header and the banner, not verification: ' + line);
   }
+});
+
+test('the Payment-Claim goes to a Dhali endpoint only, never to a public node', () => {
+  // Until 2026-11-14 the header went to whatever RPC_URL was whenever the
+  // claim happened to be exported. Run the real rpc() in a child process with
+  // a fake fetch and look at what would have been sent where.
+  const { execFileSync } = require('child_process');
+  const probe = `
+    const sent = [];
+    globalThis.fetch = async (url, o) => { sent.push({ url, claim: o.headers['Payment-Claim'] || null });
+      return { status: 200, ok: true, headers: { get: () => null }, json: async () => ({ result: { ledger_index: 1 } }) }; };
+    const v = require(${JSON.stringify(require.resolve('../scripts/verify-xrpl'))});
+    v.rpc('ledger', {}).then(() => { process.stdout.write(JSON.stringify({ paid: v.paidHere(), sent })); });`;
+  const run = (env) => JSON.parse(execFileSync(process.execPath, ['-e', probe],
+    { env: { PATH: process.env.PATH, DHALI_PAYMENT_CLAIM: 'TEST-CLAIM', ...env }, encoding: 'utf8' }));
+  const pub = run({});
+  assert.strictEqual(pub.paid, false);
+  assert.strictEqual(pub.sent[0].claim, null, 'claim sent to the public cluster');
+  const xah = run({ XRPL_RPC: 'https://xahau.network/' });
+  assert.strictEqual(xah.sent[0].claim, null, 'claim sent to xahau.network');
+  const lookalike = run({ XRPL_RPC: 'https://run.api.dhali.io.example.com/x/' });
+  assert.strictEqual(lookalike.sent[0].claim, null, 'claim sent to a look-alike host');
+  const dhali = run({ XRPL_RPC: 'https://run.api.dhali.io/00000000-0000-0000-0000-000000000000/' });
+  assert.strictEqual(dhali.paid, true);
+  assert.strictEqual(dhali.sent[0].claim, 'TEST-CLAIM');
 });
 
 test('the database is still opened readonly on the --amm path', () => {

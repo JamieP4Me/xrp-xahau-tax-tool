@@ -51,6 +51,7 @@ const READ_ONLY_METHODS = new Set([
   'account_objects',
   'account_tx',
   'amm_info',
+  'book_offers',
   'ledger',
   'server_info',
 ]);
