@@ -2393,7 +2393,7 @@ const UNVALUED_REASON = {
   PaymentChannelCreate: 'payment channel funded — locked, not yet transferred',
   PaymentChannelFund:   'payment channel topped up — locked, not yet transferred',
   PaymentChannelClaim:  'payment channel claimed — this is where value actually moves',
-  Remit:                'Xahau multi-purpose transfer — the nested payload IS now read: native XAH legs are counted above, and token legs are itemised under “assets moved” below. The tokens are not booked, because an LP receipt token’s basis is the value of what was deposited to get it, and that lives in a separate transaction this one does not name',
+  Remit:                'Xahau multi-purpose transfer — its XAH and EVR legs ARE booked, exactly like a Payment between the same addresses (since 1.10.12); listed here only for its other token legs, itemised under “assets moved” below. Those are not booked, because an LP receipt token’s basis is the value of what was deposited to get it, and that lives in a separate transaction this one does not name',
   Import:               'XRP burned on XRPL, XAH minted on Xahau',
   URITokenBuy:          'URIToken purchased — consideration when priced',
 };
@@ -2444,7 +2444,7 @@ function recordUnvalued(chain, wallet, row, txId, dk, dateStr, yr, knownQty, kno
     // type but Remit today. Without it the table reports "no amount" on ~140
     // rows that moved real quantities of real tokens -- true of XAH, and
     // thoroughly misleading about the transaction.
-    legs: t === 'Remit' ? remitLegs(row.Amounts).tokens : [],
+    legs: t === 'Remit' ? remitLegs(row.Amounts).tokens.filter(l => !isEvrCurrency(l.currency)) : [],
     amountSrc: measured ? 'ledger' : (knownQty != null ? 'windb' : ''),
     submitted: measured && imported.submitted != null ? imported.submitted : null,
     reason: noXrpLeg
@@ -3641,6 +3641,7 @@ function resetLedgerState() {
   bookingJournal.clear();
   dailyJournal.clear();
   journalBuildInfo = null;
+  Object.keys(remitBooked).forEach(k => { remitBooked[k] = 0; });
 }
 
 // Everything resetLedgerState() clears, captured and put back. The treatment
@@ -3671,6 +3672,7 @@ function snapshotLedgerState(opts = {}) {
     rowsSkippedStaleType, ammLedgerUsed, ammLedgerMissing, ammLedgerUplift, ammNoXrpLeg,
     ammBookedDeposits, ammBookedWithdrawals, ammSkippedUnverified, ammBookedDepositQty, ammBookedWithdrawQty,
     bookingJournal: c(bookingJournal), journalBuildInfo: c(journalBuildInfo), dailyJournal: c(dailyJournal),
+    remitBooked: c(remitBooked),
   };
 }
 function restoreLedgerState(snap, opts = {}) {
@@ -3701,6 +3703,7 @@ function restoreLedgerState(snap, opts = {}) {
   ammBookedDepositQty = snap.ammBookedDepositQty; ammBookedWithdrawQty = snap.ammBookedWithdrawQty;
   for(const [k, v] of c(snap.bookingJournal || new Map())) bookingJournal.set(k, v);
   for(const [k, v] of c(snap.dailyJournal || new Map())) dailyJournal.set(k, v);
+  Object.assign(remitBooked, c(snap.remitBooked || {}));
   journalBuildInfo = c(snap.journalBuildInfo || null);
   syncTaxYearSelects();
   applyReportingYear(taxYear());
@@ -4416,6 +4419,16 @@ function dataQualityHTML() {
       large relative to your real activity.
     </div>`);
   }
+  if(remitBooked.legs) {
+    parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#eef5ff;border:1px solid #9bb8e0;border-radius:4px;font-size:11px;color:#1a3a6a">
+      <strong>${remitBooked.legs.toLocaleString()} Remit leg(s) booked like Payments</strong> (since 1.10.12):
+      ${fmt(remitBooked.xahOut, 4)} XAH and ${fmt(remitBooked.evrOut, 4)} EVR sent, ${fmt(remitBooked.xahIn, 4)} XAH and ${fmt(remitBooked.evrIn, 4)} EVR received.
+      Sent to your own wallets they are transfers; sent anywhere else — an onexah pool included — they are disposals, marked “(Remit)” on Form 8949,
+      exactly as a Payment to the same address already was. XAH received by Remit is an acquisition at that day's price; EVR received by Remit is booked at
+      that day's price but <b>not</b> as income, because it comes back from a pool, not as an Evernode reward. Remit's other tokens (LP receipts and the like)
+      are still not booked and stay on the “not on Form 8949” list.
+    </div>`);
+  }
   if(typeof onchainQualityHTML === 'function') parts.push(onchainQualityHTML());
   return parts.join('');
 }
@@ -4450,6 +4463,83 @@ function makeXahauPriceHelpers() {
 // logic can also be driven by processMergedXahauEntries() below, one global
 // timestamp-sorted row at a time across ALL selected wallets at once — see
 // that function's comment for why that matters.
+// EVR as a Remit token leg: the code is "EVR", or its 40-hex form.
+function isEvrCurrency(c) {
+  const s = String(c || '').trim().toUpperCase();
+  if(s === 'EVR') return true;
+  return /^4556520{34}$/.test(s);
+}
+
+// What the Remit legs booked, for the disclosure on the 8949 tab.
+const remitBooked = { legs: 0, xahOut: 0, xahIn: 0, evrOut: 0, evrIn: 0 };
+
+// One XAH or EVR movement between src and dest, from `wallet`'s perspective.
+// This is the Payment branch as it always was, lifted out so a Remit leg is
+// booked by the very same rules: an internal transfer carries basis and
+// dates; a lost wallet drains without a sale; a gift is a gift; anything else
+// leaving is a disposal; arriving from outside is an acquisition. The one
+// deliberate difference for kind 'remit': EVR arriving by Remit is booked at
+// market value but NOT as income — it comes back from a pool or a protocol
+// address, which is a withdrawal, not an Evernode reward.
+function bookXahauLeg(c, t, q, kind) {
+  const { row, wallet, src, dest, ownSrc, ownDest, dk, ds, yr, hash, xahAirdrop, getEH, getEL, getXH, getXL } = c;
+  const isEVR = t === 'EVR';
+  if(!dustOk(t, q)) return;
+  // Flow accounting runs regardless of how the movement is classified — see
+  // walletFlowStats. It is what identifies a shared service address.
+  if(src === wallet) recordFlow(wallet, 'out', t, q, dest, dk, yr);
+  else if(dest === wallet) recordFlow(wallet, 'in', t, q, src, dk, yr);
+  if((src === wallet || dest === wallet) && !isInternalShuffle(src, dest, ownSrc, ownDest)) {
+    const hi = isEVR ? getEH(dk) : getXH(dk);
+    const lo = isEVR ? getEL(dk) : getXL(dk);
+    recordMyVolume(t, q, dk, (hi > 0 && lo > 0) ? (hi + lo) / 2 : 0);
+  }
+  const hi = isEVR ? getEH(dk) : getXH(dk), lo = isEVR ? getEL(dk) : getXL(dk);
+  if(src === wallet) {
+    if(kind === 'remit') { remitBooked.legs++; if(isEVR) remitBooked.evrOut += q; else remitBooked.xahOut += q; }
+    if(ownDest) {
+      // Internal transfer — always consume + carry over basis AND the
+      // original acquisition date(s), no year gate.
+      ledgerTransferIn(wallet, dest, t, q);
+    } else if(isLostSpend(wallet, dk)) {
+      // Involuntary outflow from a wallet whose keys are gone. Checked BEFORE
+      // gift and disposal: nothing was sold or given. See pushLostSpend().
+      pushLostSpend(wallet, t, q, dk, ds, yr, hash, hi, dest);
+    } else if(isGiftAddress(dest)) {
+      // Gift out — consumes the lots, but is not a disposal.
+      const rcpt = (giftEntry(dest)||{}).recipient;
+      pushGift(wallet, t, q, dk, ds, yr, hash, hi, rcpt, dest);
+    } else {
+      // External disposal — pushDisposal handles FIFO consumption AND splits
+      // into short-term (Box I) / long-term (Box L) automatically.
+      pushDisposal(wallet, t, q, dk, ds, yr, hash, hi, lo, kind === 'remit' ? ' (Remit)' : '', dest);
+    }
+  }
+  // Coins arriving FROM an address marked "mine" but never fetched — a
+  // withdrawal from your own exchange account. Routed through
+  // ledgerTransferIn so deposited coins come back with their original basis,
+  // and anything beyond that takes the market price (disclosed).
+  if(dest === wallet && ownSrc && isTransferOnly(src)) {
+    if(kind === 'remit') { remitBooked.legs++; if(isEVR) remitBooked.evrIn += q; else remitBooked.xahIn += q; }
+    // Deliberately NOT income: moving your own coins is not a reward.
+    ledgerTransferIn(src, wallet, t, q, { unitCost: isEVR ? getEH(dk) : (getXH(dk)||xahAirdrop), date: dk });
+  } else if(dest === wallet && !ownSrc) {
+    if(kind === 'remit') { remitBooked.legs++; if(isEVR) remitBooked.evrIn += q; else remitBooked.xahIn += q; }
+    // External inbound = acquisition
+    if(isEVR) {
+      const unitCost = getEH(dk);
+      if(kind === 'remit') {
+        ledgerAdd(wallet, 'EVR', dk, q, unitCost, 'remit_received');
+      } else {
+        ledgerAdd(wallet,'EVR',dk,q,unitCost,'reward');
+        allIncomeRows.push({wallet,dateStr:ds,dk,year:yr,qty:q,fmv:q*unitCost,ticker:'EVR',txHash:hash,description:`${q.toFixed(4)} EVR ${row._affected ? 'lease income' : 'reward'}`});
+      }
+    } else {
+      ledgerAdd(wallet,'XAH',dk,q,getXH(dk)||xahAirdrop, kind === 'remit' ? 'remit_received' : 'received');
+    }
+  }
+}
+
 function processOneXahauRow(row, wallet, walletSet, mode, helpers) {
   setBookingContext(row, wallet);
   const { xahAirdrop, getEH, getEL, getXH, getXL } = helpers;
@@ -4483,7 +4573,16 @@ function processOneXahauRow(row, wallet, walletSet, mode, helpers) {
   // Types the curated fetch now brings in but the engine does not book. They
   // are listed rather than silently dropped — see recordUnvalued().
   if(!VALUED_TYPES.has(type) && (src === wallet || dest === wallet)) {
-    recordUnvalued('Xahau', wallet, row, hash, dk, ds, yr, amountForRow(wallet, row), 'XAH');
+    if(type === 'Remit') {
+      // Its XAH and EVR legs are booked below; only the other tokens are
+      // listed — and a Remit whose payload cannot be read at all (a row cached
+      // before Amounts was fetched), so it is never silently dropped.
+      const rl = remitLegs(row.Amounts);
+      const unreadable = !(rl.native > 0) && rl.tokens.length === 0;
+      if(unreadable || rl.tokens.some(l => !isEvrCurrency(l.currency))) recordUnvalued('Xahau', wallet, row, hash, dk, ds, yr, null, null);
+    } else {
+      recordUnvalued('Xahau', wallet, row, hash, dk, ds, yr, amountForRow(wallet, row), 'XAH');
+    }
   }
 
   if(type === 'Payment') {
@@ -4491,98 +4590,22 @@ function processOneXahauRow(row, wallet, walletSet, mode, helpers) {
     const amtVal = parseFloat(row.delivered_amount_value ?? row.Amount_value ?? 0);
     const amtCur = (row.delivered_amount_currency ?? row.Amount_currency ?? '').toUpperCase().trim();
     const isEVR  = amtCur === 'EVR';
-    // Flow accounting runs regardless of how the payment is later classified —
-    // see walletFlowStats. It is what identifies a shared service address.
-    if(isEVR ? dustOk('EVR', amtVal) : dustOk('XAH', amtXAH)) {
-      const t = isEVR ? 'EVR' : 'XAH', q = isEVR ? amtVal : amtXAH;
-      if(src === wallet) recordFlow(wallet, 'out', t, q, dest, dk, yr);
-      else if(dest === wallet) recordFlow(wallet, 'in', t, q, src, dk, yr);
-      // Your own volume — see recordMyVolume(). Gated on the same dust test as
-      // the flow accounting above, and on this row being one side of a real
-      // boundary crossing so an internal shuffle is not counted twice.
-      if((src === wallet || dest === wallet) && !isInternalShuffle(src, dest, ownSrc, ownDest)) {
-        const hi = isEVR ? getEH(dk) : getXH(dk);
-        const lo = isEVR ? getEL(dk) : getXL(dk);
-        recordMyVolume(t, q, dk, (hi > 0 && lo > 0) ? (hi + lo) / 2 : 0);
-      }
-    }
+    const c = { row, wallet, src, dest, ownSrc, ownDest, dk, ds, yr, hash, xahAirdrop, getEH, getEL, getXH, getXL };
+    bookXahauLeg(c, isEVR ? 'EVR' : 'XAH', isEVR ? amtVal : amtXAH, 'payment');
+  }
 
-    if(src === wallet) {
-      if(ownDest) {
-        // Internal transfer — always consume + carry over basis AND the
-        // original acquisition date(s), no year gate.
-        if(isEVR && dustOk('EVR', amtVal)) {
-          ledgerTransferIn(wallet, dest, 'EVR', amtVal);
-        } else if(dustOk('XAH', amtXAH)) {
-          ledgerTransferIn(wallet, dest, 'XAH', amtXAH);
-        }
-      } else if(isLostSpend(wallet, dk)) {
-        // Involuntary outflow from a wallet whose keys are gone. Checked
-        // BEFORE gift and disposal: the user neither sold nor gave anything
-        // away, and received nothing for it. See pushLostSpend().
-        if(isEVR && dustOk('EVR', amtVal)) {
-          pushLostSpend(wallet, 'EVR', amtVal, dk, ds, yr, hash, getEH(dk), dest);
-        } else if(dustOk('XAH', amtXAH)) {
-          pushLostSpend(wallet, 'XAH', amtXAH, dk, ds, yr, hash, getXH(dk), dest);
-        }
-      } else if(isGiftAddress(dest)) {
-        // Gift out — consumes the lots, but is not a disposal. Checked
-        // BEFORE the external-disposal branch, and kept out of the owned
-        // set, because a gift is neither a sale nor still yours.
-        const rcpt = (giftEntry(dest)||{}).recipient;
-        if(isEVR && dustOk('EVR', amtVal)) {
-          pushGift(wallet, 'EVR', amtVal, dk, ds, yr, hash, getEH(dk), rcpt, dest);
-        } else if(dustOk('XAH', amtXAH)) {
-          pushGift(wallet, 'XAH', amtXAH, dk, ds, yr, hash, getXH(dk), rcpt, dest);
-        }
-      } else {
-        // External disposal — pushDisposal handles FIFO consumption AND
-        // splits into short-term (Box I) / long-term (Box L) automatically
-        if(isEVR && dustOk('EVR', amtVal)) {
-          pushDisposal(wallet, 'EVR', amtVal, dk, ds, yr, hash, getEH(dk), getEL(dk), '', dest);
-        } else if(dustOk('XAH', amtXAH)) {
-          pushDisposal(wallet, 'XAH', amtXAH, dk, ds, yr, hash, getXH(dk), getXL(dk), '', dest);
-        }
-      }
-    }
-
-    // Coins arriving FROM an address marked "mine" but never fetched — i.e. a
-    // withdrawal from your own exchange account.
-    //
-    // This branch has to exist separately, and getting it wrong is expensive.
-    // The old guard was `dest === wallet && !ownSrc`, and marking an exchange
-    // address as yours makes ownSrc TRUE — so the arrival matched nothing at
-    // all and the coins never entered the ledger. There is no outbound side to
-    // have handled it either, because the address is never fetched. Every coin
-    // withdrawn from that exchange silently lost its basis, and the eventual
-    // sale was then computed at $0 basis, short-term: the maximum possible tax,
-    // caused by correctly marking an address as your own.
-    //
-    // Routing it through ledgerTransferIn does both halves properly. Coins you
-    // had deposited come back carrying their ORIGINAL basis and acquisition
-    // dates (so the holding period tacks and a round trip is a no-op), and
-    // anything beyond that — coins you actually bought on the exchange — takes
-    // the market price on the arrival date, recorded in inferredBasisRows so
-    // it is disclosed rather than assumed.
-    if(dest === wallet && ownSrc && isTransferOnly(src)) {
-      if(isEVR && dustOk('EVR', amtVal)) {
-        // Deliberately NOT income: a withdrawal from your own exchange
-        // account is not an Evernode reward, and booking it as one would
-        // invent ordinary income out of moving your own coins.
-        ledgerTransferIn(src, wallet, 'EVR', amtVal, { unitCost: getEH(dk), date: dk });
-      } else if(dustOk('XAH', amtXAH)) {
-        ledgerTransferIn(src, wallet, 'XAH', amtXAH, { unitCost: getXH(dk)||xahAirdrop, date: dk });
-      }
-    } else if(dest === wallet && !ownSrc) {
-      // External inbound = acquisition — always add lot + record income row
-      if(isEVR && dustOk('EVR', amtVal)) {
-        const unitCost = getEH(dk);
-        ledgerAdd(wallet,'EVR',dk,amtVal,unitCost,'reward');
-        allIncomeRows.push({wallet,dateStr:ds,dk,year:yr,qty:amtVal,fmv:amtVal*unitCost,ticker:'EVR',txHash:hash,description:`${amtVal.toFixed(4)} EVR ${row._affected ? 'lease income' : 'reward'}`});
-      } else if(dustOk('XAH', amtXAH)) {
-        ledgerAdd(wallet,'XAH',dk,amtXAH,getXH(dk)||xahAirdrop,'received');
-      }
-    }
+  // A Remit is a multi-asset payment. Its XAH and EVR legs are booked exactly
+  // as a Payment of the same asset between the same two addresses would be
+  // (1.10.12). Until then they were only listed, so XAH sent by Remit into an
+  // onexah pool never left the app's books — measured on the main account:
+  // 22,790 XAH across 45 days — while the same deposit made by Payment was
+  // booked as a sale. Token legs (XXX, RVN, LP receipts) stay listed, unbooked.
+  if(type === 'Remit') {
+    const legs = remitLegs(row.Amounts);
+    const c = { row, wallet, src, dest, ownSrc, ownDest, dk, ds, yr, hash, xahAirdrop, getEH, getEL, getXH, getXL };
+    if(legs.native > 0) bookXahauLeg(c, 'XAH', legs.native, 'remit');
+    const evr = legs.tokens.filter(l => isEvrCurrency(l.currency)).reduce((sum, l) => sum + l.qty, 0);
+    if(evr > 0) bookXahauLeg(c, 'EVR', evr, 'remit');
   }
 
   if(type === 'OfferCreate' && src === wallet) {

@@ -425,7 +425,8 @@ test('WinDB: the check reads end-of-day balances, newest row by ledger, and flag
     const r = await runOnchainCheck();
     return { source: r.source, pin: r.pins.XRPL, errors: r.errors,
       rows: r.rows.map((x) => ({ w: x.wallet.slice(0, 13), t: x.ticker, app: x.app, ledger: x.ledger, v: x.variance, st: x.status })),
-      batched: window.__sql.some((q) => q.includes(`IN ('rTESTonchainA11111111111111111111','rTESTonchainC11111111111111111111')`)),
+      batched: window.__sql.some((q) => /IN \('r[^']+','r[^']+'/.test(q)),
+      status: _onchainStatus,
       argmax: window.__sql.filter((q) => q.includes('argMax')).length,
       claimInSql: window.__sql.some((q) => q.includes('TEST-CLAIM')) };
   });
@@ -515,4 +516,17 @@ test('the day-by-day arithmetic adds up whatever the shape of the history', asyn
   expect(out.first).toBe(9);
   expect(out.total).toBeCloseTo(out.finalDiff, 9);
   expect(out.finalDiff).toBeCloseTo(6 - 3.5, 9);
+});
+
+test('a fetched wallet is checked on both chains even without a sync record for one of them', async () => {
+  const out = await window.evaluate(async ({ A, D }) => {
+    // D is fetched (in WALLETS) and holds XRP, but has no XRPL sync record.
+    if (!WALLETS.includes(D)) WALLETS.push(D);
+    processOneXRPLRow({ TransactionType: 'Payment', TransactionResult: 'tesSUCCESS', Account: 'rTESTonchainOther111111111111111', Destination: D,
+      Timestamp: '2025-06-01 00:00:00', TransactionHash: '', Amount_XRP: '42', delivered_amount_XRP: '42' }, D, new Set([A, D]), 'in', makeXrplPriceHelpers());
+    const r = await runOnchainCheck();
+    return { checked: r.rows.some((x) => x.wallet === D && x.ticker === 'XRP'), notChecked: (r.notChecked || []).some((n) => n.wallet === D) };
+  }, { A, D: 'rTESTonchainD11111111111111111111' });
+  expect(out.checked).toBe(true);
+  expect(out.notChecked).toBe(false);
 });

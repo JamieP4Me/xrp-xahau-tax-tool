@@ -232,6 +232,11 @@ async function onchainPinTimes() {
       out[chain] = null;
     }
   }
+  // One download fetches both chains, so a chain with no sync record of its
+  // own (the XRPL side of caches from before 1.10.8, measured) uses the
+  // other chain's comparison day rather than being skipped.
+  if (!out.XRPL && out.Xahau) out.XRPL = Object.assign({}, out.Xahau, { source: out.Xahau.source + ' (shared with Xahau)' });
+  if (!out.Xahau && out.XRPL) out.Xahau = Object.assign({}, out.XRPL, { source: out.XRPL.source + ' (shared with XRPL)' });
   return out;
 }
 
@@ -566,13 +571,23 @@ async function runOnchainCheck(opts = {}) {
     }
 
     // 2. Which wallets, on which chain.
+    // Every fetched wallet on BOTH chains: the download pulls both for every
+    // wallet. Built from sync records alone, a cache whose XRPL side had none
+    // checked no XRPL wallet at all and listed them as "not checked".
     const pairs = [];
     const lastSync = {};
+    const seen = new Set();
+    const addPair = (wallet, chain) => {
+      const k = wallet + '|' + chain;
+      if (seen.has(k) || !ONCHAIN_ASSETS[chain] || !isFetchableOwnWallet(wallet)) return;
+      seen.add(k); pairs.push({ wallet, chain });
+    };
     for (const r of snap.sync) {
-      if (!isFetchableOwnWallet(r.wallet) || !ONCHAIN_ASSETS[r.chain]) continue;
-      pairs.push({ wallet: r.wallet, chain: r.chain });
-      lastSync[r.wallet + '|' + r.chain] = r.last_synced_at || null;
+      addPair(r.wallet, r.chain);
+      if (ONCHAIN_ASSETS[r.chain]) lastSync[r.wallet + '|' + r.chain] = r.last_synced_at || null;
     }
+    const fetchable = [...new Set([...(typeof WALLETS !== 'undefined' ? WALLETS : []), ...(typeof lostWallets !== 'undefined' ? lostWallets.map((e) => e.addr) : [])])];
+    for (const w of fetchable) { addPair(w, 'XRPL'); addPair(w, 'Xahau'); }
     const checked = new Set(pairs.map((p) => p.wallet + '|' + p.chain));
     const notChecked = [];
     for (const [k, v] of Object.entries(snap.app.qty)) {

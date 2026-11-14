@@ -1170,3 +1170,25 @@ beside the current state (`accounts`, `token_balances`), so:
   public full-history server is still one click away.
 - Escrows and payment channels are not in WinDB's balance tables; the public
   server source still counts them.
+
+
+## Remits are booked like Payments (1.10.12)
+
+A Remit is Xahau's multi-asset payment. Until 1.10.12 its legs were listed but
+not booked, so XAH sent by Remit into an onexah pool stayed on the app's books
+while the same deposit made by Payment was booked as a sale. The on-chain check
+measured the effect on one wallet: 22,790 XAH across 45 days.
+
+Now a Remit's **XAH and EVR legs** go through exactly the rules a Payment
+between the same two addresses uses: to your own wallet, a transfer that
+carries basis and dates; from a lost wallet, drainage; to a gift address, a
+gift; to anyone else (a pool included), a disposal marked "(Remit)" on Form
+8949; from outside, an acquisition at that day's price. One deliberate
+difference: **EVR received by Remit is not income** — it comes back from a pool
+or protocol address, which is a withdrawal, not an Evernode reward. Remit's
+other tokens (LP receipts, XXX, RVN …) are still not booked and stay on the
+"not on Form 8949" list. All Remits on record are from June 2026 onward, so
+only the 2026 figures move.
+
+The on-chain check now covers every fetched wallet on **both** chains; a cache
+without XRPL sync records had checked no XRPL wallet at all.
