@@ -114,7 +114,7 @@ test('every export that reads the live arrays waits for the lock, and queues its
   // lock frees (see runAfterLedger), instead of an alert asking to try again.
   // Either way the export's first act is to check the lock.
   for (const n of ['exportCSV', 'exportUnvaluedCSV', 'exportIncome', 'exportAllTx', 'exportKoinlyCSV',
-    'exportCoinLedgerCSV', 'exportWalletActivityCSV', 'exportLostWalletCSV', 'exportGiftsCSV', 'exportHoldingsPDF',
+    'exportCoinLedgerCSV', 'exportWalletActivityCSV', 'exportLostWalletCSV', 'exportGiftsCSV', 'exportGiftLotsCSV', 'exportHoldingsPDF',
     'exportExchangeBasisCSV', 'exportHoldingsCSV', 'exportDestinationsCSV', 'exportLedger']) {
     const re = new RegExp('function ' + n + '\\(\\) ?\\{\\n  if\\(ledgerBusy\\(\\(\\) => ' + n + '\\(\\), \'[^\']+\'\\)\\) return;');
     assert.ok(re.test(html), n + ' does not check ledgerBusy() first, queuing itself');

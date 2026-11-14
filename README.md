@@ -1192,3 +1192,30 @@ only the 2026 figures move.
 
 The on-chain check now covers every fetched wallet on **both** chains; a cache
 without XRPL sync records had checked no XRPL wallet at all.
+
+## Gift statements, lot by lot (1.10.13)
+
+A gift used to carry one basis figure and one "earliest lot" date. That is not
+enough when a gift is made of several lots: a 10,000 XRP gift can be part
+$0.48 lots from 2024 and part $2.90 lots from late 2025, long-term and
+short-term in the same transfer.
+
+Each gift now keeps every lot it consumed (quantity, the date you acquired it,
+your cost, and how you acquired it), and the gift panel offers:
+
+- **Gift Lots CSV**: one row per lot, for every recipient.
+- **Statement for <recipient> (PDF)**: one per recipient, to hand to them. For
+  each gift and lot it gives their basis for a gain, their basis for a loss,
+  and the date after which a sale is long-term for each.
+
+Two rules are applied per lot:
+
+- **Basis for a loss** is the lesser of your cost and the lot's value on the
+  gift date, lot by lot (§1015). Before, it was taken on the gift's totals,
+  which let cheap and expensive lots average out. In the example above that
+  showed a $13,400 loss basis where the lot-by-lot figure is $8,240.
+- **Holding period** tacks on for a gain (§1223(2)). For the loss on a
+  dual-basis lot, it starts on the gift date.
+
+The summary table now shows both basis figures. Gift totals are unchanged
+except the loss basis, which can only go down.

@@ -38,11 +38,23 @@ What that means for privacy and safety:
   only https, only the hosts `xrplcluster.com`, `s2.ripple.com`,
   `xahau.network` and `run.api.dhali.io`, and only read-only methods
   (`account_info`, `account_lines`, `account_objects`, `account_tx`,
-  `amm_info`, `ledger`, `server_info`). Nothing in it can submit or sign.
+  `amm_info`, `book_offers`, `ledger`, `server_info`). Nothing in it can submit or sign.
 - **The Payment-Claim** is attached only when you set a Dhali server for the
   check, and only to `run.api.dhali.io`. It is never sent to the public
   servers, never logged, and never stored. `test/ledger-rpc.test.js` pins all
   of this.
+
+### The command-line scripts
+
+`scripts/verify-xrpl.js` and `scripts/xrp-bridge.js` used to send the
+Payment-Claim header to whichever node they were using, xrplcluster.com or
+xahau.network included, whenever `DHALI_PAYMENT_CLAIM` was exported. Since
+2026-11-14 they send it only when the endpoint is `https://run.api.dhali.io/…`.
+`test/verify-xrpl.test.js` runs the real request function against public,
+look-alike and Dhali endpoints to check this. If you ran either script with
+the claim exported and without a Dhali endpoint before that date, issue a
+fresh claim. `scripts/trustlines.js` goes through `ledger-rpc.js` and was
+never affected.
 
 ## Before you share a build or a working copy
 

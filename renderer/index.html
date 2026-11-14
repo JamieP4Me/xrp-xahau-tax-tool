@@ -3464,7 +3464,7 @@ function ledgerFIFODetailed(wallet, ticker, qty) {
       const lot = lots[j];
       if(lot.remaining <= 0) continue;
       const used = Math.min(rem, lot.remaining);
-      consumed.push({qty: used, unitCost: lot.unitCost, acqDate: lot.date});
+      consumed.push({qty: used, unitCost: lot.unitCost, acqDate: lot.date, source: lot.source || null});
       lot.remaining -= used;
       rem -= used;
     }
@@ -3486,7 +3486,7 @@ function ledgerFIFODetailed(wallet, ticker, qty) {
     // and the next transfer out finds an empty ledger. Recording it here is
     // what makes that chain visible — see basisShortfalls.
     basisShortfalls.push({ wallet, ticker, qty: rem });
-    consumed.push({qty: rem, unitCost: 0, acqDate: null});
+    consumed.push({qty: rem, unitCost: 0, acqDate: null, source: null});
   }
   journalRecord(wallet, ticker, 'used', qty - Math.max(rem, 0));
   if(rem > 0) journalRecord(wallet, ticker, 'short', rem);
@@ -3842,12 +3842,32 @@ const cents = (n) => {
 function pushGift(wallet, ticker, totalQty, dk, ds, yr, hash, priceH, recipient, addr) {
   if(!Number.isFinite(priceH)) { priceH = 0; missingPriceRows.push({ ticker, wanted: dk, usedInstead: null, field: 'high', price: 0 }); }
   const consumed = ledgerFIFODetailed(wallet, ticker, totalQty);
-  let basis = 0, ltQty = 0, stQty = 0, earliest = null;
+  // Kept lot by lot (1.10.13). The recipient's numbers belong to each LOT,
+  // not to the gift as a whole:
+  //   * basis for a gain  = your cost of that lot (IRC §1015(a), carryover);
+  //   * basis for a loss  = the lesser of that cost and the lot's value on
+  //     the gift date — applied per lot, because each unit is property in its
+  //     own right. Applying it to the gift's totals let expensive lots and
+  //     cheap lots average each other out: a 10,000 XRP gift made of $0.48 and
+  //     $2.90 lots, worth $1.34 on the day, showed a $13,400 loss basis when
+  //     the lot-by-lot figure is $8,240;
+  //   * holding period    = yours tacks on for a carried-over basis (§1223(2)),
+  //     but starts on the gift date when the gift-date value is the basis.
+  // A gift that mixes long- and short-term lots ("VARIOUS") cannot be filed
+  // from a single earliest date; the per-lot statement is what makes it usable.
+  let basis = 0, lossBasis = 0, ltQty = 0, stQty = 0, earliest = null, dual = false;
+  const lots = [];
   for(const c of consumed) {
     if(c.qty <= 0) continue;
-    basis += c.qty * c.unitCost;
-    if(isLongTerm(c.acqDate, dk)) ltQty += c.qty; else stQty += c.qty;
+    const lb = c.qty * c.unitCost, lf = c.qty * priceH;
+    const lt = isLongTerm(c.acqDate, dk);
+    basis += lb;
+    lossBasis += Math.min(lb, lf);
+    if(lf < lb) dual = true;
+    if(lt) ltQty += c.qty; else stQty += c.qty;
     if(c.acqDate && (!earliest || c.acqDate < earliest)) earliest = c.acqDate;
+    lots.push({ qty: c.qty, unitCost: c.unitCost, acqDate: c.acqDate || null, source: c.source || null,
+                basis: lb, fmv: lf, lossBasis: Math.min(lb, lf), dual: lf < lb, term: lt ? 'LT' : 'ST' });
   }
   allGiftRows.push({
     wallet, addr, recipient: recipient || '(unnamed)',
@@ -3856,13 +3876,14 @@ function pushGift(wallet, ticker, totalQty, dk, ds, yr, hash, priceH, recipient,
     price: priceH,
     fmv: totalQty * priceH,
     basis,
-    // Their basis if they later sell at a LOSS. Equal to your basis unless
-    // the coin was worth less than you paid on the day you gave it away.
-    lossBasis: Math.min(basis, totalQty * priceH),
-    dualBasis: (totalQty * priceH) < basis,
+    // Their basis if they later sell at a LOSS: the sum, lot by lot, of the
+    // lesser of your cost and the value on the gift date.
+    lossBasis,
+    dualBasis: dual,
     term: ltQty > 0 && stQty > 0 ? 'VARIOUS' : (ltQty > 0 ? 'LT' : 'ST'),
     earliestAcq: earliest ? fmtDate(new Date(earliest).getTime()) : '',
     txHash: hash,
+    lots,
   });
 }
 
@@ -8796,8 +8817,9 @@ function giftsByRecipientYear() {
   for(const g of allGiftRows) {
     const key = `${g.recipient}||${g.year}`;
     let e = out.get(key);
-    if(!e) { e = { recipient: g.recipient, year: g.year, fmv: 0, basis: 0, count: 0, tickers: new Set() }; out.set(key, e); }
-    e.fmv += g.fmv; e.basis += g.basis; e.count++; e.tickers.add(g.ticker);
+    if(!e) { e = { recipient: g.recipient, year: g.year, fmv: 0, basis: 0, lossBasis: 0, dual: false, count: 0, tickers: new Set() }; out.set(key, e); }
+    e.fmv += g.fmv; e.basis += g.basis; e.lossBasis += (g.lossBasis != null ? g.lossBasis : g.basis); e.dual = e.dual || !!g.dualBasis;
+    e.count++; e.tickers.add(g.ticker);
   }
   return [...out.values()].sort((a,b) => b.year - a.year || b.fmv - a.fmv);
 }
@@ -8816,6 +8838,13 @@ function giftSummaryHTML() {
     </div>
     <div class="row" style="margin-bottom:8px">
       <button class="sml" style="background:#4a1a6b;color:#fff;border-color:#4a1a6b" onclick="exportGiftsCSV()">⬇ Gift Log CSV (for Form 709)</button>
+      <button class="sml" style="background:#fff;color:#4a1a6b;border-color:#4a1a6b" onclick="exportGiftLotsCSV()">⬇ Gift Lots CSV (lot by lot)</button>
+      ${giftRecipients().map((r, i) => `<button class="sml" style="background:#fff;color:#4a1a6b;border-color:#4a1a6b" onclick="exportGiftStatementPDF(${i})">⬇ Statement for ${escapeHTML(r)} (PDF)</button>`).join('')}
+    </div>
+    <div class="lv" style="margin-bottom:8px">
+      Each recipient's statement lists every lot they received: quantity, the date you acquired it, your cost,
+      their basis for a gain and for a loss, and the date each lot turns long-term. Give it to them to keep — they
+      need it when they sell, and you are the only one with the records.
     </div>
     <table style="font-size:10.5px;width:100%">
       <thead><tr>
@@ -8824,7 +8853,8 @@ function giftSummaryHTML() {
         <th style="background:#f3e6ff;color:#4a1a6b">Assets</th>
         <th style="background:#f3e6ff;color:#4a1a6b;text-align:right">Transfers</th>
         <th style="background:#f3e6ff;color:#4a1a6b;text-align:right">Value when given</th>
-        <th style="background:#f3e6ff;color:#4a1a6b;text-align:right">Your basis (carries over)</th>
+        <th style="background:#f3e6ff;color:#4a1a6b;text-align:right">Their basis for a gain</th>
+        <th style="background:#f3e6ff;color:#4a1a6b;text-align:right">Their basis for a loss</th>
         <th style="background:#f3e6ff;color:#4a1a6b">Annual exclusion</th>
       </tr></thead>
       <tbody>
@@ -8838,6 +8868,7 @@ function giftSummaryHTML() {
             <td style="text-align:right">${g.count}</td>
             <td style="text-align:right;font-weight:700">$${fmt(g.fmv)}</td>
             <td style="text-align:right">$${fmt(g.basis)}</td>
+            <td style="text-align:right">$${fmt(g.lossBasis)}${g.dual ? ' <span class="lv" title="Some lots were worth less on the gift date than you paid. Between the two figures a sale is neither a gain nor a loss.">dual basis</span>' : ''}</td>
             <td>${limit == null ? '<span class="lv">unknown for this year</span>'
               : over ? `<strong style="color:#8b0000">OVER $${limit.toLocaleString()} — Form 709 likely required</strong>`
                      : `<span style="color:#1a4a3a">under $${limit.toLocaleString()}</span>`}</td>
@@ -8846,6 +8877,9 @@ function giftSummaryHTML() {
       </tbody>
     </table>
     <div class="lv" style="margin-top:6px">
+      <strong>Two basis figures:</strong> a recipient measures a gain from your cost (it carries over), but a loss from the
+      lesser of your cost and the value on the gift date, lot by lot. When those differ ("dual basis"), selling for a price
+      between the two is neither a gain nor a loss.
       Exclusion amounts are per recipient per year and double if you are married and elect gift-splitting.
       This tool is not tax advice — confirm Form 709 with your preparer.
     </div>`;
@@ -8872,6 +8906,163 @@ function exportGiftsCSV() {
       limit == null ? 'unknown' : limit, limit != null && g.fmv > limit ? 'YES' : 'no'].map(csvField).join(','));
   }
   downloadCSV(lines, `Gift-Log-${new Date().toISOString().slice(0,10)}.csv`);
+}
+
+// ── Gift lots: the per-lot statement each recipient keeps (1.10.13) ──────
+function giftRecipients() {
+  return [...new Set(allGiftRows.map(g => g.recipient))].sort((a, b) => a.localeCompare(b));
+}
+
+const GIFT_LOT_SOURCE = {
+  received: 'received', received_flat: 'received', received_market: 'received',
+  remit_received: 'received (Remit)', reward: 'reward (income)', dex_buy: 'bought on the DEX',
+  amm_withdrawal: 'AMM pool withdrawal', exchange_withdrawal: 'withdrawn from an exchange',
+  transfer_in: 'moved from another of your wallets',
+};
+function giftLotSource(src) {
+  if(src == null) return 'no record of acquisition ($0 basis)';
+  return GIFT_LOT_SOURCE[src] || String(src).replace(/_/g, ' ');
+}
+
+// 'YYYY-MM-DD…' → 'M/D/YYYY', with no time-zone shift.
+function giftDay(key) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(key || ''));
+  return m ? `${+m[2]}/${+m[3]}/${m[1]}` : '';
+}
+// The last day a sale is still SHORT-term: long-term needs a sale AFTER the
+// one-year anniversary (see isLongTerm). Returns '' for an unknown date.
+function giftLongTermAfter(key) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(key || ''));
+  if(!m) return '';
+  const d = new Date(Date.UTC(+m[1] + 1, +m[2] - 1, +m[3]));
+  return `${d.getUTCMonth() + 1}/${d.getUTCDate()}/${d.getUTCFullYear()}`;
+}
+
+// One row per lot, in gift order. Shared by the CSV and the PDF so the two
+// can never disagree.
+function giftLotRows(recipient) {
+  const out = [];
+  const gifts = allGiftRows.filter(g => recipient == null || g.recipient === recipient)
+    .sort((a, b) => (a.dk < b.dk ? -1 : a.dk > b.dk ? 1 : 0));
+  for(const g of gifts) {
+    (g.lots || []).forEach((l, i) => {
+      out.push({
+        gift: g, lotNo: i + 1, qty: l.qty,
+        acquired: giftDay(l.acqDate), how: giftLotSource(l.source),
+        unitCost: l.unitCost, basis: l.basis, fmv: l.fmv, lossBasis: l.lossBasis, dual: l.dual,
+        // Gain: your holding period tacks on. Loss on a dual-basis lot: it
+        // starts again on the gift date. Unknown acquisition: no tacking can
+        // be shown, so it is short-term from the gift date either way.
+        ltGainAfter: l.acqDate ? giftLongTermAfter(l.acqDate) : giftLongTermAfter(g.dk),
+        ltLossAfter: (l.dual || !l.acqDate) ? giftLongTermAfter(g.dk) : giftLongTermAfter(l.acqDate),
+      });
+    });
+  }
+  return out;
+}
+
+function exportGiftLotsCSV() {
+  if(ledgerBusy(() => exportGiftLotsCSV(), 'Gift lots CSV')) return;   // live arrays may be mid-rebuild
+  if(allGiftRows.length === 0) { alert('No gifts recorded. Mark a destination as a gift, then rebuild.'); return; }
+  const lines = ['Gift Date,Recipient,Recipient Address,From Wallet,Asset,Gift Tx Hash,Lot,Quantity,Date You Acquired,How You Acquired It,' +
+    'Your Unit Cost USD,Their Basis For A Gain USD,Value On Gift Date USD,Their Basis For A Loss USD,Dual Basis (This Lot),' +
+    'Long-Term For A Gain If Sold After,Long-Term For A Loss If Sold After'];
+  for(const r of giftLotRows(null)) {
+    const g = r.gift;
+    lines.push([g.dateStr, g.recipient, g.addr, g.wallet, g.ticker, g.txHash, r.lotNo, r.qty.toFixed(6),
+      r.acquired || 'unknown', r.how, r.unitCost.toFixed(6), r.basis.toFixed(2), r.fmv.toFixed(2), r.lossBasis.toFixed(2),
+      r.dual ? 'YES' : 'no', r.ltGainAfter, r.ltLossAfter].map(csvField).join(','));
+  }
+  downloadCSV(lines, `Gift-Lots-${new Date().toISOString().slice(0,10)}.csv`);
+}
+
+// The statement to hand a recipient. Built separately from saving so the
+// tests can read it.
+function buildGiftStatementDoc(recipient) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation:'landscape', unit:'pt', format:'letter' });
+  const margin = 36, pageW = doc.internal.pageSize.getWidth(), pageH = doc.internal.pageSize.getHeight();
+  const money = v => '$' + fmt(v);
+  const gifts = allGiftRows.filter(g => g.recipient === recipient).sort((a, b) => (a.dk < b.dk ? -1 : a.dk > b.dk ? 1 : 0));
+  const rows = giftLotRows(recipient);
+  let y = margin;
+
+  doc.setFont('helvetica','bold'); doc.setFontSize(16); doc.setTextColor(20,20,30);
+  doc.text(`Gift basis statement for ${recipient}`, margin, y + 16);
+  y += 30;
+  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(60,60,70);
+  const intro = doc.splitTextToSize(
+    `You received the coins below as gifts. Gifts are not income to you, but when you sell or trade these coins you report the sale, ` +
+    `and you need two numbers for each lot. For a GAIN, your basis is the giver's cost, and the giver's holding period counts toward yours. ` +
+    `For a LOSS, your basis is the lesser of the giver's cost and the value on the gift date; where that is the gift-date value ("dual basis"), ` +
+    `your holding period for the loss starts on the gift date. If you sell a dual-basis lot for a price between its two basis figures, ` +
+    `there is no gain and no loss. A lot turns long-term the day after the date shown. Keep this with your records. ` +
+    `Generated ${new Date().toLocaleDateString()} from the giver's on-ledger records. Not tax advice.`, pageW - margin * 2);
+  doc.text(intro, margin, y);
+  y += intro.length * 11 + 10;
+
+  const tot = gifts.reduce((s, g) => ({ fmv: s.fmv + g.fmv, basis: s.basis + g.basis, loss: s.loss + g.lossBasis }), { fmv: 0, basis: 0, loss: 0 });
+  doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(20,20,30);
+  doc.text(`${gifts.length} gift(s) · value when given ${money(tot.fmv)} · basis for a gain ${money(tot.basis)} · basis for a loss ${money(tot.loss)}`, margin, y + 10);
+  y += 24;
+
+  const cols = [
+    { key:'lot',   label:'Lot',                    w: 24 },
+    { key:'qty',   label:'Quantity',               w: 84, align:'right' },
+    { key:'acq',   label:'Giver acquired',         w: 66 },
+    { key:'how',   label:'How acquired',           w: 128 },
+    { key:'unit',  label:'Giver cost / unit',      w: 66, align:'right' },
+    { key:'gain',  label:'Basis for a gain',       w: 74, align:'right' },
+    { key:'fmv',   label:'Value on gift date',     w: 74, align:'right' },
+    { key:'loss',  label:'Basis for a loss',       w: 74, align:'right' },
+    { key:'ltg',   label:'Long-term (gain) after', w: 66 },
+    { key:'ltl',   label:'Long-term (loss) after', w: 64 },
+  ];
+  for(const g of gifts) {
+    if(y + 70 > pageH - margin) { doc.addPage(); y = margin; }
+    doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(74,26,107);
+    doc.text(`${g.dateStr} · ${g.qty.toLocaleString(undefined,{maximumFractionDigits:6})} ${g.ticker} at $${g.price.toFixed(g.price < 1 ? 6 : 4)} · value ${money(g.fmv)}` +
+             `${g.dualBasis ? ' · dual basis' : ''}`, margin, y + 12);
+    y += 16;
+    doc.setFont('helvetica','normal'); doc.setFontSize(7.5); doc.setTextColor(110,110,120);
+    doc.text(`to ${g.addr || ''} · transaction ${g.txHash || ''}`, margin, y + 8);
+    y += 13;
+    doc.setTextColor(20,20,30);
+    const lotRows = rows.filter(r => r.gift === g).map(r => ({
+      lot: String(r.lotNo), qty: r.qty.toLocaleString(undefined,{maximumFractionDigits:6}),
+      acq: r.acquired || 'unknown', how: r.how, unit: '$' + r.unitCost.toFixed(r.unitCost < 1 ? 6 : 4),
+      gain: money(r.basis), fmv: money(r.fmv), loss: money(r.lossBasis) + (r.dual ? ' *' : ''),
+      ltg: r.ltGainAfter, ltl: r.ltLossAfter,
+    }));
+    y = pdfTable(doc, { cols, rows: lotRows, x0: margin, startY: y, margin, rowH: 13, headerH: 16 });
+    doc.setFont('helvetica','bold'); doc.setFontSize(8.5);
+    doc.text(`Gift total — basis for a gain ${money(g.basis)} · basis for a loss ${money(g.lossBasis)}`, margin, y + 10);
+    y += 22;
+  }
+  if(rows.some(r => r.dual)) {
+    if(y + 24 > pageH - margin) { doc.addPage(); y = margin; }
+    doc.setFont('helvetica','normal'); doc.setFontSize(8); doc.setTextColor(90,60,20);
+    doc.text('* Dual-basis lot: worth less on the gift date than the giver paid.', margin, y + 8);
+  }
+  const pages = doc.internal.getNumberOfPages();
+  for(let i = 1; i <= pages; i++) {
+    doc.setPage(i);
+    doc.setFont('helvetica','normal'); doc.setFontSize(8); doc.setTextColor(130,130,130);
+    doc.text(`Gift basis statement for ${recipient} · page ${i} of ${pages}`, margin, pageH - 18);
+  }
+  return doc;
+}
+
+function exportGiftStatementPDF(idx) {
+  if(ledgerBusy(() => exportGiftStatementPDF(idx), 'Gift statement PDF')) return;   // live arrays may be mid-rebuild
+  if(typeof window.jspdf === 'undefined' || !window.jspdf.jsPDF) {
+    alert('The PDF library did not load. This needs no internet: jsPDF ships with the app at renderer/vendor/jspdf.umd.min.js. If you are seeing this, that file is missing from the build — please report it.');
+    return;
+  }
+  const recipient = giftRecipients()[idx];
+  if(recipient == null) { alert('No gifts recorded for that recipient. Rebuild and try again.'); return; }
+  const safe = recipient.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'recipient';
+  buildGiftStatementDoc(recipient).save(`Gift-Statement-${safe}-${new Date().toISOString().slice(0,10)}.pdf`);
 }
 
 async function rebuildAfterOwnershipChange() {
