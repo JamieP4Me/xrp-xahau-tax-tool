@@ -80,6 +80,12 @@ contextBridge.exposeInMainWorld('taxDB', {
   /** One wallet's cached rows between two Timestamp strings, oldest first, capped. */
   getRowsBetween: (wallet, chain, from, to, limit) => ipcRenderer.invoke('db:getRowsBetween', wallet, chain, from, to, limit),
 
+  /** XRPL trades read from the ledger: which transactions have a ledger row, how far each wallet was read. */
+  getLedgerTradeKeys: (chain) => ipcRenderer.invoke('db:getLedgerTradeKeys', chain),
+  getLedgerSweeps: () => ipcRenderer.invoke('db:getLedgerSweeps'),
+  setLedgerSweep: (s) => ipcRenderer.invoke('db:setLedgerSweep', s),
+  clearLedgerTrades: () => ipcRenderer.invoke('db:clearLedgerTrades'),
+
   /** Bumped by every change to cached data (see db.js bumpDataVersion). */
   getDataVersion: () => ipcRenderer.invoke('db:getDataVersion'),
   /** Saved finished reports: one per AMM treatment, loaded only on an exact stamp match. */

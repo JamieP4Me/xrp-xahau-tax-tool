@@ -1219,3 +1219,47 @@ Two rules are applied per lot:
 
 The summary table now shows both basis figures. Gift totals are unchanged
 except the loss basis, which can only go down.
+
+## XRPL trades are booked from the ledger (1.10.14)
+
+The download holds what each transaction **asked for**. For a trade that is
+not what happened:
+
+- An offer states terms. It may fill at once, in part, later, or never. Every
+  "sell XRP" offer used to be booked as a sale of the whole amount offered,
+  and what it bought was not booked.
+- A token sold for XRP was not booked at all.
+- When someone else's transaction fills your offer, that transaction is not in
+  the download under your wallet.
+
+**Setup → XRPL Trades — Read From the Ledger** reads every transaction of your
+XRPL wallets from a full-history server and keeps what the ledger says
+changed. Nothing changes until you press it. After that:
+
+| What the ledger shows | How it is booked |
+|---|---|
+| XRP out, one token in | The XRP is sold at that day's price. That value is the token's basis. |
+| One token out, XRP in | The token is sold for what the XRP was worth. The XRP starts a lot at that price. |
+| A token in or out, no XRP | No value is known. The quantity is tracked (a token that arrives gets a dated $0 lot) and the row is listed, **not** put on Form 8949. |
+| A token moved between your own wallets | A transfer: basis and dates go with it. |
+| A token for a token, or several assets | Listed for review; quantities kept. |
+| AMM deposit or withdrawal | Stored, not booked. It stays with the AMM treatment setting. |
+
+Two rules stop a transaction being booked twice. A transaction with a ledger
+record is booked from that record only. An offer inside the range read, with
+no ledger record, did not trade when it was placed and is not booked.
+
+The Data Summary states the counts, and **List every one (CSV)** gives one line
+per ledger record with how it was booked. **Remove what was read** puts the old
+booking back.
+
+Limits, stated plainly:
+
+- **This changes earlier years' figures**, including 2025, wherever an offer
+  was booked at more than it traded. Compare before relying on it.
+- A token that arrived by airdrop is income at its value on arrival. That
+  value is not measured here; the lot is $0.
+- A token acquired through an AMM withdrawal has no lot yet, so selling it
+  shows as a $0-basis, short-term sale and is flagged.
+- Xahau trades are not read this way yet.
+- The Koinly and CoinLedger exports are still built from the download.

@@ -100,6 +100,9 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
 <!-- The on-chain balance check and its explain view. Loaded before the main
      script; it only declares functions and its own state at load time. -->
 <script src="onchain.js"></script>
+<!-- XRPL trades read from the ledger: the sweep, its panel, and the pure
+     helpers the engine uses to book them. Declares functions only. -->
+<script src="ledger-trades.js"></script>
 </head>
 <body>
 
@@ -198,6 +201,33 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
       against what's cached — nothing is lost or doubled); "Clear Local
       Database" deletes the local cache entirely and starts over from
       nothing.
+    </div>
+  </section>
+
+  <!-- XRPL trades come from the ledger's own record of each transaction,
+       because the download only holds what a transaction asked for. See
+       renderer/ledger-trades.js. -->
+  <section id="ledgerTradesSection" style="display:none">
+    <div class="sec-title">XRPL Trades — Read From the Ledger</div>
+    <div id="ledgerTradesStats" style="font-size:11.5px;color:#333;line-height:1.8">Loading…</div>
+    <div class="row" style="margin-top:10px">
+      <button class="sml" id="ledgerTradesBtn" style="background:#1a3a7a;color:#fff;border-color:#1a3a7a" onclick="sweepLedgerTradesUI()">⟳ Read XRPL trades from the ledger</button>
+      <button class="sml" id="ledgerTradesStop" style="display:none" onclick="stopLedgerTrades()">■ Stop</button>
+      <button class="sml" onclick="exportLedgerTradesCSV()">⬇ List every one (CSV)</button>
+      <button class="sml dan" onclick="clearLedgerTradesUI()">🗑 Remove what was read</button>
+    </div>
+    <div style="font-size:10px;color:#888;margin-top:6px;line-height:1.5">
+      The download records what each transaction <b>asked for</b>. For a trade that is not what happened: an offer
+      can fill in full, in part, later or never; a token sold for XRP is not in the download as a sale; and an offer
+      filled by someone else's transaction is not in the download under your wallet at all. This reads every
+      transaction of your XRPL wallets from a full-history server and books each trade from what the ledger says
+      <b>actually moved</b>. Buying a token with XRP is a sale of the XRP, and its value is the token's basis. Selling a
+      token for XRP is a sale of the token. A token that arrives or leaves with no XRP side has no known value: its
+      quantity is tracked, it is listed, and it is <b>not</b> put on Form 8949. AMM deposits and withdrawals stay with
+      the AMM treatment setting.
+      <br><br>
+      Read-only, through the server chosen in the on-chain check's settings (the public XRPL cluster unless you set
+      another). After the first read it runs by itself at the end of each download.
     </div>
   </section>
 
@@ -3382,12 +3412,13 @@ function txKeyNormalize(id) {
 }
 function journalKeyOf(row, wallet) {
   if(row && row._affected && row._affected.hash) return txKeyNormalize(row._affected.hash);
+  if(row && row._ledger && row.LedgerHash) return txKeyNormalize(row.LedgerHash);
   return txKeyNormalize(makeTxHash(row || {}, (row && row.Timestamp) || '', wallet));
 }
 // A cache tx_hash as db.js stores it.
 function cacheTxKey(txHash) {
   const s = String(txHash || '');
-  return s.startsWith('AFFECTED:') ? txKeyNormalize(s.split(':')[1]) : txKeyNormalize(s);
+  return (s.startsWith('AFFECTED:') || s.startsWith('LEDGER')) ? txKeyNormalize(s.split(':')[1]) : txKeyNormalize(s);
 }
 
 function journalRecord(wallet, ticker, field, qty) {
@@ -3401,13 +3432,13 @@ function journalRecord(wallet, ticker, field, qty) {
   if(!de) dm.set(day, de = { add: 0, used: 0, short: 0 });
   de[field] += qty;
   if(!_journalOn) return;
-  const chain = ticker === 'XRP' ? 'XRPL' : 'Xahau';
+  const chain = (ticker === 'XRP' || ltIsToken(ticker)) ? 'XRPL' : 'Xahau';   // tokens are booked on XRPL only
   if(!(journalAll || journalWallets.has(wallet) || _bookMs > journalCutoffMs[chain])) return;
   if(_bookKey === undefined) _bookKey = journalKeyOf(_bookRow, _bookWallet);
   let m = bookingJournal.get(jk);
   if(!m) bookingJournal.set(jk, m = new Map());
   let e = m.get(_bookKey);
-  if(!e) m.set(_bookKey, e = { ms: _bookMs, type: _bookRow.TransactionType || '', add: 0, used: 0, short: 0 });
+  if(!e) m.set(_bookKey, e = { ms: _bookMs, type: _bookRow.LedgerType || _bookRow.TransactionType || '', add: 0, used: 0, short: 0 });
   e[field] += qty;
 }
 
@@ -3642,6 +3673,11 @@ function resetLedgerState() {
   dailyJournal.clear();
   journalBuildInfo = null;
   Object.keys(remitBooked).forEach(k => { remitBooked[k] = 0; });
+  // Counted and listed during the build. The index of what was read from the
+  // ledger (ledgerTradeIndex) is NOT cleared here: like the AMM map, it is
+  // loaded from the cache once per build, before the XRPL rows are read.
+  Object.keys(ledgerTradeStats).forEach(k => { ledgerTradeStats[k] = 0; });
+  ledgerTradeLog.length = 0;
 }
 
 // Everything resetLedgerState() clears, captured and put back. The treatment
@@ -3673,6 +3709,7 @@ function snapshotLedgerState(opts = {}) {
     ammBookedDeposits, ammBookedWithdrawals, ammSkippedUnverified, ammBookedDepositQty, ammBookedWithdrawQty,
     bookingJournal: c(bookingJournal), journalBuildInfo: c(journalBuildInfo), dailyJournal: c(dailyJournal),
     remitBooked: c(remitBooked),
+    ledgerTradeStats: c(ledgerTradeStats), ledgerTradeLog: c(ledgerTradeLog),
   };
 }
 function restoreLedgerState(snap, opts = {}) {
@@ -3704,9 +3741,11 @@ function restoreLedgerState(snap, opts = {}) {
   for(const [k, v] of c(snap.bookingJournal || new Map())) bookingJournal.set(k, v);
   for(const [k, v] of c(snap.dailyJournal || new Map())) dailyJournal.set(k, v);
   Object.assign(remitBooked, c(snap.remitBooked || {}));
+  Object.assign(ledgerTradeStats, c(snap.ledgerTradeStats || {})); fill(ledgerTradeLog, c(snap.ledgerTradeLog || []));
   journalBuildInfo = c(snap.journalBuildInfo || null);
   syncTaxYearSelects();
   applyReportingYear(taxYear());
+  if(typeof refreshLedgerTradesPanel === 'function') refreshLedgerTradesPanel();
 }
 
 const MS_PER_DAY = 86400000;
@@ -3794,13 +3833,13 @@ const cents = (n) => {
     // the arithmetic behind it.
     const pH = cents(qty*priceH), pL = cents(qty*priceL), b = cents(cost);
     return {
-      wallet, dateStr:ds, dk, year:yr, ticker, chain: ticker==='XRP'?'XRPL':'XAH',
+      wallet, dateStr:ds, dk, year:yr, ticker, chain: (ticker==='XRP' || ltIsToken(ticker)) ? 'XRPL' : 'XAH',
       qty, term, box, dateAcquired: acqLabel,
       priceH, priceL,
       proceedsH: pH, proceedsL: pL,
       basis: b,
       gainH: cents(pH - b), gainL: cents(pL - b),
-      txHash: hash, counterparty: counterparty || '', description: `${qty.toFixed(4)} ${ticker}${descSuffix||''}`,
+      txHash: hash, counterparty: counterparty || '', description: `${qty.toFixed(4)} ${ltTokenLabel(ticker)}${descSuffix||''}`,
       rowKey: `${wallet}_${hash}_${ticker}_${term}`
     };
   };
@@ -4152,6 +4191,7 @@ function grandTotalRaw() {
 // into a single number and labelling the total "XRP". Three assets worth
 // wildly different amounts added together is not a quantity of anything.
 function zeroBasisPriceOf(t) {
+  if(ltIsToken(t)) return 0;   // no price series for an XRPL token
   const src = t === 'XRP' ? XRP_PRICES : (t === 'EVR' ? EVR_PRICES : XAH_PRICES);
   const p = lookupPrice(src, t, toDK(Date.now()), 'high');
   return Number.isFinite(p) ? p : 0;
@@ -4171,11 +4211,26 @@ function zeroBasisByTicker(shortfalls) {
 
 function dataQualityHTML() {
   const parts = [];
-  if(basisShortfalls.length) {
+  // XRPL tokens are kept out of the red panel below. Its headline adds
+  // quantities and prices them at today's price; a meme token counted in
+  // billions of units with no price would turn that into nonsense and bury
+  // the XRP, XAH and EVR rows it exists to show. They get their own line.
+  const coinShortfalls = basisShortfalls.filter(b => !ltIsToken(b.ticker));
+  const tokenShortfalls = basisShortfalls.filter(b => ltIsToken(b.ticker));
+  if(tokenShortfalls.length) {
+    const names = [...new Set(tokenShortfalls.map(b => ltTokenLabel(b.ticker)))];
+    parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#fff4e5;border:1px solid #d08a00;border-radius:4px;font-size:11px;color:#7a4a00">
+      <strong>${names.length.toLocaleString()} XRPL token(s) left a wallet with no lot on record</strong>
+      (${tokenShortfalls.length.toLocaleString()} time(s)): ${names.slice(0, 12).join(', ')}${names.length > 12 ? ` and ${names.length - 12} more` : ''}.
+      Where one of these was a sale, Form 8949 shows it with $0 basis, short-term. The usual cause is a token that came out of an
+      AMM pool, which is not booked yet. Check each against “List every one (CSV)” under the XRPL trades note.
+    </div>`);
+  }
+  if(coinShortfalls.length) {
     // Grouped by wallet+ticker: "4 shortfalls" means nothing, "9,873 XRP at
     // your Coinbase address has no basis" is the sentence that gets acted on.
     const by = {};
-    for(const b of basisShortfalls) {
+    for(const b of coinShortfalls) {
       const k = b.wallet + '|' + b.ticker;
       (by[k] = by[k] || { wallet: b.wallet, ticker: b.ticker, qty: 0, n: 0 });
       by[k].qty += b.qty; by[k].n++;
@@ -4450,6 +4505,8 @@ function dataQualityHTML() {
       are still not booked and stay on the “not on Form 8949” list.
     </div>`);
   }
+  { const lt = ledgerTradesDisclosureHTML();
+    if(lt) parts.push(`<div style="margin-top:8px;padding:10px 12px;background:#eef5ff;border:1px solid #9bb8e0;border-radius:4px;font-size:11px;color:#1a3a6a">${lt}</div>`); }
   if(typeof onchainQualityHTML === 'function') parts.push(onchainQualityHTML());
   return parts.join('');
 }
@@ -4896,8 +4953,191 @@ function makeXrplPriceHelpers() {
 // and the matching comment on processMergedXahauEntries(), for why a single
 // wallet's rows can no longer just be processed start-to-finish in
 // isolation once a transfer chain crosses more than one selected wallet.
+// ── XRPL trades booked from the ledger (1.10.14) ─────────────────────────
+//
+// renderer/ledger-trades.js reads every transaction that touched a wallet
+// from a full-history node and stores, for each one that moved a token, what
+// the ledger says changed for that wallet. Those rows arrive here in the same
+// chronological stream as the download's rows. See that file for why.
+//
+// Two rules keep the two sources from booking one transaction twice:
+//   1. A transaction with a ledger row is booked from the ledger row ONLY.
+//      The download's row for the same wallet and hash is skipped.
+//   2. An OfferCreate inside the range read from the ledger, with no ledger
+//      row, did not trade when it was placed. It is not booked. (It used to
+//      be booked as a sale of the whole amount offered.) If it filled later,
+//      that happened in someone else's transaction, which has a ledger row.
+//
+// ledgerTradeIndex is loaded from the cache at the start of each build and is
+// not part of the report's state. The counters and the log are.
+const ledgerTradeIndex = { keys: new Map(), through: new Map() };   // wallet -> Set(hash); wallet -> ms read through
+const ledgerTradeStats = { rows: 0, buys: 0, sells: 0, xrpSpent: 0, xrpReceived: 0, tokenIn: 0, tokenOut: 0,
+                           transfers: 0, swaps: 0, complex: 0, amm: 0, replaced: 0, offersNotFilled: 0, offersNotFilledXrp: 0, lost: 0 };
+const ledgerTradeLog = [];   // one line per ledger row: what it was, how it was booked
+
+async function loadLedgerTradeIndex() {
+  ledgerTradeIndex.keys.clear(); ledgerTradeIndex.through.clear();
+  if(!USE_LOCAL_DB || !window.taxDB.getLedgerTradeKeys) return;
+  try {
+    for(const r of await window.taxDB.getLedgerTradeKeys('XRPL')) {
+      let set = ledgerTradeIndex.keys.get(r.wallet);
+      if(!set) ledgerTradeIndex.keys.set(r.wallet, set = new Set());
+      set.add(String(r.tx_hash).slice('LEDGER:'.length));
+    }
+    for(const sw of await window.taxDB.getLedgerSweeps()) {
+      if(sw.chain === 'XRPL') ledgerTradeIndex.through.set(sw.wallet, parseWinDbTs(sw.through_ts));
+    }
+  } catch(e) {
+    // Without the index the ledger rows would be booked AND the download's
+    // rows for the same transactions would be booked. Refuse both instead.
+    ledgerTradeIndex.keys.clear(); ledgerTradeIndex.through.clear();
+    throw new Error('could not read the list of ledger trades: ' + e.message);
+  }
+}
+
+// Lots used up with no disposal row (a token that left with no value known).
+function ledgerConsumeQuiet(wallet, ticker, qty) {
+  let basis = 0;
+  for(const c of ledgerFIFODetailed(wallet, ticker, qty)) basis += c.qty * c.unitCost;
+  return basis;
+}
+
+function processLedgerChangeRow(row, wallet, walletSet, helpers) {
+  const ms = parseWinDbTs(row.Timestamp ?? '');
+  const dk = toDK(ms), yr = new Date(ms).getUTCFullYear(), dateStr = fmtDate(ms);
+  const hash = String(row.LedgerHash || '');
+  transactionsScanned++;
+  ledgerTradeStats.rows++;
+  const xrpH = lookupPrice(XRP_PRICES, 'XRP', dk, 'high');
+  const xrpL = lookupPrice(XRP_PRICES, 'XRP', dk, 'low');
+  const shape = ltShape(row);
+  const note = (kind, extra) => ledgerTradeLog.push(Object.assign({
+    wallet, dk, dateStr, year: yr, hash, type: String(row.LedgerType || ''), role: String(row.Role || ''), kind,
+    xrp: shape.xrp || 0, ticker: '', qty: 0, usd: null, basis: null, counterparty: '' }, extra || {}));
+  const lost = isLostSpend(wallet, dk);
+  const xrpOut = (qty) => {
+    if(lost) pushLostSpend(wallet, 'XRP', qty, dk, dateStr, yr, hash, xrpH, 'DEX trade');
+    else pushDisposal(wallet, 'XRP', qty, dk, dateStr, yr, hash, xrpH, xrpL, ' (DEX)', 'DEX trade');
+  };
+  const xrpIn = (qty) => ledgerAdd(wallet, 'XRP', dk, qty, xrpH || helpers.xrpBasisRate || 0, 'dex_buy');
+
+  if(shape.kind === 'none') return;
+  if(shape.kind === 'amm') { ledgerTradeStats.amm++; note('amm'); return; }
+
+  if(shape.kind === 'buy' || shape.kind === 'sell' || shape.kind === 'token_in' || shape.kind === 'token_out') {
+    const ticker = ltTicker(shape.token.c, shape.token.i);
+    if(!ticker) { ledgerTradeStats.complex++; note('complex'); return; }
+    const qty = shape.qty;
+
+    if(shape.kind === 'buy') {
+      // XRP given for a token. The XRP is sold at its value that day; that
+      // value is what the token cost.
+      const usd = shape.xrp * (xrpH || 0);
+      xrpOut(shape.xrp);
+      ledgerAdd(wallet, ticker, dk, qty, usd / qty, 'dex_buy');
+      ledgerTradeStats.buys++; ledgerTradeStats.xrpSpent += shape.xrp;
+      if(lost) ledgerTradeStats.lost++;
+      note('buy', { ticker, qty, usd });
+      return;
+    }
+    if(shape.kind === 'sell') {
+      // A token given for XRP. The proceeds are what the XRP was worth, and
+      // the XRP starts a lot at that price.
+      const usd = shape.xrp * (xrpH || 0);
+      if(lost) { ledgerConsumeQuiet(wallet, ticker, qty); ledgerTradeStats.lost++; }
+      else pushDisposal(wallet, ticker, qty, dk, dateStr, yr, hash, (shape.xrp * xrpH) / qty, (shape.xrp * xrpL) / qty, ' (DEX)', 'DEX trade');
+      xrpIn(shape.xrp);
+      ledgerTradeStats.sells++; ledgerTradeStats.xrpReceived += shape.xrp;
+      note('sell', { ticker, qty, usd });
+      return;
+    }
+    if(shape.kind === 'token_in') {
+      const from = String(row.Account || '');
+      // Sent by another of your wallets, and that wallet's own ledger row is
+      // stored: it moves the lots across (basis and dates kept), so adding a
+      // lot here as well would count the tokens twice.
+      const senderRow = from && from !== wallet && ledgerTradeIndex.keys.get(from);
+      if(row.LedgerType === 'Payment' && row.Role === 'received' && walletSet.has(from) && senderRow && senderRow.has(hash)) {
+        note('transfer_in', { ticker, qty, counterparty: from });
+        return;
+      }
+      // No value is known for a token that simply arrived. A dated lot at $0
+      // keeps the quantity and the holding period right. If it was an airdrop,
+      // its value on arrival is income and basis, which this does not measure.
+      ledgerAdd(wallet, ticker, dk, qty, 0, 'token_received');
+      ledgerTradeStats.tokenIn++;
+      note('token_in', { ticker, qty, counterparty: from === wallet ? '' : from });
+      return;
+    }
+    // token_out
+    const dest = String(row.Destination || '');
+    if(row.LedgerType === 'Payment' && row.Role === 'sent' && dest && dest !== wallet && walletSet.has(dest)) {
+      ledgerTransferIn(wallet, dest, ticker, qty);
+      ledgerTradeStats.transfers++;
+      note('transfer_out', { ticker, qty, counterparty: dest });
+      return;
+    }
+    const basis = ledgerConsumeQuiet(wallet, ticker, qty);
+    ledgerTradeStats.tokenOut++;
+    const sentByMe = row.LedgerType === 'Payment' && row.Role === 'sent';
+    const kind = lost ? 'lost_wallet' : !sentByMe ? 'other_out' : dest === shape.token.i ? 'to_issuer' : isGiftAddress(dest) ? 'gift_unpriced' : 'sent_unvalued';
+    note(kind, { ticker, qty, basis, counterparty: dest });
+    return;
+  }
+
+  // A token for a token, or several assets at once: no single value can be
+  // put on it from the ledger alone. Keep every quantity right and list it.
+  let basisUsed = 0;
+  const parts = [];
+  if(shape.xrp < 0) { xrpOut(-shape.xrp); parts.push(`${(-shape.xrp).toFixed(6)} XRP out`); }
+  if(shape.xrp > 0) { xrpIn(shape.xrp); parts.push(`${shape.xrp.toFixed(6)} XRP in`); }
+  for(const t of shape.tokens) {
+    const ticker = ltTicker(t.c, t.i), d = Number(t.d);
+    if(!ticker) continue;
+    if(d > 0) ledgerAdd(wallet, ticker, dk, d, 0, 'token_received');
+    else basisUsed += ledgerConsumeQuiet(wallet, ticker, -d);
+    parts.push(`${Math.abs(d)} ${ltTokenLabel(ticker)} ${d > 0 ? 'in' : 'out'}`);
+  }
+  if(shape.kind === 'token_swap') ledgerTradeStats.swaps++; else ledgerTradeStats.complex++;
+  note(lost ? 'lost_wallet' : shape.kind, { ticker: parts.join('; '), basis: basisUsed });
+}
+
+function exportLedgerTradesCSV() {
+  if(ledgerBusy(() => exportLedgerTradesCSV(), 'XRPL ledger trades CSV')) return;   // live arrays may be mid-rebuild
+  if(ledgerTradeLog.length === 0) { alert('Nothing to list. Read the XRPL trades from the ledger on the Setup tab, then rebuild.'); return; }
+  const lines = ['Date,Wallet,Ledger Transaction Type,Your Role,How It Was Booked,On Form 8949,XRP Change (fee excluded),Token,Token Quantity,Value USD,Basis Used USD,Counterparty,Transaction Hash'];
+  for(const r of [...ledgerTradeLog].sort((a, b) => (a.dk < b.dk ? -1 : a.dk > b.dk ? 1 : 0))) {
+    lines.push([r.dateStr, r.wallet, r.type, r.role, LT_KIND_WORDS[r.kind] || r.kind, (r.kind === 'buy' || r.kind === 'sell') ? 'yes' : 'no',
+      r.kind === 'buy' ? (-r.xrp).toFixed(6) : (r.xrp ? r.xrp.toFixed(6) : ''),
+      ltIsToken(r.ticker) ? r.ticker : r.ticker, r.qty ? r.qty : '', r.usd == null ? '' : r.usd.toFixed(2),
+      r.basis == null ? '' : r.basis.toFixed(2), r.counterparty || '', r.hash].map(csvField).join(','));
+  }
+  downloadCSV(lines, `XRPL-Ledger-Trades-${new Date().toISOString().slice(0,10)}.csv`);
+}
+
+function ledgerTradesDisclosureHTML() {
+  const s = ledgerTradeStats;
+  if(!s.rows && !s.offersNotFilled && !s.replaced) return '';
+  const unvalued = s.tokenIn + s.tokenOut + s.swaps + s.complex;
+  return `<div>
+      <strong>XRPL trades booked from the ledger</strong> (since 1.10.14): ${s.rows.toLocaleString()} ledger record(s).
+      ${s.buys.toLocaleString()} purchase(s) of a token with ${fmt(s.xrpSpent, 4)} XRP and ${s.sells.toLocaleString()} sale(s) of a token for ${fmt(s.xrpReceived, 4)} XRP are on Form 8949 at what actually traded.
+      ${s.offersNotFilled ? `${s.offersNotFilled.toLocaleString()} offer(s) to sell ${fmt(s.offersNotFilledXrp, 4)} XRP did not trade when placed and are no longer booked as sales.` : ''}
+      ${unvalued ? `${unvalued.toLocaleString()} token movement(s) had no XRP side, so no value is known: quantities are kept (a token that arrived has a $0 basis) and they are <strong>not</strong> on Form 8949.` : ''}
+      ${s.transfers ? `${s.transfers.toLocaleString()} token transfer(s) between your own wallets kept their basis and dates.` : ''}
+      ${s.amm ? `${s.amm.toLocaleString()} AMM record(s) are stored but left to the AMM treatment setting.` : ''}
+      ${s.lost ? `${s.lost.toLocaleString()} were from a lost wallet (no gain or loss).` : ''}
+      <button class="sml" style="margin-left:6px" onclick="exportLedgerTradesCSV()">⬇ List every one (CSV)</button>
+    </div>`;
+}
+
 function processOneXRPLRow(row, wallet, walletSet, mode, helpers) {
   setBookingContext(row, wallet);
+  // A row read from the ledger rather than the download.
+  if(row._ledger) {
+    if((row.TransactionResult ?? '') === 'tesSUCCESS') processLedgerChangeRow(row, wallet, walletSet, helpers);
+    return;
+  }
   const { xrpBasisRate } = helpers;
   const src    = row.Account ?? '';
   const dest   = row.Destination ?? '';
@@ -4949,6 +5189,12 @@ function processOneXRPLRow(row, wallet, walletSet, mode, helpers) {
     TakerGets_XRP:row.TakerGets_XRP,TakerGets_value:row.TakerGets_value,TakerGets_currency:row.TakerGets_currency,
     TakerPays_XRP:row.TakerPays_XRP,TakerPays_value:row.TakerPays_value,TakerPays_currency:row.TakerPays_currency,
     hash:txId});
+
+  // The ledger's own record of this transaction is stored for this wallet, so
+  // it is booked from that record and not from this row (rule 1 above
+  // processLedgerChangeRow).
+  const ltKeys = ledgerTradeIndex.keys.get(wallet);
+  if(ltKeys && ltKeys.size && ltKeys.has(journalKeyOf(row, wallet))) { ledgerTradeStats.replaced++; return; }
 
   // Types the curated fetch now brings in but the engine does not book. They
   // are listed rather than silently dropped — see recordUnvalued().
@@ -5051,7 +5297,13 @@ function processOneXRPLRow(row, wallet, walletSet, mode, helpers) {
     // the same verified reason. The old /1e6 here silently zeroed out every
     // DEX disposal over 1,000 XRP.
     const rawGets = parseFloat(row.TakerGets_XRP ?? 0);
-    if(rawGets >= DUST_MIN_UNITS && rawGets < 1e9) {
+    const ltThrough = ledgerTradeIndex.through.get(wallet);
+    if(ltThrough != null && ms <= ltThrough) {
+      // Inside the range read from the ledger and no ledger row (it would
+      // have returned above): this offer did not trade when it was placed
+      // (rule 2 above processLedgerChangeRow). Nothing to book.
+      if(rawGets > 0) { ledgerTradeStats.offersNotFilled++; ledgerTradeStats.offersNotFilledXrp += rawGets; }
+    } else if(rawGets >= DUST_MIN_UNITS && rawGets < 1e9) {
       if(isLostSpend(wallet, dk)) pushLostSpend(wallet, 'XRP', rawGets, dk, dateStr, yr, txId, xrpH, 'DEX offer');
       else pushDisposal(wallet, 'XRP', rawGets, dk, dateStr, yr, txId, xrpH, xrpL, ' (DEX)', 'DEX offer');
     } else if(rawGets > 0) {
@@ -5098,6 +5350,9 @@ async function runFetch(){
     _lastBuildBase = null;
     if(!abortFlag) await saveCurrentReport();
   });
+  // Wallets whose XRPL trades were read from the ledger are brought up to
+  // date now; if that finds anything it rebuilds, so what follows sees it.
+  if(USE_LOCAL_DB && !abortFlag && typeof autoSweepLedgerTrades === 'function') await autoSweepLedgerTrades();
   if(USE_LOCAL_DB && !abortFlag) refreshCompareAfterBuild('fetch');
   if(USE_LOCAL_DB && !abortFlag && typeof scheduleOnchainCheck === 'function') scheduleOnchainCheck('fetch');
 }
@@ -5920,6 +6175,7 @@ async function _buildReportFromCacheInner(opts = {}) {
   syncTaxYearSelects();
   applyReportingYear(taxYear());
   renderDataSummary();
+  if(typeof refreshLedgerTradesPanel === 'function') refreshLedgerTradesPanel();
   // Price History is repainted by buildReportFromCache()'s finally block, so
   // it happens on the failure paths too — see the note there.
   if(!opts.silent) {
@@ -6463,6 +6719,9 @@ async function dataStamp() {
     rows: rowsStreamedThisBuild, ver,
     prices: [last(XRP_PRICES), last(XAH_PRICES), last(EVR_PRICES)],
     amm: amm ? [amm.rows, amm.withDelivered, amm.importedAt || ''] : null,
+    // What the ledger-read trades did to this build. An offer newly inside
+    // the range read stops being booked without changing the rows read.
+    lt: [ledgerTradeStats.rows, ledgerTradeStats.replaced, ledgerTradeStats.offersNotFilled],
   });
 }
 const snapKey = (snap) => JSON.stringify(Object.keys(snap.byYear).sort().map(y => {
@@ -7695,6 +7954,10 @@ async function forEachCachedTx(cb, onProgress) {
       for(const { wallet, row } of page.rows) {
         // Same success filter the ledger applies before recording anything.
         if((row.TransactionResult ?? '') !== 'tesSUCCESS') continue;
+        // Rows read from the ledger (1.10.14) are a second view of
+        // transactions; the exports that walk the cache are built from the
+        // download's rows and are unchanged by them.
+        if(row._ledger) continue;
         cb(cachedRowToTx(row, wallet, chain));
         n++;
       }
@@ -7754,7 +8017,7 @@ const LEDGER_PAGE_ROWS = 25000;
 async function expectedRowsForChain(chain) {
   const totalAll = await window.taxDB.countForChain(chain);
   if(!totalAll) return 0;
-  const types = chain === 'Xahau' ? FETCH_TYPES_XAHAU : FETCH_TYPES_XRPL;
+  const types = chain === 'Xahau' ? FETCH_TYPES_XAHAU : FETCH_TYPES_XRPL.concat(LT_ROW_TYPE);   // + rows read from the ledger
   try {
     const filtered = await window.taxDB.countForChain(chain, types);
     if(Number.isFinite(filtered) && filtered > 0) return filtered;
@@ -7798,7 +8061,11 @@ async function streamChainIntoLedger(chain, walletSet) {
   // what the engine sees relative to what it asks the network for. And it
   // prints what it left behind, because a filter that hides its own effect is
   // how a row class goes missing from a tax return without anyone noticing.
-  const types = chain === 'Xahau' ? FETCH_TYPES_XAHAU : FETCH_TYPES_XRPL;
+  const types = chain === 'Xahau' ? FETCH_TYPES_XAHAU : FETCH_TYPES_XRPL.concat(LT_ROW_TYPE);   // + rows read from the ledger
+  // Which transactions the ledger rows cover, and how far each wallet was
+  // read. Loaded before the first XRPL row, because it decides how the
+  // download's rows are booked.
+  if(chain === 'XRPL') await loadLedgerTradeIndex();
   const totalAll = await window.taxDB.countForChain(chain);
   if(totalAll === 0) return 0;
   let total = totalAll;
@@ -8156,6 +8423,9 @@ async function exportCoinLedgerCSV() {
 //    recognised and added.
 
 function latestPriceFor(ticker) {
+  // An XRPL token has no price series here. It used to fall through to the
+  // EVR series below, which would have valued every token at EVR's price.
+  if(ltIsToken(ticker)) return { price: 0, asOf: null };
   const series = ticker === 'XRP' ? XRP_PRICES : ticker === 'XAH' ? XAH_PRICES : EVR_PRICES;
   const keys = sortedPriceKeys(series);
   if(!keys.length) return { price: 0, asOf: null };
@@ -9388,6 +9658,7 @@ setAppVersion();
 refreshLocalDataPanel();
 refreshAmmLedgerPanel();
 refreshAffectedPanel();
+refreshLedgerTradesPanel();
 // Silently rebuild Form 8949 / Schedule D from whatever's already cached on
 // this computer, so results are ready the moment the user clicks over to
 // them — no click, no Payment-Claim, no waiting for a fetch. "Silent" here

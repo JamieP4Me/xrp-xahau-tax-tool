@@ -102,6 +102,30 @@ CREATE TABLE IF NOT EXISTS amm_ledger (
 -- version, app version, prices, wallet classifications, basis inputs); a
 -- saved report is only ever loaded when its stamp matches exactly.
 -- \`data\` is the engine's state, v8-serialized and gzipped by main.js.
+-- XRPL trades read from the ledger (1.10.14). WinDB holds what a transaction
+-- ASKED for; what an offer or a swap actually moved is only in the ledger's
+-- own metadata, and a trade filled by someone else's transaction is not in
+-- WinDB under this wallet at all. The app reads each wallet's transactions
+-- from a full-history node and stores the ones that moved a token as cache
+-- rows keyed 'LEDGER:<hash>' (AMM transactions: 'LEDGERAMM:<hash>').
+--
+-- This table records how far each wallet has been read. It matters for the
+-- figures, not only for resuming: an OfferCreate inside the range that has no
+-- ledger row is an offer that did not trade, and is no longer booked as a
+-- sale of the amount offered. So it must never claim more than is stored:
+-- every operation that removes cached XRPL rows removes the matching entry
+-- here in the same transaction.
+CREATE TABLE IF NOT EXISTS ledger_sweep (
+  wallet          TEXT NOT NULL,
+  chain           TEXT NOT NULL,
+  through_ledger  INTEGER NOT NULL,   -- every transaction up to and including this ledger was read
+  through_ts      TEXT NOT NULL,      -- that ledger's close time, in the cache's Timestamp format
+  swept_at        TEXT NOT NULL,
+  txs             INTEGER NOT NULL,   -- transactions read so far, all sweeps
+  stored          INTEGER NOT NULL,   -- of those, how many moved a token and were stored
+  PRIMARY KEY (wallet, chain)
+);
+
 CREATE TABLE IF NOT EXISTS report_cache (
   key       TEXT PRIMARY KEY,
   stamp     TEXT NOT NULL,
@@ -383,12 +407,16 @@ function makeApi(db) {
   // becomes a redundant re-fetch, never silent data loss.
   const clearWalletChainTxn = db.transaction((wallet, chain) => {
     stmts.clearWalletSync.run(wallet, chain);
+    // The ledger rows for this wallet go with the rest, so the record of how
+    // far it was read must go too (see ledger_sweep).
+    db.prepare('DELETE FROM ledger_sweep WHERE wallet = ? AND chain = ?').run(wallet, chain);
     if (stmts.clearWalletChain.run(wallet, chain).changes > 0) bumpDataVersion();
   });
 
   const clearAllTxn = db.transaction(() => {
     stmts.clearEverything_sync.run();
     stmts.clearEverything_tx.run();
+    db.prepare('DELETE FROM ledger_sweep').run();
     db.prepare('DELETE FROM report_cache').run();
     bumpDataVersion();
     // amm_ledger is deliberately NOT cleared here. It is not cached WinDB
@@ -669,6 +697,63 @@ function makeApi(db) {
     clearAmmLedger() {
       stmts.clearAmmLedger.run();
       bumpDataVersion();
+    },
+
+    /**
+     * XRPL trades read from the ledger (see ledger_sweep above).
+     * Keys: which transactions each wallet has a ledger row for. AMM rows
+     * ('LEDGERAMM:') are stored but not returned here: they do not replace
+     * the AMM booking, which stays with the AMM treatment setting.
+     * @returns {{wallet:string, tx_hash:string}[]}
+     */
+    getLedgerTradeKeys(chain) {
+      return db.prepare("SELECT wallet, tx_hash FROM raw_transactions WHERE chain = ? AND tx_hash LIKE 'LEDGER:%'").all(String(chain));
+    },
+    /** @returns {{wallet, chain, through_ledger, through_ts, swept_at, txs, stored}[]} */
+    getLedgerSweeps() {
+      return db.prepare('SELECT wallet, chain, through_ledger, through_ts, swept_at, txs, stored FROM ledger_sweep ORDER BY wallet, chain').all();
+    },
+    /**
+     * Record how far one wallet has been read.
+     *
+     * The range decides one thing in a build: whether an OfferCreate with no
+     * ledger row is booked. So the data version is bumped only when the range
+     * newly covers such a row (or is new). A routine read that finds nothing
+     * and only moves the end date forward leaves saved reports valid; bumping
+     * every time would force a full rebuild after every download.
+     */
+    setLedgerSweep(s) {
+      if (!s || typeof s.wallet !== 'string' || (s.chain !== 'XRPL' && s.chain !== 'Xahau')) throw new Error('ledger sweep: bad wallet or chain');
+      const through = Number(s.through_ledger);
+      if (!Number.isInteger(through) || through <= 0) throw new Error('ledger sweep: bad ledger index');
+      if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(String(s.through_ts))) throw new Error('ledger sweep: bad timestamp');
+      const prev = db.prepare('SELECT through_ledger, through_ts FROM ledger_sweep WHERE wallet = ? AND chain = ?').get(s.wallet, s.chain);
+      // Never move the range backwards: it would un-cover rows already booked from the ledger.
+      if (prev && through < prev.through_ledger) throw new Error('ledger sweep: range cannot move backwards');
+      db.prepare(`INSERT INTO ledger_sweep (wallet, chain, through_ledger, through_ts, swept_at, txs, stored)
+                  VALUES (?, ?, ?, ?, ?, ?, ?)
+                  ON CONFLICT(wallet, chain) DO UPDATE SET through_ledger = excluded.through_ledger,
+                    through_ts = excluded.through_ts, swept_at = excluded.swept_at, txs = excluded.txs, stored = excluded.stored`)
+        .run(s.wallet, s.chain, through, String(s.through_ts), new Date().toISOString(), Number(s.txs) || 0, Number(s.stored) || 0);
+      let matters = !prev;
+      if (prev) {
+        try {
+          matters = !!db.prepare(`SELECT 1 FROM raw_transactions WHERE wallet = ? AND chain = ? AND timestamp > ? AND timestamp <= ?
+                                  AND tx_type = 'OfferCreate' LIMIT 1`).get(s.wallet, s.chain, prev.through_ts, String(s.through_ts));
+        } catch (e) { matters = true; }   // cannot tell: say it changed
+      }
+      if (matters) bumpDataVersion();
+      return matters;
+    },
+    /** Remove every ledger-read row and the record of what was read. @returns {number} rows removed */
+    clearLedgerTrades() {
+      const run = db.transaction(() => {
+        const swept = db.prepare('DELETE FROM ledger_sweep').run().changes;
+        const n = db.prepare("DELETE FROM raw_transactions WHERE tx_hash LIKE 'LEDGER:%' OR tx_hash LIKE 'LEDGERAMM:%'").run().changes;
+        if (n > 0 || swept > 0) bumpDataVersion();
+        return n;
+      });
+      return run();
     },
 
     /** The number every data change bumps (see bumpDataVersion). '0' on a cache that predates it. */

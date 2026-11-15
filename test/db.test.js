@@ -730,6 +730,62 @@ test('the data version moves on every real change and only then, and clearAll dr
   db.close();
 });
 
+test('ledger trades: keys leave out AMM rows, the read range never claims more than is stored, and it only invalidates a report when it matters', () => {
+  const db = createDb(tmpDbPath());
+  const W = 'rTESTsweepA', H = (c) => c.repeat(64);
+  const lr = (key, ts, type) => ({ tx_hash: key, timestamp: ts, raw_json: JSON.stringify({ _ledger: 1, TransactionType: type || 'LedgerChange', Timestamp: ts }) });
+  db.insertRows(W, 'XRPL', [
+    lr('LEDGER:' + H('A'), '2025-01-01 00:00:00'), lr('LEDGERAMM:' + H('B'), '2025-01-02 00:00:00'),
+    lr(H('C'), '2025-02-01 00:00:00', 'OfferCreate'), lr(H('D'), '2025-03-01 00:00:00', 'Payment'),
+  ]);
+  assert.deepStrictEqual(db.getLedgerTradeKeys('XRPL'), [{ wallet: W, tx_hash: 'LEDGER:' + H('A') }]);
+  assert.deepStrictEqual(db.getLedgerTradeKeys('Xahau'), []);
+
+  // a bad range is refused
+  assert.throws(() => db.setLedgerSweep({ wallet: W, chain: 'ETH', through_ledger: 5, through_ts: '2025-01-15 00:00:00' }), /chain/);
+  assert.throws(() => db.setLedgerSweep({ wallet: W, chain: 'XRPL', through_ledger: 0, through_ts: '2025-01-15 00:00:00' }), /ledger index/);
+  assert.throws(() => db.setLedgerSweep({ wallet: W, chain: 'XRPL', through_ledger: 5, through_ts: '15 Jan 2025' }), /timestamp/);
+
+  // first read: always matters
+  const v0 = db.getDataVersion();
+  assert.strictEqual(db.setLedgerSweep({ wallet: W, chain: 'XRPL', through_ledger: 100, through_ts: '2025-01-15 00:00:00', txs: 2, stored: 2 }), true);
+  const v1 = db.getDataVersion();
+  assert.notStrictEqual(v1, v0);
+  // the range grows past an OfferCreate: that offer's booking changes
+  assert.strictEqual(db.setLedgerSweep({ wallet: W, chain: 'XRPL', through_ledger: 200, through_ts: '2025-02-15 00:00:00', txs: 3, stored: 2 }), true);
+  const v2 = db.getDataVersion();
+  assert.notStrictEqual(v2, v1);
+  // it grows past a Payment only: nothing a build does changes, so saved reports stay valid
+  assert.strictEqual(db.setLedgerSweep({ wallet: W, chain: 'XRPL', through_ledger: 300, through_ts: '2025-03-15 00:00:00', txs: 4, stored: 2 }), false);
+  assert.strictEqual(db.getDataVersion(), v2);
+  assert.throws(() => db.setLedgerSweep({ wallet: W, chain: 'XRPL', through_ledger: 250, through_ts: '2025-03-01 00:00:00' }), /backwards/);
+  assert.deepStrictEqual(db.getLedgerSweeps().map((s) => [s.wallet, s.chain, s.through_ledger, s.through_ts, s.txs, s.stored]),
+    [[W, 'XRPL', 300, '2025-03-15 00:00:00', 4, 2]]);
+
+  // the type filter the build uses counts ledger rows once the index exists
+  db.buildTypeIndex();
+  assert.strictEqual(db.countForChain('XRPL', ['Payment', 'OfferCreate', 'LedgerChange']), 4);
+  assert.strictEqual(db.countForChain('XRPL', ['Payment', 'OfferCreate']), 2);
+
+  // clearing one wallet's rows drops its range with them
+  db.clearWalletChain(W, 'XRPL');
+  assert.deepStrictEqual(db.getLedgerSweeps(), []);
+  assert.deepStrictEqual(db.getLedgerTradeKeys('XRPL'), []);
+
+  // clearLedgerTrades removes ledger rows and ranges, and nothing else
+  db.insertRows(W, 'XRPL', [lr('LEDGER:' + H('A'), '2025-01-01 00:00:00'), lr('LEDGERAMM:' + H('B'), '2025-01-02 00:00:00'), lr(H('C'), '2025-02-01 00:00:00', 'OfferCreate')]);
+  db.setLedgerSweep({ wallet: W, chain: 'XRPL', through_ledger: 100, through_ts: '2025-01-15 00:00:00', txs: 2, stored: 2 });
+  assert.strictEqual(db.clearLedgerTrades(), 2);
+  assert.strictEqual(db.countForWallet(W, 'XRPL'), 1);
+  assert.deepStrictEqual(db.getLedgerSweeps(), []);
+
+  // clearAll drops the range too
+  db.setLedgerSweep({ wallet: W, chain: 'XRPL', through_ledger: 100, through_ts: '2025-01-15 00:00:00', txs: 2, stored: 2 });
+  db.clearAll();
+  assert.deepStrictEqual(db.getLedgerSweeps(), [], 'clearAll left a read range for rows that no longer exist');
+  db.close();
+});
+
 console.log('');
 if (failures > 0) {
   console.log(`${failures} test(s) FAILED`);

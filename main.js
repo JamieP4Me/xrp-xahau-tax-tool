@@ -487,6 +487,12 @@ function registerIpcHandlers(db, dbPath) {
       return null;   // unreadable (e.g. written by another Electron/V8): rebuild instead
     }
   }));
+  // XRPL trades read from the ledger (see db.js ledger_sweep).
+  ipcMain.handle('db:getLedgerTradeKeys', guarded((_evt, chain) => db.getLedgerTradeKeys(chain)));
+  ipcMain.handle('db:getLedgerSweeps', guarded(() => db.getLedgerSweeps()));
+  ipcMain.handle('db:setLedgerSweep', guarded((_evt, s) => db.setLedgerSweep(s)));
+  ipcMain.handle('db:clearLedgerTrades', guarded(() => db.clearLedgerTrades()));
+
   ipcMain.handle('report:info', guarded(() => db.reportInfo()));
   ipcMain.handle('report:clear', guarded(() => db.clearReports()));
   ipcMain.handle('db:getDataVersion', guarded(() => db.getDataVersion()));

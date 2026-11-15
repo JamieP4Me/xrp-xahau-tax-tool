@@ -44,6 +44,25 @@ What that means for privacy and safety:
   servers, never logged, and never stored. `test/ledger-rpc.test.js` pins all
   of this.
 
+### XRPL trades read from the ledger (1.10.14)
+
+"Read XRPL trades from the ledger" on the Setup tab asks a full-history XRPL
+server for every transaction of each of your XRPL wallets (`account_tx`,
+read-only), and after the first read it runs by itself at the end of each
+download. It uses the server set in the on-chain check's settings, which is
+the public cluster `xrplcluster.com` unless you chose another. So **your
+wallet addresses go to that server**, which can see which addresses are being
+looked up from your IP address. Nothing else is sent: no Payment-Claim (unless
+the server you set is Dhali), no report data. It goes through the same
+main-process route as the balance check (`ledger-rpc.js`), with the same host
+and method lists. It does not run until you press the button once, and
+"Remove what was read" undoes it.
+
+A token's name is chosen by whoever issued it and is shown throughout the app.
+It is reduced to letters and digits once, where it is read
+(`ltCurrencyCode`); anything else is kept as its hex code. A test checks that
+markup in a token name cannot reach the page.
+
 ### The command-line scripts
 
 `scripts/verify-xrpl.js` and `scripts/xrp-bridge.js` used to send the
