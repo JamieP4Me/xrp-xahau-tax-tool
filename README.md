@@ -87,6 +87,9 @@ scripts/check-node.js             preinstall guard: refuses to build on a Node v
 
 - Each wallet+chain pair has a `sync_state.last_timestamp` cursor. A fetch
   only queries WinDB for rows newer than that cursor.
+- Within a fetch, each page starts from the last timestamp of the page before
+  (inclusive), not from a row count. See "A download that cannot skip a row"
+  below for why.
 - Every row fetched is stashed to `raw_transactions`, keyed by
   `(wallet, chain, tx_hash)`, so re-fetching an overlapping range is a no-op
   (`INSERT OR IGNORE`) rather than a duplicate.
@@ -1330,3 +1333,71 @@ it cannot tell. A bridged XAH or EVR is priced by itself.
   XAH or EVR.
 - The Holdings CSV has a Chain column, and `npm run trustlines` matches a
   token's basis by code and issuer instead of by name.
+
+## A download that cannot skip a row, and a clearer Form 8949 PDF (1.10.16)
+
+### Paging by position in time
+
+The download asked WinDB for a wallet's rows a page at a time with
+`ORDER BY Timestamp ... LIMIT 1000 OFFSET k`. `OFFSET` counts rows from the
+start of the result on every query, so it is right only if the result is
+identical from one query to the next. A database that removes duplicate rows
+in the background, or returns rows sharing a timestamp in no fixed order, does
+not promise that. A row that slides across a page boundary between two queries
+is returned by neither, and from then on it is older than the sync cursor, so
+no later download asks for it.
+
+Each page now starts from the last timestamp of the page before, inclusive:
+`Timestamp >= <last seen> ORDER BY Timestamp LIMIT 1000`. The rows at that
+timestamp are read again, so nothing at a boundary can be missed; the repeats
+are dropped (and the cache would ignore them anyway). If a whole page shares
+one timestamp the page size doubles until it can move on. It costs no extra
+queries. `keysetRows()` in `renderer/index.html` is the whole of it, and
+`test/download-paging.spec.js` runs the old method and the new one against a
+stand-in server that behaves the way a real one is allowed to: the old one
+loses a row, the new one does not.
+
+Three limits worth knowing:
+
+- **It protects downloads from now on.** It does not go back for a row an
+  earlier download may have missed. The on-chain balance check and the XRPL
+  ledger read are what would show such a gap; "Force full resync" re-reads
+  everything if one is found.
+- **It needs timestamps in a form it knows** (`2025-12-17 10:50:42.168000006`
+  and its shorter variants). If WinDB ever returns another form, that pass
+  says so in the log and pages the old way, rather than failing.
+- **The browser mode keeps the old paging.** It has no cache to absorb a row
+  read twice.
+
+Row keys are unchanged. A row without a transaction hash is stored under its
+timestamp plus the wallet, and two such rows at one timestamp would overwrite
+each other. Whether that can happen depends on whether rows ever share a
+timestamp, which the cache can answer: `npm run probe:ties` (readonly; prints
+counts and timestamp forms, never an address or a hash). Changing the keys
+without that answer would risk booking every existing hashless row twice.
+
+### Only an address or a timestamp goes into a query
+
+The WinDB queries are built as text. A wallet address, a timestamp and a row
+count are now each checked at the point they are written into one (`sqlAddr`,
+`sqlTs`, `sqlInt`), not only where they first entered the app. A saved sync
+point that is not a timestamp is not sent; that wallet's full history is read
+instead.
+
+### The Form 8949 PDF
+
+- The description column is wider and wraps to a second line instead of being
+  cut off. "… withdrawn from AMM pool" was the part that fell off the end.
+- An LP row names its pool: "LP XRP/MAG" instead of "LP token C3BE9D". The
+  pair is learned from the pool's own deposits and withdrawals as they are
+  booked; from this version the ledger read also stores the pool's two assets
+  on each AMM row. With one asset known it reads "LP XRP/? C3BE9D".
+- The asset column shows a token's code, not its code and issuer.
+
+### The bridge box
+
+The panel no longer offers an address it would refuse (one of your own
+wallets, an exchange address of yours, a gift address, a lost wallet), and
+both the box and the refusal now say what a bridge address is: not the wallet
+you sent from, but the address your wallet sent to, which a wallet app such as
+Xaman fills in for you.

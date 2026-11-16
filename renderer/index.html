@@ -3025,9 +3025,107 @@ function winDbSafeNow() {
 // existed. Returns {total, pages, maxTs, ok} — ok is false if a page
 // errored or the user hit Stop, which callers use to decide whether it's
 // safe to advance that wallet's sync cursor.
+// ── What may be written into a WinDB query ───────────────────────────────
+// The queries are built as text. Two kinds of value go into them: a wallet
+// address and a timestamp. Both are checked HERE, at the point of use, not
+// only where they first entered the app: the wallet list is read back from
+// local storage, and a timestamp used as a cursor came out of WinDB's own
+// rows. Anything that is not exactly an address or a timestamp stops the
+// query rather than becoming part of it.
+function sqlAddr(a) {
+  if(!R_ADDR_RE.test(String(a))) throw new Error('not a wallet address: ' + String(a).slice(0, 12));
+  return String(a);
+}
+function sqlInt(n) {
+  if(!Number.isSafeInteger(n) || n < 0) throw new Error('not a row count: ' + String(n).slice(0, 12));
+  return String(n);
+}
+const SQL_TS_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z?$/;
+function sqlTs(t) {
+  if(!SQL_TS_RE.test(String(t))) throw new Error('not a timestamp: ' + String(t).slice(0, 24));
+  return String(t);
+}
+
+// ── Paging that cannot skip a row ────────────────────────────────────────
+//
+// The download used to page with ORDER BY Timestamp ... LIMIT n OFFSET k.
+// OFFSET counts rows from the start of the result each time, so it is only
+// right if the result is IDENTICAL from one query to the next. WinDB does
+// not promise that: it can hold the same row twice until a background merge
+// removes one, and rows that share a timestamp have no fixed order. Either
+// shifts the count, and a row that slides across a page boundary between two
+// queries is returned by neither. It is older than the sync cursor from then
+// on, so no later download asks for it again.
+//
+// This pages by position in time instead. Each query asks for rows from the
+// last timestamp seen, INCLUSIVE, so the rows at that timestamp are fetched
+// again and nothing at a page boundary can be missed. The repeats are
+// recognised and dropped; the cache would ignore them anyway (same key,
+// same content). If a whole page shares one timestamp the page
+// cannot advance, so the limit is doubled until it can.
+//
+// Two things it is careful about:
+//   • "Already seen" means the identical row, compared whole. Two different
+//     rows at one timestamp are both kept, whatever ids they carry.
+//   • It needs timestamps it can read. If the first page's are not in the
+//     form it expects, it says so once and pages the old way for that pass,
+//     so a format change at WinDB can make a download slower to trust but
+//     never makes it fail.
+//
+// buildSql(offset, limit, from): `from` is the timestamp to start at (null =
+// the caller's own starting point). Yields { rows, received }: `rows` are the
+// ones not already yielded.
+const KEYSET_MAX_LIMIT = 64000;
+const sameRow = (r) => JSON.stringify(r);
+async function* keysetRows({ claim, buildSql, page, onFallback, maxLimit = KEYSET_MAX_LIMIT }) {
+  let from = null, limit = page, boundary = new Set();   // rows already yielded whose Timestamp === from
+  for(;;) {
+    const got = await windbQuery(buildSql(0, limit, from), claim);
+    let last = null;
+    for(const r of got) { const t = String(r.Timestamp ?? ''); if(last === null || t > last) last = t; }
+    const rows = from === null ? got : got.filter(r => !(String(r.Timestamp ?? '') === from && boundary.has(sameRow(r))));
+    const full = got.length >= limit;
+    yield { rows, received: got.length };
+    if(!full) return;
+    if(!SQL_TS_RE.test(String(last))) {
+      if(from !== null) throw new Error('a row has no usable Timestamp, so paging cannot continue safely');
+      if(onFallback) onFallback(String(last));
+      for(let offset = got.length;;) {
+        const more = await windbQuery(buildSql(offset, page, null), claim);
+        yield { rows: more, received: more.length };
+        if(more.length < page) return;
+        offset += more.length;
+      }
+    }
+    if(from !== null && last === from) {
+      // A full page, every row of it at the timestamp we started from: ask
+      // for more at once. What this page held has been handed on, so the
+      // larger read must not hand it on again.
+      for(const r of got) boundary.add(sameRow(r));
+      if(limit >= maxLimit) throw new Error(`more than ${limit.toLocaleString()} rows share the timestamp ${from}`);
+      limit *= 2;
+      continue;
+    }
+    boundary = new Set();
+    for(const r of got) if(String(r.Timestamp ?? '') === last) boundary.add(sameRow(r));
+    from = last; limit = page;
+  }
+}
+
+// The stored sync cursor goes into the next query. If it is not a timestamp
+// (a damaged cache, a format this version does not know), read the whole
+// history again rather than send it: slower, and nothing is lost, because a
+// row already in the cache is not stored twice.
+function usableCursor(ts, label) {
+  if(ts == null || ts === '') return null;
+  if(SQL_TS_RE.test(String(ts))) return String(ts);
+  log(`  ⚠ ${label}: the saved sync point is not a timestamp, so this wallet's full history is read again.`, 'wa');
+  return null;
+}
+
 async function paginateAndStash({ claim, chain, wallet, buildSql, page = 1000, onRowsLegacy, onError }) {
   let offset = 0, total = 0, pages = 0, maxTs = null, ok = true, truncated = false;
-  while (true) {
+  const ceiling = () => {
     // Hard ceiling purely to stop a runaway loop if WinDB ever keeps
     // returning full pages forever. It used to be 50 pages — i.e. 50,000
     // rows per wallet, per chain, per direction — which real wallets in this
@@ -3037,23 +3135,25 @@ async function paginateAndStash({ claim, chain, wallet, buildSql, page = 1000, o
     // and those rows became permanently unreachable on every future run.
     // Now the cap is high enough not to bind in practice, and reaching it is
     // reported as `truncated` so the cursor logic can refuse to skip ahead.
-    if (pages >= MAX_PAGES_PER_PASS) {
-      truncated = true;
-      log(`  ⚠ ${wallet} (${chain}): hit the ${MAX_PAGES_PER_PASS.toLocaleString()}-page safety ceiling (${total.toLocaleString()} rows) — this pass is INCOMPLETE, so the sync cursor will not advance past it. Re-run to continue from here.`, 'err');
-      break;
-    }
-    if (abortFlag) { ok = false; break; }
-    const sql = buildSql(offset, page);
-    let rows;
-    try {
-      rows = await windbQuery(sql, claim);
-    } catch (e) {
-      if (onError) onError(e, pages + 1);
-      ok = false;
-      break;
-    }
-    total += rows.length;
-    if (USE_LOCAL_DB) {
+    if (pages < MAX_PAGES_PER_PASS) return false;
+    truncated = true;
+    log(`  ⚠ ${wallet} (${chain}): hit the ${MAX_PAGES_PER_PASS.toLocaleString()}-page safety ceiling (${total.toLocaleString()} rows) — this pass is INCOMPLETE, so the sync cursor will not advance past what was actually fetched.`, 'wa');
+    return true;
+  };
+
+  // Desktop: page by position in time (see keysetRows) and stash each page.
+  if (USE_LOCAL_DB) {
+    const it = keysetRows({ claim, buildSql, page,
+      onFallback: () => log(`  ⚠ ${wallet} (${chain}): timestamps came back in a form this version does not know, so this pass is paged the old way.`, 'wa') });
+    for (;;) {
+      if (ceiling()) break;
+      if (abortFlag) { ok = false; break; }
+      let step;
+      try { step = await it.next(); }
+      catch (e) { if (onError) onError(e, pages + 1); ok = false; break; }
+      if (step.done) break;
+      const rows = step.value.rows;
+      total += rows.length;
       if (rows.length) {
         const toStash = rows.map(r => ({
           tx_hash: makeTxHash(r, r.Timestamp, wallet),
@@ -3065,9 +3165,27 @@ async function paginateAndStash({ claim, chain, wallet, buildSql, page = 1000, o
           if (r.Timestamp && (!maxTs || r.Timestamp > maxTs)) maxTs = r.Timestamp;
         }
       }
-    } else if (onRowsLegacy) {
-      onRowsLegacy(rows);
+      pages++;
     }
+    return { total, pages, maxTs, ok, truncated };
+  }
+
+  // Browser mode (no local cache): rows are processed as they arrive, so a
+  // row fetched twice would be booked twice. It keeps the original paging.
+  while (true) {
+    if (ceiling()) break;
+    if (abortFlag) { ok = false; break; }
+    const sql = buildSql(offset, page);
+    let rows;
+    try {
+      rows = await windbQuery(sql, claim);
+    } catch (e) {
+      if (onError) onError(e, pages + 1);
+      ok = false;
+      break;
+    }
+    total += rows.length;
+    if (onRowsLegacy) onRowsLegacy(rows);
     offset += rows.length;
     pages++;
     if (rows.length < page) break; // short page = genuinely reached the end
@@ -3292,18 +3410,21 @@ async function fetchXahauWinDB(claim, year) {
     if(USE_LOCAL_DB) {
       try { sinceTs = await window.taxDB.getSyncState(w, 'Xahau'); } catch(e) { sinceTs = null; }
     }
-    const timeFilter = sinceTs ? `AND ${timeCol} >= '${sinceTs}'` : '';
+    sinceTs = usableCursor(sinceTs, `${w.slice(0,14)}… (Xahau)`);
+    let addr;
+    try { addr = sqlAddr(w); } catch(e) { log(`  ⚠ skipped: ${e.message}`, 'er'); continue; }
+    const timeFilter = (from) => { const t = from || sinceTs; return t ? `AND ${timeCol} >= '${sqlTs(t)}'` : ''; };
     setProgress(i, selected.length, `Xahau: ${w.slice(0,14)}… (${i+1}/${selected.length})${sinceTs ? ' · incremental sync' : ' · full history'} · ${grandTotalRaw().toLocaleString()} rows scanned so far`);
 
     const outPass = await paginateAndStash({
       claim, chain: 'Xahau', wallet: w,
-      buildSql: (offset, page) => `SELECT ${safeCols.join(', ')}
+      buildSql: (offset, page, from) => `SELECT ${safeCols.join(', ')}
 FROM xahau.transactions
-WHERE ${acctCol} = '${w}'
+WHERE ${acctCol} = '${addr}'
   AND ${typeCol} IN (${sqlTypeList(FETCH_TYPES_XAHAU)})
-  ${timeFilter}
+  ${timeFilter(from)}
 ORDER BY ${timeCol} ASC
-LIMIT ${page} OFFSET ${offset}`.trim(),
+LIMIT ${sqlInt(page)} OFFSET ${sqlInt(offset)}`.trim(),
       onRowsLegacy: rows => { schemaLogged = true; processWalletRows(rows, w, walletSet); },
       onError: (e, pageNum) => log(`  ${w.slice(0,14)}… page ${pageNum} error: ${e.message}`, 'er'),
     });
@@ -3320,13 +3441,13 @@ LIMIT ${page} OFFSET ${offset}`.trim(),
     // ownSrc check inside processWalletRows().
     const inPass = await paginateAndStash({
       claim, chain: 'Xahau', wallet: w,
-      buildSql: (offset, page) => `SELECT ${safeCols.join(', ')}
+      buildSql: (offset, page, from) => `SELECT ${safeCols.join(', ')}
 FROM xahau.transactions
-WHERE ${destCol} = '${w}'
+WHERE ${destCol} = '${addr}'
   AND ${typeCol} IN (${sqlTypeList(FETCH_TYPES_IN_XAHAU)})
-  ${timeFilter}
+  ${timeFilter(from)}
 ORDER BY ${timeCol} ASC
-LIMIT ${page} OFFSET ${offset}`.trim(),
+LIMIT ${sqlInt(page)} OFFSET ${sqlInt(offset)}`.trim(),
       onRowsLegacy: rows => { processWalletRows(rows, w, walletSet, 'in'); },
       onError: (e, pageNum) => log(`  ${w.slice(0,14)}… (received) page ${pageNum} error: ${e.message}`, 'er'),
     });
@@ -3747,6 +3868,7 @@ function resetLedgerState() {
   // loaded from the cache once per build, before the XRPL rows are read.
   Object.keys(ledgerTradeStats).forEach(k => { ledgerTradeStats[k] = 0; });
   ledgerTradeLog.length = 0;
+  Object.keys(lpPools).forEach(k => { delete lpPools[k]; });
   bridgeScan.xOut.length = 0; bridgeScan.lSent.length = 0; bridgeScan.hints = {};
 }
 
@@ -3780,7 +3902,7 @@ function snapshotLedgerState(opts = {}) {
     bookingJournal: c(bookingJournal), journalBuildInfo: c(journalBuildInfo), dailyJournal: c(dailyJournal),
     remitBooked: c(remitBooked),
     ledgerTradeStats: c(ledgerTradeStats), ledgerTradeLog: c(ledgerTradeLog),
-    bridgeHints: c(bridgeScan.hints),
+    bridgeHints: c(bridgeScan.hints), lpPools: c(lpPools),
   };
 }
 function restoreLedgerState(snap, opts = {}) {
@@ -3814,6 +3936,7 @@ function restoreLedgerState(snap, opts = {}) {
   Object.assign(remitBooked, c(snap.remitBooked || {}));
   Object.assign(ledgerTradeStats, c(snap.ledgerTradeStats || {})); fill(ledgerTradeLog, c(snap.ledgerTradeLog || []));
   bridgeScan.hints = c(snap.bridgeHints || {});
+  Object.keys(lpPools).forEach(k => { delete lpPools[k]; }); Object.assign(lpPools, c(snap.lpPools || {}));
   journalBuildInfo = c(snap.journalBuildInfo || null);
   syncTaxYearSelects();
   applyGiftValues();
@@ -3840,6 +3963,8 @@ function holdingDays(acqDateStr, disposalDateKey) {
 // booked here as a fully taxable sale at market value, and without the
 // destination there is no way to see that, or to find which addresses are
 // responsible for the bulk of the reported gain. See renderHoldings().
+// An LP token's ticker: a currency code starting 03, then the pool's account.
+const LP_TICKER_RE = /^03[0-9A-F]{38}\./i;
 function pushDisposal(wallet, ticker, totalQty, dk, ds, yr, hash, priceH, priceL, descSuffix, counterparty) {
   // Last line of defence for the totals. Everything downstream sums
   // proceeds/gain with .reduce(), so a single non-finite price here would
@@ -3913,6 +4038,7 @@ const cents = (n) => {
       basis: b,
       gainH: cents(pH - b), gainL: cents(pL - b),
       txHash: hash, counterparty: counterparty || '', description: `${qty.toFixed(4)} ${ltTokenLabel(ticker)}${descSuffix||''}`,
+      ...(LP_TICKER_RE.test(ticker) ? { descTail: descSuffix || '' } : {}),
       rowKey: `${wallet}_${hash}_${ticker}_${term}`
     };
   };
@@ -4989,18 +5115,21 @@ async function fetchXRPLWinDB(claim) {
     if(USE_LOCAL_DB) {
       try { sinceTs = await window.taxDB.getSyncState(w, 'XRPL'); } catch(e) { sinceTs = null; }
     }
-    const timeFilter = sinceTs ? `AND Timestamp >= '${sinceTs}'` : '';
+    sinceTs = usableCursor(sinceTs, `${w.slice(0,14)}… (XRPL)`);
+    let addr;
+    try { addr = sqlAddr(w); } catch(e) { log(`  ⚠ skipped: ${e.message}`, 'er'); continue; }
+    const timeFilter = (from) => { const t = from || sinceTs; return t ? `AND Timestamp >= '${sqlTs(t)}'` : ''; };
     setProgress(i, selected.length, `XRPL: ${w.slice(0,14)}… (${i+1}/${selected.length})${sinceTs ? ' · incremental sync' : ' · full history'} · ${grandTotalRaw().toLocaleString()} rows scanned so far`);
 
     const outPass = await paginateAndStash({
       claim, chain: 'XRPL', wallet: w,
-      buildSql: (offset, page) => `SELECT ${safeCols.join(', ')}
+      buildSql: (offset, page, from) => `SELECT ${safeCols.join(', ')}
 FROM ${XRPL_TABLE}
-WHERE Account = '${w}'
+WHERE Account = '${addr}'
   AND TransactionType IN (${sqlTypeList(FETCH_TYPES_XRPL)})
-  ${timeFilter}
+  ${timeFilter(from)}
 ORDER BY Timestamp ASC
-LIMIT ${page} OFFSET ${offset}`.trim(),
+LIMIT ${sqlInt(page)} OFFSET ${sqlInt(offset)}`.trim(),
       onRowsLegacy: rows => { processXRPLRows(rows, w, walletSet); },
       onError: (e, pageNum) => log(`  XRPL ${w.slice(0,14)}… page ${pageNum} error: ${e.message}`, 'er'),
     });
@@ -5016,13 +5145,13 @@ LIMIT ${page} OFFSET ${offset}`.trim(),
     // here (handled above from the sending wallet's own pass).
     const inPass = await paginateAndStash({
       claim, chain: 'XRPL', wallet: w,
-      buildSql: (offset, page) => `SELECT ${safeCols.join(', ')}
+      buildSql: (offset, page, from) => `SELECT ${safeCols.join(', ')}
 FROM ${XRPL_TABLE}
-WHERE Destination = '${w}'
+WHERE Destination = '${addr}'
   AND TransactionType IN (${sqlTypeList(FETCH_TYPES_IN_XRPL)})
-  ${timeFilter}
+  ${timeFilter(from)}
 ORDER BY Timestamp ASC
-LIMIT ${page} OFFSET ${offset}`.trim(),
+LIMIT ${sqlInt(page)} OFFSET ${sqlInt(offset)}`.trim(),
       onRowsLegacy: rows => { processXRPLRows(rows, w, walletSet, 'in'); },
       onError: (e, pageNum) => log(`  XRPL ${w.slice(0,14)}… (received) error: ${e.message}`, 'er'),
     });
@@ -5110,6 +5239,33 @@ const ledgerTradeStats = { rows: 0, buys: 0, sells: 0, xrpSpent: 0, xrpReceived:
                            bridgeOut: 0, bridgeIn: 0, bridgeUnmatched: 0,
                            tokenGifts: 0 };
 const ledgerTradeLog = [];   // one line per ledger row: what it was, how it was booked
+// Which two assets each AMM pool holds, learned from the pool's own
+// transactions as they are booked: LP token ticker → the assets seen going in
+// or coming out with it. An LP token's currency code is a hash, so without
+// this an LP row on Form 8949 can only say "LP token C3BE9D".
+const lpPools = {};
+function lpPoolSeen(lpTicker, tickers) {
+  if(!lpTicker) return;
+  const known = lpPools[lpTicker] || (lpPools[lpTicker] = []);
+  for(const t of tickers || []) if(t && t !== lpTicker && !known.includes(t) && known.length < 2) known.push(t);
+  known.sort((a, b) => (a === 'XRP' ? -1 : b === 'XRP' ? 1 : a < b ? -1 : a > b ? 1 : 0));
+}
+// "LP XRP/MAG" once both assets are known, "LP XRP/? C3BE9D" with one, null with none.
+function lpPoolName(lpTicker) {
+  const known = lpPools[lpTicker];
+  if(!known || !known.length) return null;
+  const code = (t) => { const c = ltIsToken(t) ? t.slice(0, t.indexOf('.')) : String(t); return c.length > 12 ? c.slice(0, 8) + '…' : c; };
+  if(known.length >= 2) return `LP ${code(known[0])}/${code(known[1])}`;
+  return `LP ${code(known[0])}/? ${String(lpTicker).slice(2, 8)}`;
+}
+// A pool's second asset can first appear after rows naming it were written
+// (a one-sided deposit, then a two-sided withdrawal). One pass at the end of
+// the build gives every LP row the same, final name.
+function relabelLpRows() {
+  for(const r of allDisposalsHigh) {
+    if(r && r.descTail !== undefined && lpPools[r.ticker]) r.description = `${r.qty.toFixed(4)} ${ltTokenLabel(r.ticker)}${r.descTail}`;
+  }
+}
 
 async function loadLedgerTradeIndex() {
   ledgerTradeIndex.keys.clear(); ledgerTradeIndex.through.clear();
@@ -5263,6 +5419,9 @@ function bookAmmFromLedger(row, wallet, shape, ctx) {
   const assets = [];
   if(shape.xrp) assets.push({ ticker: 'XRP', qty: Math.abs(shape.xrp), sign: Math.sign(shape.xrp) });
   for(const t of others) { const tk = ltTicker(t.c, t.i); if(tk) assets.push({ ticker: tk, qty: Math.abs(Number(t.d)), sign: Math.sign(Number(t.d)) }); }
+  // The pool's two assets: named on the row when the ledger read stored them
+  // (1.10.16 on), otherwise whatever moved with the LP tokens here.
+  if(lpTicker) lpPoolSeen(lpTicker, Array.isArray(row.Pool) && row.Pool.length ? row.Pool : assets.map(a => a.ticker));
   const text = assets.map(a => `${a.qty} ${ltTokenLabel(a.ticker)} ${a.sign > 0 ? 'in' : 'out'}`).join('; ');
   const lpQty = lp ? Math.abs(Number(lp.d)) : 0;
   const deposit = lp && Number(lp.d) > 0;
@@ -7619,20 +7778,27 @@ function leaseSql(w, cols, sinceTs, page, offset) {
     .filter(c => !cols || cols.includes(c));
   return `SELECT ${sel.join(', ')}
 FROM xahau.transactions
-WHERE TransactionType = 'URITokenBuy' AND TransactionResult = 'tesSUCCESS' AND Account != '${w}'
+WHERE TransactionType = 'URITokenBuy' AND TransactionResult = 'tesSUCCESS' AND Account != '${sqlAddr(w)}'
   AND URITokenID IN (SELECT DISTINCT URITokenID FROM xahau.transactions
-                     WHERE Account = '${w}' AND TransactionType = 'URITokenCreateSellOffer' AND TransactionResult = 'tesSUCCESS')
-  ${sinceTs ? `AND Timestamp >= '${sinceTs}'` : ''}
+                     WHERE Account = '${sqlAddr(w)}' AND TransactionType = 'URITokenCreateSellOffer' AND TransactionResult = 'tesSUCCESS')
+  ${sinceTs ? `AND Timestamp >= '${sqlTs(sinceTs)}'` : ''}
 ORDER BY Timestamp ASC
-LIMIT ${page} OFFSET ${offset}`.trim();
+LIMIT ${sqlInt(page)} OFFSET ${sqlInt(offset)}`.trim();
 }
 async function fetchLeaseSales(claim, w, walletSet, cols, sinceTs, page = 1000) {
-  let offset = 0, total = 0, pages = 0, maxTs = null, ok = true, truncated = false, evr = 0, internal = 0, external = 0;
+  let total = 0, pages = 0, maxTs = null, ok = true, truncated = false, evr = 0, internal = 0, external = 0;
+  sinceTs = usableCursor(sinceTs, `${w.slice(0,14)}… (leases)`);
+  // Paged by position in time, like the other passes (see keysetRows): a
+  // lease that slid across a page boundary used to be missed for good, and
+  // one read twice would have been counted twice in the totals below.
+  const it = keysetRows({ claim, page,
+    buildSql: (offset, limit, from) => leaseSql(w, cols, from || sinceTs, limit, offset),
+    onFallback: () => log(`  ⚠ ${w.slice(0,14)}… (leases): timestamps came back in a form this version does not know, so this pass is paged the old way.`, 'wa') });
   while(true) {
     if(pages >= MAX_PAGES_PER_PASS) { truncated = true; break; }
     if(abortFlag) { ok = false; break; }
     let rows;
-    try { rows = await windbQuery(leaseSql(w, cols, sinceTs, page, offset), claim); }
+    try { const step = await it.next(); if(step.done) break; rows = step.value.rows; }
     catch(e) { log(`  ${w.slice(0,14)}… (leases) page ${pages + 1} error: ${e.message}`, 'er'); ok = false; break; }
     const byPerspective = new Map();
     for(const r of rows) {
@@ -7654,8 +7820,7 @@ async function fetchLeaseSales(claim, w, walletSet, cols, sinceTs, page = 1000) 
     if(USE_LOCAL_DB) {
       for(const [key, list] of byPerspective) await window.taxDB.insertRows(key.split('|')[0], 'Xahau', list);
     }
-    total += rows.length; offset += rows.length; pages++;
-    if(rows.length < page) break;
+    total += rows.length; pages++;
   }
   return { total, pages, maxTs, ok, truncated, evr, internal, external };
 }
@@ -8003,6 +8168,21 @@ function truncateToWidth(doc, text, maxWidth) {
   return s + '…';
 }
 
+// A cell that may run to several lines instead of being cut off. Used for the
+// Form 8949 description, where "… withdrawn from AMM pool" is the part a
+// reader needs and was the part that fell off the end. Lines beyond
+// `maxLines` are folded into the last one, which is then shortened, so a
+// freak value cannot make a row taller than that.
+const PDF_WRAP_LINE_H = 8;
+function wrapToWidth(doc, text, maxWidth, maxLines = 3) {
+  if(doc.getTextWidth(text) <= maxWidth) return [text];
+  const lines = doc.splitTextToSize(text, maxWidth);
+  if(lines.length <= maxLines) return lines;
+  const kept = lines.slice(0, maxLines - 1);
+  kept.push(truncateToWidth(doc, lines.slice(maxLines - 1).join(' '), maxWidth));
+  return kept;
+}
+
 function pdfSummaryLine(doc, x, y, label, sum) {
   doc.setFont('helvetica','normal'); doc.setFontSize(9);
   doc.text(`${label} — Proceeds: ${fmtMoney(sum.proceeds)}   Cost Basis: ${fmtMoney(sum.basis)}   Gain/(Loss): ${fmtMoney(sum.gain)}`, x+10, y);
@@ -8040,33 +8220,44 @@ function pdfTable(doc, {cols, rows, x0, startY, margin, rowH=14, headerH=16}) {
     return y + 18;
   }
   rows.forEach((row,i)=>{
-    if(y + rowH > pageH - margin) {
+    // `_bold` marks a subtotal/summary row. Optional: callers that don't set
+    // it get exactly the previous behaviour. Set before measuring, because
+    // bold text is wider.
+    if(row._bold) doc.setFont('helvetica','bold');
+    // A column marked `wrap` may take several lines; the row grows to fit.
+    // Every other cell is one line, shortened with an ellipsis as before.
+    const cells = cols.map(c => {
+      const text = String(row[c.key] ?? '');
+      return c.wrap ? wrapToWidth(doc, text, c.w - 5, c.maxLines) : [truncateToWidth(doc, text, c.w - 5)];
+    });
+    const h = rowH + (Math.max(...cells.map(l => l.length)) - 1) * PDF_WRAP_LINE_H;
+    if(y + h > pageH - margin) {
       doc.addPage();
       y = margin;
       drawHeader();
+      if(row._bold) doc.setFont('helvetica','bold');
     }
-    // `_bold` marks a subtotal/summary row. Optional: callers that don't set
-    // it get exactly the previous behaviour.
     if(row._bold) {
       doc.setFillColor(233,238,247);
-      doc.rect(x0, y, totalW, rowH, 'F');
-      doc.setFont('helvetica','bold');
+      doc.rect(x0, y, totalW, h, 'F');
     } else if(i % 2 === 1) {
       doc.setFillColor(245,247,250);
-      doc.rect(x0, y, totalW, rowH, 'F');
+      doc.rect(x0, y, totalW, h, 'F');
     }
     let x = x0;
-    cols.forEach(c=>{
-      const val = truncateToWidth(doc, String(row[c.key] ?? ''), c.w - 5);
+    cols.forEach((c, ci)=>{
       // Right-aligned numeric columns. Figures that do not share a decimal
       // position cannot be compared down a column at a glance, which is the
       // only reason to put them in a column.
-      if(c.align === 'right') doc.text(val, x + c.w - 3, y + rowH - 4, { align:'right' });
-      else doc.text(val, x+3, y+rowH-4);
+      cells[ci].forEach((val, li) => {
+        const ty = y + rowH - 4 + li * PDF_WRAP_LINE_H;
+        if(c.align === 'right') doc.text(val, x + c.w - 3, ty, { align:'right' });
+        else doc.text(val, x+3, ty);
+      });
       x += c.w;
     });
     if(row._bold) doc.setFont('helvetica','normal');
-    y += rowH;
+    y += h;
   });
   doc.setDrawColor(200,200,200);
   doc.line(x0, y, x0+totalW, y);
@@ -8074,6 +8265,14 @@ function pdfTable(doc, {cols, rows, x0, startY, margin, rowH=14, headerH=16}) {
 }
 
 const pdfWalletShort = w => (w && w.length > 14) ? `${w.slice(0,8)}…${w.slice(-4)}` : (w||'');
+
+// The asset column is 38 points wide: a token shows its code, an LP token "LP".
+function pdfAssetShort(ticker) {
+  if(!ltIsToken(ticker)) return String(ticker || '');
+  if(LP_TICKER_RE.test(ticker)) return 'LP';
+  const code = ticker.slice(0, ticker.indexOf('.'));
+  return code.length > 8 ? code.slice(0, 7) + '…' : code;
+}
 
 function pdfDisposalRow(r) {
   return {
@@ -8085,14 +8284,16 @@ function pdfDisposalRow(r) {
     code: '',
     adj: '—',
     gain: fmtMoney(r.gain),
-    chain: r.ticker,
+    chain: pdfAssetShort(r.ticker),
     wallet: pdfWalletShort(r.wallet),
     term: effectiveTerm(r)==='LT' ? 'LT' : 'ST',
   };
 }
 
 const PDF_DISPOSAL_COLS = [
-  {key:'desc',     label:'(a) Description',    w:120},
+  // The description takes the width the page has to spare (landscape letter,
+  // 30pt margins: 732 across, 706 used), and wraps when it still does not fit.
+  {key:'desc',     label:'(a) Description',    w:200, wrap:true},
   {key:'acq',      label:'(b) Acquired',       w:56},
   {key:'sold',     label:'(c) Sold',           w:56},
   {key:'proceeds', label:'(d) Proceeds',       w:58},
@@ -8603,6 +8804,7 @@ async function streamAllIntoLedger(walletSet) {
     }
   }
   for(const st of streams) log(`    …${st.chain}: ${st.done.toLocaleString()} / ${st.total.toLocaleString()}`, 'in');
+  relabelLpRows();
   return doneAll;
 }
 

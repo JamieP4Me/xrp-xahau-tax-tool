@@ -1,7 +1,7 @@
 {
   "name": "xrp-xahau-tax-tool",
   "productName": "XRP & Xahau Tax Tool",
-  "version": "1.10.15",
+  "version": "1.10.16",
   "description": "Local desktop app for full XRP/Xahau transaction history and Form 8949/Schedule D generation, backed by a local SQLite cache with incremental sync.",
   "main": "main.js",
   "author": "XRP & Xahau Tax Tool contributors",
@@ -13,7 +13,7 @@
   "scripts": {
     "preinstall": "node scripts/check-node.js",
     "start": "electron .",
-    "test:db": "node test/db.test.js && node test/verify-xrpl.test.js && node test/iou-inventory.test.js && node test/sign-native.test.js && node test/supply-chain.test.js && node test/price-tables.test.js && node test/ledger-lock.test.js && node test/ledger-rpc.test.js && node test/trustlines.test.js",
+    "test:db": "node test/db.test.js && node test/verify-xrpl.test.js && node test/iou-inventory.test.js && node test/sign-native.test.js && node test/supply-chain.test.js && node test/price-tables.test.js && node test/ledger-lock.test.js && node test/ledger-rpc.test.js && node test/trustlines.test.js && node test/probe-ties.test.js",
     "test:e2e": "playwright test test/*.spec.js --reporter=line",
     "test": "npm run test:db && npm run test:e2e",
     "test:log": "node scripts/test-log.js",
@@ -35,6 +35,8 @@
     "iou:inventory": "node scripts/iou-inventory.js",
     "preiou:inventory": "node scripts/check-abi.js node",
     "probe:xahau": "node scripts/probe-xahau-iou.js",
+    "probe:ties": "node scripts/probe-ties.js",
+    "preprobe:ties": "node scripts/check-abi.js node",
     "preprobe:xahau": "node scripts/check-abi.js node",
     "audit:types": "node scripts/audit-types.js",
     "preaudit:types": "node scripts/check-abi.js node",

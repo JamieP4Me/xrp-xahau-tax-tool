@@ -44,6 +44,16 @@ What that means for privacy and safety:
   servers, never logged, and never stored. `test/ledger-rpc.test.js` pins all
   of this.
 
+### What is written into a WinDB query (1.10.16)
+
+The download builds its WinDB queries as text. Three kinds of value are
+written into them: a wallet address, a timestamp and a row count. Each is
+checked where it is written (`sqlAddr`, `sqlTs`, `sqlInt` in
+`renderer/index.html`); anything else stops the query. This matters because
+the timestamp a page starts from is taken from WinDB's own previous answer,
+and the saved sync point is read back from the local cache: neither is typed
+by you, and neither is trusted. `test/download-paging.spec.js` pins it.
+
 ### XRPL trades read from the ledger (1.10.14)
 
 "Read XRPL trades from the ledger" on the Setup tab asks a full-history XRPL

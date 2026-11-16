@@ -101,7 +101,13 @@ function ltTokenLabel(ticker) {
   if (!ltIsToken(ticker)) return String(ticker);
   const i = ticker.indexOf('.');
   const code = ticker.slice(0, i), issuer = ticker.slice(i + 1);
-  const name = /^03[0-9A-F]{38}$/.test(code) ? 'LP token ' + code.slice(2, 8) : (code.length > 20 ? code.slice(0, 8) + '…' : code);
+  if (/^03[0-9A-F]{38}$/.test(code)) {
+    // An LP token's code is a hash. Once the engine has seen the pool's
+    // assets it is named for them: "LP XRP/MAG".
+    const pool = (typeof lpPoolName === 'function') ? lpPoolName(ticker) : null;
+    return pool || `LP token ${code.slice(2, 8)} (${issuer.slice(0, 7)}…)`;
+  }
+  const name = code.length > 20 ? code.slice(0, 8) + '…' : code;
   return `${name} (${issuer.slice(0, 7)}…)`;
 }
 
@@ -165,7 +171,15 @@ function ltChangesFromTx(entry, wallet) {
     account: String(tx.Account || ''), destination: String(tx.Destination || ''),
     role: signer ? 'sent' : (tx.Destination === wallet ? 'received' : 'affected'),
     fee, xrp, tokens: ltIouDeltas(meta, wallet),
+    pool: /^AMM/.test(String(tx.TransactionType || '')) ? [tx.Asset, tx.Asset2].map(ltAssetTicker).filter(Boolean) : [],
   };
+}
+
+// An AMM transaction names its pool's two assets: { currency: 'XRP' } or { currency, issuer }.
+function ltAssetTicker(a) {
+  if (!a || typeof a !== 'object') return null;
+  if (a.currency === 'XRP' && !a.issuer) return 'XRP';
+  return ltTicker(a.currency, a.issuer);
 }
 
 const ltTs = (ms) => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
@@ -182,6 +196,7 @@ function ltCacheRow(ch) {
     Account: ch.account, Destination: ch.destination, Role: ch.role,
     Fee_XRP: ch.fee, XRP: ch.xrp, Tokens: ch.tokens,
   };
+  if (amm && Array.isArray(ch.pool) && ch.pool.length === 2) raw.Pool = ch.pool;
   return { tx_hash: (amm ? 'LEDGERAMM:' : 'LEDGER:') + ch.hash, timestamp: ts, raw_json: JSON.stringify(raw) };
 }
 
@@ -443,6 +458,9 @@ function bridgeSuggestions() {
     const code = r.ticker.slice(0, r.ticker.indexOf('.')).toUpperCase();
     if (code !== 'XAH' && code !== 'EVR') continue;
     if (isBridgeAddress(r.counterparty) && bridgedNative(r.ticker)) continue;
+    // Never offer an address that would be refused: one of your own wallets,
+    // an exchange address of yours, a gift address or a lost wallet.
+    if (bridgeAddressConflict(r.counterparty)) continue;
     let e = by.get(r.counterparty);
     if (!e) by.set(r.counterparty, e = { addr: r.counterparty, tokens: new Map(), n: 0 });
     let t = e.tokens.get(r.ticker);
@@ -461,7 +479,7 @@ function renderBridgeBox() {
   const q = (n) => n.toLocaleString(undefined, { maximumFractionDigits: 2 });
   _bridgeSuggestions = bridgeSuggestions();
   _bridgeHints = (typeof bridgeScan === 'undefined') ? [] : Object.entries(bridgeScan.hints)
-    .filter(([a]) => LT_ADDR_RE.test(a) && !isBridgeAddress(a))
+    .filter(([a]) => LT_ADDR_RE.test(a) && !isBridgeAddress(a) && !bridgeAddressConflict(a))
     .map(([addr, h]) => ({ addr, n: h.n, qty: h.qty, native: h.native, dir: h.dir })).sort((a, b) => b.n - a.n).slice(0, 6);
   const s = (typeof ledgerTradeStats !== 'undefined') ? ledgerTradeStats : {};
   const transit = (typeof walletLedger !== 'undefined' && walletLedger[BRIDGE_TRANSIT]) || {};
@@ -491,12 +509,15 @@ function renderBridgeBox() {
         <button class="sml" style="margin-left:6px" onclick="markBridgeHint(${i})">Mark as bridge</button></div>`).join('')}
     </div>` : ''}
     <div class="row" style="margin-top:6px">
-      <input id="bridgeAddrInput" style="flex:1;max-width:340px;font-size:11px;margin:0" placeholder="A bridge's address (on either chain)">
+      <input id="bridgeAddrInput" style="flex:1;max-width:340px;font-size:11px;margin:0" placeholder="The bridge's own address (not your wallet)">
       <button class="sml" onclick="addBridgeUI()">Add bridge address</button>
     </div>
     <div style="font-size:10px;color:#888;margin-top:4px;line-height:1.5">
       A bridge moves your XAH or EVR between Xahau and the XRP Ledger. Marked, a payment to it is not a sale and what arrives from it is not
-      income: the coins keep their cost and dates across the crossing. Mark the bridge's address on <b>both</b> chains if they differ.
+      income: the coins keep their cost and dates across the crossing. Mark the bridge's address on <b>both</b> chains if they differ.<br>
+      <b>The bridge's address is not your wallet.</b> It is the address your wallet sent the coins to, and the one that paid them to you
+      on the other chain. A wallet app such as Xaman fills it in for you, so you may never have seen it: the app finds it on the ledger
+      and lists it above with a "Mark as bridge" button. Type an address here only if a bridge you used is not listed.
     </div>`;
 }
 
@@ -506,11 +527,19 @@ async function bridgeChanged() {
   await refreshLedgerTradesPanel();
   if (typeof renderHoldings === 'function') { try { await renderHoldings(); } catch (e) {} }
 }
+// Why an address was refused, and what to do instead.
+function bridgeRefusal(why) {
+  const own = /your own/.test(why);
+  return `That address cannot be a bridge: ${why}.` + (own
+    ? '\n\nA bridge is not the wallet you sent from. It is the address your wallet sent the coins TO on one chain, and the address that paid them to you on the other. ' +
+      'Your wallet app filled it in for you. Look in the yellow panel above this box: the app lists the addresses it found on the ledger, each with a "Mark as bridge" button.'
+    : '');
+}
 async function markBridgeSuggestion(i) {
   const e = _bridgeSuggestions[i];
   if (!e || (typeof ledgerBusy === 'function' && ledgerBusy())) return;
   const why = bridgeAddressConflict(e.addr);
-  if (why) { alert(`That address cannot be a bridge: ${why}.`); return; }
+  if (why) { alert(bridgeRefusal(why)); return; }
   addBridgeAddress(e.addr);
   for (const t of e.tokens.values()) setBridgedToken(t.ticker, t.native);
   await bridgeChanged();
@@ -522,7 +551,7 @@ async function markBridgeHint(i) {
 async function markBridgeUI(addr) {
   if (typeof ledgerBusy === 'function' && ledgerBusy()) return;
   const why = bridgeAddressConflict(addr);
-  if (why) { alert(`That address cannot be a bridge: ${why}.`); return; }
+  if (why) { alert(bridgeRefusal(why)); return; }
   if (!confirm(`Mark ${addr} as a bridge?\n\nCoins you sent to it will no longer be booked as sold; they are treated as your own coins moving to the other chain. Only do this for an address you used as a bridge.`)) return;
   addBridgeAddress(addr);
   await bridgeChanged();
