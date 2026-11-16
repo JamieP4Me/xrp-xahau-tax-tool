@@ -105,6 +105,15 @@ test('the Holdings CSV supplies basis per wallet and token, and the XRP price', 
   assert.strictEqual(t.basisFor({ basis: 5, qty: 2 }, 10), 5);
   assert.strictEqual(t.basisFor(undefined, 10), 0);
   assert.strictEqual(m.get('__XRPUSD'), 2.25);
+  // 1.10.15 exports: tokens by code and issuer, and a Chain column. A Xahau row is not a trust line's basis.
+  fs.writeFileSync(f, 'Wallet,Description,Type,Asset,Quantity,Cost Basis USD,Unit Price USD,Price As Of,Current Value USD,Chain\n' +
+    'rEXAMPLE,Main,active,XRP,10,5.00,2.250000,2026-11-13,22.50,XRPL\n' +
+    'rEXAMPLE,Main,active,EVR,70000,129.00,0.1,2026-11-13,7000,Xahau\n' +
+    'rEXAMPLE,Main,active,mXRP.rEXAMPLEissuer,191.4,570.38,0,,0,XRPL\n');
+  const m2 = t.readHoldings(f);
+  assert.deepStrictEqual(m2.get('rEXAMPLE|MXRP.rEXAMPLEissuer'), { basis: 570.38, qty: 191.4 });
+  assert.strictEqual(m2.get('rEXAMPLE|EVR'), undefined, 'a Xahau holding was offered as an XRPL trust line\'s basis');
+  assert.strictEqual(m2.get('__XRPUSD'), 2.25);
   assert.throws(() => { fs.writeFileSync(f, 'a,b\n1,2\n'); t.readHoldings(f); }, /Holdings-By-Wallet/);
 });
 

@@ -170,9 +170,18 @@ function readHoldings(file) {
   const rows = text.split(/\r?\n/).filter(Boolean).map(parseCsvLine);
   const head = rows.shift() || [];
   const iW = head.indexOf('Wallet'), iA = head.indexOf('Asset'), iB = head.indexOf('Cost Basis USD'), iP = head.indexOf('Unit Price USD'), iQ = head.indexOf('Quantity');
+  const iC = head.indexOf('Chain');
   if (iW < 0 || iA < 0 || iB < 0) throw new Error('not a Holdings-By-Wallet CSV (needs Wallet, Asset, Cost Basis USD columns)');
   for (const r of rows) {
-    const k = r[iW] + '|' + String(r[iA] || '').toUpperCase();
+    const asset = String(r[iA] || '');
+    // Since 1.10.14 an XRPL token is listed as "<code>.<issuer>", which names
+    // the trust line exactly. Since 1.10.15 a Chain column says which chain a
+    // row is on; a Xahau row (the wallet's Xahau EVR, say) is not about any
+    // XRPL trust line and is left out, where before it was prorated in.
+    const dot = asset.indexOf('.');
+    if (dot > 0) { map.set(r[iW] + '|' + asset.slice(0, dot).toUpperCase() + '.' + asset.slice(dot + 1), { basis: num(r[iB]), qty: iQ >= 0 ? num(r[iQ]) : 0 }); map.set('__EXACT', true); continue; }
+    if (iC >= 0 && String(r[iC]) !== 'XRPL' && asset.toUpperCase() !== 'XRP') continue;
+    const k = r[iW] + '|' + asset.toUpperCase();
     const h = map.get(k) || { basis: 0, qty: 0 };
     h.basis += num(r[iB]); h.qty += iQ >= 0 ? num(r[iQ]) : 0;
     map.set(k, h);
@@ -332,7 +341,11 @@ async function main() {
       const rc = recv.get(issuer + '|' + cur);
       r.received = rc ? rc.n : 0;
       r.lastReceived = rc && rc.last ? String(rc.last).replace(' ', 'T') + 'Z' : null;
-      r.basisUsd = holdingsFile ? basisFor(holdings.get(W + '|' + cur.toUpperCase()), r.balance) : null;
+      // An exact match on code and issuer when the export has them; the
+      // older by-name match (prorated) only for an export that predates that.
+      const exact = holdings.get(W + '|' + cur.toUpperCase() + '.' + issuer);
+      r.basisUsd = !holdingsFile ? null : exact ? basisFor(exact, r.balance)
+        : holdings.get('__EXACT') ? 0 : basisFor(holdings.get(W + '|' + cur.toUpperCase()), r.balance);
 
       if (lp && chain === 'XRPL') {
         const a = await call('amm_info', { amm_account: issuer, ledger_index: 'validated' });

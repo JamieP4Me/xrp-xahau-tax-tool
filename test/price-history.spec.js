@@ -711,20 +711,20 @@ test('a build that stops mid-way repaints and says so, instead of claiming it is
       // Stubbing window.taxDB does NOT work — contextBridge exposes a frozen
       // object, so the assignment silently does nothing and the build then
       // succeeds, which is exactly how this test first passed for the wrong
-      // reason. streamChainIntoLedger is a plain declaration in renderer
+      // reason. streamAllIntoLedger is a plain declaration in renderer
       // scope, and failing there is also the realistic case: it is the long
       // pass over millions of rows, and it fails BEFORE any volume has
       // accumulated, so the page is left in the state the user reported.
-      const realStream = streamChainIntoLedger;
+      const realStream = streamAllIntoLedger;
       // eslint-disable-next-line no-func-assign
-      streamChainIntoLedger = async () => { throw new Error('simulated cache read failure'); };
+      streamAllIntoLedger = async () => { throw new Error('simulated cache read failure'); };
 
       let threw = false;
       try { await buildReportFromCache({ silent: true }); }
       catch (e) { threw = true; }
 
       // eslint-disable-next-line no-func-assign
-      streamChainIntoLedger = realStream;
+      streamAllIntoLedger = realStream;
 
       const html = document.getElementById('priceHistoryBody').innerHTML;
       return {

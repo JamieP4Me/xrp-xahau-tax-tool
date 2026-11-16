@@ -39,8 +39,12 @@
 //                           dated $0 lot in; lots used up out) and the row is
 //                           listed, not put on Form 8949.
 //   anything else           listed for review, quantities kept right.
-//   AMM transactions        stored, not booked: they stay with the AMM
-//                           treatment setting.
+//   AMM transactions        follow the AMM treatment setting. Standard: stored
+//                           and listed, not booked. Treatment A (1.10.15):
+//                           both assets and the LP tokens are booked from
+//                           this record (bookAmmFromLedger in index.html).
+//   to or from a bridge     the same coins moving between Xahau and XRPL: no
+//                           sale, cost and dates kept (bridgeConfig).
 //
 // A transaction that has a ledger row is booked from the ledger row ONLY; the
 // download's view of the same transaction is skipped. An OfferCreate inside
@@ -207,9 +211,20 @@ const LT_KIND_WORDS = {
   to_issuer: 'Token sent to its issuer (burn, redemption or migration), no proceeds recorded',
   gift_unpriced: 'Token sent to a gift address, value not known', sent_unvalued: 'Token sent, value not known',
   other_out: 'Token left the wallet, value not known', token_swap: 'Token traded for another token, value not known',
-  complex: 'Several assets moved, review needed', amm: 'AMM transaction, left to the AMM treatment',
+  complex: 'Several assets moved, review needed', amm: 'AMM transaction, not booked (Standard treatment)',
   lost_wallet: 'From a lost wallet, quantities only',
+  swap_valued: 'Token traded for another token, valued at the bridged asset\'s price',
+  amm_deposit: 'Deposited to an AMM pool: assets sold at value, LP tokens received',
+  amm_withdraw: 'Withdrawn from an AMM pool: LP tokens sold for the value received',
+  amm_carried: 'AMM pool, no value known: cost carried across, nothing reported as sold',
+  amm_other: 'Other AMM transaction, quantities only',
+  bridge_out: 'Sent to a bridge: in transit to the other chain, not a sale',
+  bridge_in: 'Arrived from a bridge with its original cost and dates',
+  bridge_in_unmatched: 'Arrived from a bridge with nothing recorded as sent: booked at that day\'s price',
+  gift: 'Gift of a token (see the Gift Log)',
 };
+// Which kinds put a row on Form 8949.
+const LT_ON_8949 = new Set(['buy', 'sell', 'swap_valued', 'amm_deposit', 'amm_withdraw']);
 
 // ── The sweep ──────────────────────────────────────────────────────────────
 let _ltRunning = false, _ltCancel = false, _ltStatus = '';
@@ -406,4 +421,124 @@ async function refreshLedgerTradesPanel() {
     if (_ltStatus) html += `<br><span style="color:#7a4a00">${escapeHTML(_ltStatus)}</span>`;
     box.innerHTML = html;
   } catch (e) { box.textContent = 'Could not read: ' + e.message; }
+  try { renderBridgeBox(); } catch (e) {}
+}
+
+// ── Bridge between Xahau and the XRP Ledger: the panel ─────────────────────
+// The settings and the booking live in index.html (bridgeConfig, bridgeDepart,
+// bridgeArrive). This lists what is marked, lets an address be added, and
+// suggests candidates from what the ledger read found: an XRPL token named
+// XAH or EVR that arrived from, or was sent to, one particular address.
+//
+// A suggestion is only a suggestion. Anyone can issue a token and call it
+// "EVR", so nothing is treated as a bridge until the user says it is.
+let _bridgeSuggestions = [], _bridgeHints = [];
+
+function bridgeSuggestions() {
+  const by = new Map();
+  if (typeof ledgerTradeLog === 'undefined') return [];
+  for (const r of ledgerTradeLog) {
+    if ((r.chain || 'XRPL') !== 'XRPL' || !ltIsToken(r.ticker) || !LT_ADDR_RE.test(r.counterparty || '')) continue;
+    if (r.kind !== 'token_in' && r.kind !== 'sent_unvalued') continue;
+    const code = r.ticker.slice(0, r.ticker.indexOf('.')).toUpperCase();
+    if (code !== 'XAH' && code !== 'EVR') continue;
+    if (isBridgeAddress(r.counterparty) && bridgedNative(r.ticker)) continue;
+    let e = by.get(r.counterparty);
+    if (!e) by.set(r.counterparty, e = { addr: r.counterparty, tokens: new Map(), n: 0 });
+    let t = e.tokens.get(r.ticker);
+    if (!t) e.tokens.set(r.ticker, t = { ticker: r.ticker, native: code, inQty: 0, outQty: 0 });
+    if (r.kind === 'token_in') t.inQty += r.qty; else t.outQty += r.qty;
+    e.n++;
+  }
+  // Dust from strangers is not a bridge: at least one whole coin each way in total.
+  return [...by.values()].filter((e) => [...e.tokens.values()].some((t) => t.inQty + t.outQty >= 1))
+    .sort((a, b) => b.n - a.n).slice(0, 8);
+}
+
+function renderBridgeBox() {
+  const box = document.getElementById('bridgeBox');
+  if (!box || typeof bridgeConfig === 'undefined') return;
+  const q = (n) => n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  _bridgeSuggestions = bridgeSuggestions();
+  _bridgeHints = (typeof bridgeScan === 'undefined') ? [] : Object.entries(bridgeScan.hints)
+    .filter(([a]) => LT_ADDR_RE.test(a) && !isBridgeAddress(a))
+    .map(([addr, h]) => ({ addr, n: h.n, qty: h.qty, native: h.native, dir: h.dir })).sort((a, b) => b.n - a.n).slice(0, 6);
+  const s = (typeof ledgerTradeStats !== 'undefined') ? ledgerTradeStats : {};
+  const transit = (typeof walletLedger !== 'undefined' && walletLedger[BRIDGE_TRANSIT]) || {};
+  const waiting = Object.entries(transit).map(([t, lots]) => [t, lots.reduce((n, l) => n + l.remaining, 0)]).filter(([, n]) => n > 1e-9);
+  const tokens = Object.entries(bridgeConfig.tokens);
+  box.innerHTML = `
+    <div class="sec-title" style="font-size:11px">Bridge between Xahau and the XRP Ledger</div>
+    <div style="font-size:11px;color:#333;line-height:1.7">
+      ${bridgeConfig.addresses.length
+        ? `Bridge addresses: ${bridgeConfig.addresses.map((a, i) => `<code style="font-size:10px">${escapeHTML(a)}</code> <a href="#" style="font-size:9.5px" onclick="removeBridgeUI(${i});return false;">remove</a>`).join(' &nbsp;·&nbsp; ')}`
+        : '<span style="color:#666">No bridge marked.</span> Coins sent to a bridge are booked as sold, and what arrives on the other chain has no cost.'}
+      ${tokens.length ? `<br>Same coin on both chains: ${tokens.map(([t, n]) => `${escapeHTML(ltTokenLabel(t))} = ${n}`).join(', ')}` : ''}
+      ${(s.bridgeOut || s.bridgeIn) ? `<br>In this report: ${s.bridgeOut} sent to a bridge, ${s.bridgeIn} arrived from one` +
+        (s.bridgeUnmatched ? `, <strong style="color:#8b0000">${s.bridgeUnmatched} arrival(s) with nothing recorded as sent</strong> (mark the bridge's address on the other chain too)` : '') +
+        (waiting.length ? `; still in transit: ${waiting.map(([t, n]) => `${q(n)} ${t}`).join(', ')}` : '') + '.' : ''}
+    </div>
+    ${_bridgeSuggestions.length ? `<div style="margin-top:6px;padding:8px 10px;background:#fff8e6;border:1px solid #e0c060;border-radius:4px;font-size:10.5px;color:#5a4300">
+      <strong>These look like a bridge.</strong> A token named XAH or EVR moved between your wallets and one address. Mark it only if you used that address to move your own coins between the chains.
+      ${_bridgeSuggestions.map((e, i) => `<div style="margin-top:4px"><code style="font-size:10px">${escapeHTML(e.addr)}</code>:
+        ${[...e.tokens.values()].map((t) => `${t.inQty ? q(t.inQty) + ' received' : ''}${t.inQty && t.outQty ? ', ' : ''}${t.outQty ? q(t.outQty) + ' sent' : ''} of ${escapeHTML(ltTokenLabel(t.ticker))}`).join('; ')}
+        <button class="sml" style="margin-left:6px" onclick="markBridgeSuggestion(${i})">Mark as bridge</button></div>`).join('')}
+    </div>` : ''}
+    ${_bridgeHints.length ? `<div style="margin-top:6px;padding:8px 10px;background:#fff8e6;border:1px solid #e0c060;border-radius:4px;font-size:10.5px;color:#5a4300">
+      <strong>The other side of the bridge, on Xahau.</strong> These addresses sent or received about the same amount within two hours of a crossing on the XRP Ledger.
+      ${_bridgeHints.map((e, i) => `<div style="margin-top:4px"><code style="font-size:10px">${escapeHTML(e.addr)}</code>:
+        ${e.n} transfer(s), ${q(e.qty)} ${escapeHTML(e.native)} ${e.dir === 'to' ? 'sent to it' : 'received from it'}
+        <button class="sml" style="margin-left:6px" onclick="markBridgeHint(${i})">Mark as bridge</button></div>`).join('')}
+    </div>` : ''}
+    <div class="row" style="margin-top:6px">
+      <input id="bridgeAddrInput" style="flex:1;max-width:340px;font-size:11px;margin:0" placeholder="A bridge's address (on either chain)">
+      <button class="sml" onclick="addBridgeUI()">Add bridge address</button>
+    </div>
+    <div style="font-size:10px;color:#888;margin-top:4px;line-height:1.5">
+      A bridge moves your XAH or EVR between Xahau and the XRP Ledger. Marked, a payment to it is not a sale and what arrives from it is not
+      income: the coins keep their cost and dates across the crossing. Mark the bridge's address on <b>both</b> chains if they differ.
+    </div>`;
+}
+
+async function bridgeChanged() {
+  renderBridgeBox();
+  if (typeof buildReportFromCache === 'function') await buildReportFromCache({ silent: true });
+  await refreshLedgerTradesPanel();
+  if (typeof renderHoldings === 'function') { try { await renderHoldings(); } catch (e) {} }
+}
+async function markBridgeSuggestion(i) {
+  const e = _bridgeSuggestions[i];
+  if (!e || (typeof ledgerBusy === 'function' && ledgerBusy())) return;
+  const why = bridgeAddressConflict(e.addr);
+  if (why) { alert(`That address cannot be a bridge: ${why}.`); return; }
+  addBridgeAddress(e.addr);
+  for (const t of e.tokens.values()) setBridgedToken(t.ticker, t.native);
+  await bridgeChanged();
+}
+async function markBridgeHint(i) {
+  const e = _bridgeHints[i];
+  if (e) await markBridgeUI(e.addr);
+}
+async function markBridgeUI(addr) {
+  if (typeof ledgerBusy === 'function' && ledgerBusy()) return;
+  const why = bridgeAddressConflict(addr);
+  if (why) { alert(`That address cannot be a bridge: ${why}.`); return; }
+  if (!confirm(`Mark ${addr} as a bridge?\n\nCoins you sent to it will no longer be booked as sold; they are treated as your own coins moving to the other chain. Only do this for an address you used as a bridge.`)) return;
+  addBridgeAddress(addr);
+  await bridgeChanged();
+}
+async function addBridgeUI() {
+  const el = document.getElementById('bridgeAddrInput');
+  const addr = String((el && el.value) || '').trim();
+  if (!addr) return;
+  await markBridgeUI(addr);
+}
+async function removeBridgeUI(i) {
+  const addr = bridgeConfig.addresses[i];
+  if (!addr || (typeof ledgerBusy === 'function' && ledgerBusy())) return;
+  if (!confirm(`Stop treating ${addr} as a bridge? Payments to it go back to being booked as sales.`)) return;
+  removeBridgeAddress(addr);
+  // A token stays "the same coin" only while some bridge address remains.
+  if (!bridgeConfig.addresses.length) for (const t of Object.keys(bridgeConfig.tokens)) setBridgedToken(t, null);
+  await bridgeChanged();
 }

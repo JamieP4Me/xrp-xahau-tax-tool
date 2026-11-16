@@ -223,12 +223,14 @@ footer{padding:10px 24px;background:#2c3e6e;font-size:10px;color:#a8c8b8;display
       transaction of your XRPL wallets from a full-history server and books each trade from what the ledger says
       <b>actually moved</b>. Buying a token with XRP is a sale of the XRP, and its value is the token's basis. Selling a
       token for XRP is a sale of the token. A token that arrives or leaves with no XRP side has no known value: its
-      quantity is tracked, it is listed, and it is <b>not</b> put on Form 8949. AMM deposits and withdrawals stay with
-      the AMM treatment setting.
+      quantity is tracked, it is listed, and it is <b>not</b> put on Form 8949. AMM deposits and withdrawals follow the
+      AMM treatment setting: under Standard they are listed and not booked; under Treatment A both assets and the LP
+      tokens are booked from the ledger, including the gain or loss on the pool position when you withdraw.
       <br><br>
       Read-only, through the server chosen in the on-chain check's settings (the public XRPL cluster unless you set
       another). After the first read it runs by itself at the end of each download.
     </div>
+    <div id="bridgeBox" style="margin-top:12px"></div>
   </section>
 
   <!-- AMM amounts come from a different place than everything else in this
@@ -1123,6 +1125,76 @@ function clearGiftAddress(addr){
   saveGifts();
 }
 
+// ── Bridges between Xahau and the XRP Ledger (1.10.15) ───────────────────
+//
+// A bridge takes XAH or EVR on one chain and hands the same coins back on the
+// other, where they exist as a token ("XAH" or "EVR" issued by the bridge's
+// issuer). Nothing was sold and nothing was earned: it is your own property
+// moving, like a transfer between two of your wallets. Without being told,
+// the engine sees two unrelated events: a payment to a stranger on one chain
+// (booked as a sale) and coins arriving from a stranger on the other (booked
+// with no basis, or, for EVR on Xahau, as reward income).
+//
+// So the user names two things, both of which only they can vouch for:
+//   addresses  the bridge's own accounts, on either chain. A payment to one
+//              puts the coins "in transit"; a payment from one takes them out.
+//   tokens     which XRPL token is the same coin as which Xahau asset, e.g.
+//              the bridge's XAH token is XAH. That also gives the token a
+//              price (the Xahau asset's), which a token otherwise lacks.
+// Nothing here is built in: real addresses do not belong in shipped code.
+let bridgeConfig = { addresses: [], tokens: {} };   // tokens: XRPL ticker -> 'XAH' | 'EVR'
+function saveBridgeConfig(){ try{ localStorage.setItem('bridgeConfig', JSON.stringify(bridgeConfig)); }catch(e){} }
+function loadBridgeConfig(){
+  try{
+    const o = JSON.parse(localStorage.getItem('bridgeConfig') || 'null');
+    if(o && typeof o === 'object') {
+      bridgeConfig = {
+        addresses: (Array.isArray(o.addresses) ? o.addresses : []).filter(a => R_ADDR_RE.test(a)),
+        tokens: Object.fromEntries(Object.entries(o.tokens || {}).filter(([k, v]) => ltIsToken(k) && (v === 'XAH' || v === 'EVR'))),
+      };
+    }
+  }catch(e){}
+}
+function isBridgeAddress(addr){ return !!addr && bridgeConfig.addresses.includes(addr); }
+// The Xahau asset an XRPL token stands for, or null.
+function bridgedNative(ticker){ return bridgeConfig.tokens[ticker] || null; }
+// Why an address cannot be a bridge, or '' when it can.
+function bridgeAddressConflict(addr){
+  if(!R_ADDR_RE.test(addr)) return 'not a valid address';
+  if(WALLETS.includes(addr)) return 'it is one of your own wallets';
+  if(isTransferOnly(addr)) return 'it is marked as one of your own (exchange) addresses';
+  if(isGiftAddress(addr)) return 'it is marked as a gift address';
+  if(isLostWallet(addr)) return 'it is marked as a lost wallet';
+  return '';
+}
+function addBridgeAddress(addr){
+  if(bridgeAddressConflict(addr)) return false;
+  if(!bridgeConfig.addresses.includes(addr)) bridgeConfig.addresses.push(addr);
+  saveBridgeConfig();
+  return true;
+}
+function removeBridgeAddress(addr){ bridgeConfig.addresses = bridgeConfig.addresses.filter(a => a !== addr); saveBridgeConfig(); }
+function setBridgedToken(ticker, native){
+  if(!ltIsToken(ticker)) return false;
+  if(native === 'XAH' || native === 'EVR') bridgeConfig.tokens[ticker] = native; else delete bridgeConfig.tokens[ticker];
+  saveBridgeConfig();
+  return true;
+}
+// Where coins sit between leaving one chain and arriving on the other. A
+// name, not an address, so it can never collide with a wallet.
+const BRIDGE_TRANSIT = '(in transit across a bridge)';
+
+// ── Values you entered for gifts of tokens ────────────────────────────────
+// A token has no price series, so the app cannot know what a gift of one was
+// worth on the day. The donor does (or can find out), and the figure matters:
+// it is what counts against the annual exclusion and what sets the
+// recipient's basis for a loss. Keyed by transaction and token; a total in
+// dollars for that transfer. Applied to the gift rows whenever they are built
+// or loaded, so entering one does not need a rebuild.
+let giftValues = {};
+function saveGiftValues(){ try{ localStorage.setItem('giftValues', JSON.stringify(giftValues)); }catch(e){} }
+function loadGiftValues(){ try{ const o = JSON.parse(localStorage.getItem('giftValues') || '{}'); if(o && typeof o === 'object') giftValues = o; }catch(e){} }
+
 // ── Lost / inaccessible wallets ────────────────────────────────────────────
 // A fourth classification, and the one with the least intuitive tax answer.
 //
@@ -1547,7 +1619,7 @@ function exportWalletConfigCSV() {
 }
 
 // Rows for addresses that are no longer the user's are skipped at build time
-// (see streamChainIntoLedger), so this is about disk and scan time rather than
+// (see openChainStream), so this is about disk and scan time rather than
 // correctness. On a cache where a bridge address was fetched by mistake it can
 // be the majority of the database.
 async function purgeUnownedCachedData() {
@@ -3314,12 +3386,9 @@ LIMIT ${page} OFFSET ${offset}`.trim(),
     renderDataSummary(); // keep the live summary box updated as we go
   }
 
-  if(USE_LOCAL_DB) {
-    // Every selected wallet has finished syncing. Build the FIFO ledger from
-    // the complete cache in one global chronological pass — the same shared
-    // routine the offline rebuild uses, so both produce identical reports.
-    await streamChainIntoLedger('Xahau', walletSet);
-  }
+  // In desktop mode the ledger is NOT built here any more. It is built once,
+  // by _runFetchLocked(), after BOTH chains have been fetched, from one
+  // chronological stream of both (see streamAllIntoLedger).
 
   log(`\n✓ Xahau total raw rows${USE_LOCAL_DB ? ' fetched this run' : ''}: ${totalRaw.toLocaleString()}`, 'ok');
   log(`✓ ${allDisposalsHigh.length} total disposal rows built across all years`, 'ok');
@@ -3678,6 +3747,7 @@ function resetLedgerState() {
   // loaded from the cache once per build, before the XRPL rows are read.
   Object.keys(ledgerTradeStats).forEach(k => { ledgerTradeStats[k] = 0; });
   ledgerTradeLog.length = 0;
+  bridgeScan.xOut.length = 0; bridgeScan.lSent.length = 0; bridgeScan.hints = {};
 }
 
 // Everything resetLedgerState() clears, captured and put back. The treatment
@@ -3710,6 +3780,7 @@ function snapshotLedgerState(opts = {}) {
     bookingJournal: c(bookingJournal), journalBuildInfo: c(journalBuildInfo), dailyJournal: c(dailyJournal),
     remitBooked: c(remitBooked),
     ledgerTradeStats: c(ledgerTradeStats), ledgerTradeLog: c(ledgerTradeLog),
+    bridgeHints: c(bridgeScan.hints),
   };
 }
 function restoreLedgerState(snap, opts = {}) {
@@ -3742,8 +3813,10 @@ function restoreLedgerState(snap, opts = {}) {
   for(const [k, v] of c(snap.dailyJournal || new Map())) dailyJournal.set(k, v);
   Object.assign(remitBooked, c(snap.remitBooked || {}));
   Object.assign(ledgerTradeStats, c(snap.ledgerTradeStats || {})); fill(ledgerTradeLog, c(snap.ledgerTradeLog || []));
+  bridgeScan.hints = c(snap.bridgeHints || {});
   journalBuildInfo = c(snap.journalBuildInfo || null);
   syncTaxYearSelects();
+  applyGiftValues();
   applyReportingYear(taxYear());
   if(typeof refreshLedgerTradesPanel === 'function') refreshLedgerTradesPanel();
 }
@@ -3878,8 +3951,12 @@ const cents = (n) => {
 //             tacks onto theirs
 //
 // `fmv` is also the number that counts against the annual exclusion.
-function pushGift(wallet, ticker, totalQty, dk, ds, yr, hash, priceH, recipient, addr) {
-  if(!Number.isFinite(priceH)) { priceH = 0; missingPriceRows.push({ ticker, wanted: dk, usedInstead: null, field: 'high', price: 0 }); }
+function pushGift(wallet, ticker, totalQty, dk, ds, yr, hash, priceH, recipient, addr, opts) {
+  // opts.needsValue: a token with no price series. Not a missing price (that
+  // is an error in a series that should have one); a figure the donor supplies.
+  const needsValue = !!(opts && opts.needsValue);
+  if(needsValue) priceH = 0;
+  else if(!Number.isFinite(priceH)) { priceH = 0; missingPriceRows.push({ ticker, wanted: dk, usedInstead: null, field: 'high', price: 0 }); }
   const consumed = ledgerFIFODetailed(wallet, ticker, totalQty);
   // Kept lot by lot (1.10.13). The recipient's numbers belong to each LOT,
   // not to the gift as a whole:
@@ -3924,6 +4001,34 @@ function pushGift(wallet, ticker, totalQty, dk, ds, yr, hash, priceH, recipient,
     txHash: hash,
     lots,
   });
+  if(needsValue) {
+    const g = allGiftRows[allGiftRows.length - 1];
+    g.valueKey = `${hash}:${ticker}`;
+    setGiftRowValue(g, giftValues[g.valueKey]);
+  }
+}
+
+// Put a donor-supplied value on a token gift, or mark it as still needing one.
+// Recomputes the same per-lot figures pushGift() does, from the lots it kept.
+function setGiftRowValue(g, totalUsd) {
+  const has = totalUsd != null && Number.isFinite(Number(totalUsd)) && Number(totalUsd) >= 0;
+  const price = has ? Number(totalUsd) / g.qty : 0;
+  g.unpriced = !has;
+  g.price = price; g.fmv = has ? Number(totalUsd) : 0;
+  let loss = 0, dual = false;
+  for(const l of (g.lots || [])) {
+    l.fmv = l.qty * price;
+    // Without a value the loss basis cannot be worked out; show the cost.
+    l.lossBasis = has ? Math.min(l.basis, l.fmv) : l.basis;
+    l.dual = has && l.fmv < l.basis;
+    loss += l.lossBasis; if(l.dual) dual = true;
+  }
+  g.lossBasis = loss; g.dualBasis = dual;
+}
+// Applied after a build and after a saved report loads, so a value entered
+// since the report was saved is not lost and needs no rebuild.
+function applyGiftValues() {
+  for(const g of allGiftRows) if(g.valueKey) setGiftRowValue(g, giftValues[g.valueKey]);
 }
 
 // Coins leaving a wallet whose keys are gone. The lots are consumed — the
@@ -4190,8 +4295,19 @@ function grandTotalRaw() {
 // mistake the comparison shipped with: summing XRP, XAH and EVR quantities
 // into a single number and labelling the total "XRP". Three assets worth
 // wildly different amounts added together is not a quantity of anything.
+// The price of one unit on a day, or null when this app has no price for it.
+// XRP, XAH and EVR have series. An XRPL token has one only if the user has
+// said it is a bridged XAH or EVR (see bridgeConfig).
+function priceOfTicker(ticker, dk, field) {
+  const t = ltIsToken(ticker) ? bridgedNative(ticker) : ticker;
+  const series = t === 'XRP' ? XRP_PRICES : t === 'XAH' ? XAH_PRICES : t === 'EVR' ? EVR_PRICES : null;
+  if(!series) return null;
+  const p = lookupPrice(series, t, dk, field || 'high');
+  return Number.isFinite(p) ? p : null;
+}
+
 function zeroBasisPriceOf(t) {
-  if(ltIsToken(t)) return 0;   // no price series for an XRPL token
+  if(ltIsToken(t)) { const n = bridgedNative(t); return n ? zeroBasisPriceOf(n) : 0; }   // no price series for an XRPL token
   const src = t === 'XRP' ? XRP_PRICES : (t === 'EVR' ? EVR_PRICES : XAH_PRICES);
   const p = lookupPrice(src, t, toDK(Date.now()), 'high');
   return Number.isFinite(p) ? p : 0;
@@ -4583,6 +4699,12 @@ function bookXahauLeg(c, t, q, kind) {
       // Involuntary outflow from a wallet whose keys are gone. Checked BEFORE
       // gift and disposal: nothing was sold or given. See pushLostSpend().
       pushLostSpend(wallet, t, q, dk, ds, yr, hash, hi, dest);
+    } else if(isBridgeAddress(dest)) {
+      // Sent to a bridge: the same coins are about to appear on the XRP
+      // Ledger. Not a sale. Their lots wait in transit (see bridgeConfig).
+      const basis = bridgeDepart(wallet, t, t, q);
+      ledgerTradeLog.push({ chain: 'Xahau', wallet, dk, dateStr: ds, year: yr, hash, type: row.TransactionType || '', role: 'sent', kind: 'bridge_out',
+                            xrp: 0, ticker: t, qty: q, usd: null, basis, counterparty: dest });
     } else if(isGiftAddress(dest)) {
       // Gift out — consumes the lots, but is not a disposal.
       const rcpt = (giftEntry(dest)||{}).recipient;
@@ -4591,18 +4713,29 @@ function bookXahauLeg(c, t, q, kind) {
       // External disposal — pushDisposal handles FIFO consumption AND splits
       // into short-term (Box I) / long-term (Box L) automatically.
       pushDisposal(wallet, t, q, dk, ds, yr, hash, hi, lo, kind === 'remit' ? ' (Remit)' : '', dest);
+      // Remembered briefly in case it turns out to be the other half of a
+      // bridge crossing (see bridgeScan). Only while a bridge is marked.
+      if(q >= 1 && bridgeConfig.addresses.length) bridgeScanPush(bridgeScan.xOut, { ms: parseWinDbTs(row.Timestamp ?? ''), addr: dest, t, q });
     }
   }
   // Coins arriving FROM an address marked "mine" but never fetched — a
   // withdrawal from your own exchange account. Routed through
   // ledgerTransferIn so deposited coins come back with their original basis,
   // and anything beyond that takes the market price (disclosed).
-  if(dest === wallet && ownSrc && isTransferOnly(src)) {
+  if(dest === wallet && !ownSrc && isBridgeAddress(src)) {
+    // Arrived from a bridge: coins that left the XRP Ledger. Their lots come
+    // out of transit. Never income, whatever the asset: a reward does not
+    // come from a bridge.
+    const r = bridgeArrive(wallet, t, t, q, dk, isEVR ? getEH(dk) : (getXH(dk) || xahAirdrop));
+    ledgerTradeLog.push({ chain: 'Xahau', wallet, dk, dateStr: ds, year: yr, hash, type: row.TransactionType || '', role: 'received',
+                          kind: r.unmatched ? 'bridge_in_unmatched' : 'bridge_in', xrp: 0, ticker: t, qty: q, usd: null, basis: r.basis, counterparty: src });
+  } else if(dest === wallet && ownSrc && isTransferOnly(src)) {
     if(kind === 'remit') { remitBooked.legs++; if(isEVR) remitBooked.evrIn += q; else remitBooked.xahIn += q; }
     // Deliberately NOT income: moving your own coins is not a reward.
     ledgerTransferIn(src, wallet, t, q, { unitCost: isEVR ? getEH(dk) : (getXH(dk)||xahAirdrop), date: dk });
   } else if(dest === wallet && !ownSrc) {
     if(kind === 'remit') { remitBooked.legs++; if(isEVR) remitBooked.evrIn += q; else remitBooked.xahIn += q; }
+    if(q >= 1 && bridgeScan.lSent.length) bridgeHintForInbound(src, t, q, parseWinDbTs(row.Timestamp ?? ''));
     // External inbound = acquisition
     if(isEVR) {
       const unitCost = getEH(dk);
@@ -4919,9 +5052,7 @@ LIMIT ${page} OFFSET ${offset}`.trim(),
     renderDataSummary();
   }
 
-  if(USE_LOCAL_DB) {
-    await streamChainIntoLedger('XRPL', walletSet);
-  }
+  // Built by _runFetchLocked() after both chains; see fetchXahauWinDB().
 
   log(`\n✓ XRPL total raw rows${USE_LOCAL_DB ? ' fetched this run' : ''}: ${totalRaw}`, 'ok');
 }
@@ -4972,7 +5103,12 @@ function makeXrplPriceHelpers() {
 // not part of the report's state. The counters and the log are.
 const ledgerTradeIndex = { keys: new Map(), through: new Map() };   // wallet -> Set(hash); wallet -> ms read through
 const ledgerTradeStats = { rows: 0, buys: 0, sells: 0, xrpSpent: 0, xrpReceived: 0, tokenIn: 0, tokenOut: 0,
-                           transfers: 0, swaps: 0, complex: 0, amm: 0, replaced: 0, offersNotFilled: 0, offersNotFilledXrp: 0, lost: 0 };
+                           transfers: 0, swaps: 0, swapsValued: 0, complex: 0, amm: 0, replaced: 0, offersNotFilled: 0, offersNotFilledXrp: 0, lost: 0,
+                           // AMM pools booked from the ledger (Treatment A, 1.10.15)
+                           ammDeposits: 0, ammWithdrawals: 0, ammValueIn: 0, ammValueOut: 0, ammLpBasisOut: 0, ammCarried: 0, ammReplaced: 0,
+                           // bridge crossings, both chains
+                           bridgeOut: 0, bridgeIn: 0, bridgeUnmatched: 0,
+                           tokenGifts: 0 };
 const ledgerTradeLog = [];   // one line per ledger row: what it was, how it was booked
 
 async function loadLedgerTradeIndex() {
@@ -5002,6 +5138,188 @@ function ledgerConsumeQuiet(wallet, ticker, qty) {
   return basis;
 }
 
+// ── Finding the bridge's address on the other chain ──────────────────────
+// A bridge may use one address on Xahau and another on the XRP Ledger. The
+// XRPL side is easy to spot (a token named XAH or EVR and one counterparty).
+// The Xahau side is one address among millions of rows. But a crossing has a
+// signature: the same amount, less a small fee, on the other chain within a
+// couple of hours. While a bridge is marked, the build keeps the last few
+// hundred large Xahau payments to and from strangers and matches them
+// against crossings it already recognises on the XRPL side. A match is a
+// HINT shown in the bridge panel; nothing is booked differently until the
+// user marks the address.
+const bridgeScan = { xOut: [], lSent: [], hints: {} };   // hints: address -> { n, qty, native, dir }
+const BRIDGE_HINT_WINDOW_MS = 2 * 3600 * 1000;
+function bridgeScanPush(list, e) { list.push(e); if(list.length > 400) list.splice(0, 200); }
+function bridgeHint(addr, native, qty, dir) {
+  const h = bridgeScan.hints[addr] || (bridgeScan.hints[addr] = { n: 0, qty: 0, native, dir });
+  h.n++; h.qty += qty;
+}
+// An XRPL arrival from a bridge that found nothing in transit: was there a
+// Xahau payment of about that much to a stranger shortly before?
+function bridgeHintForArrival(native, qty, ms) {
+  for(let i = bridgeScan.xOut.length - 1; i >= 0; i--) {
+    const e = bridgeScan.xOut[i];
+    if(ms - e.ms > BRIDGE_HINT_WINDOW_MS) break;
+    if(e.t === native && e.ms <= ms && e.q >= qty * 0.999999 && e.q <= qty * 1.02) { bridgeHint(e.addr, native, e.q, 'to'); return; }
+  }
+}
+// A Xahau arrival from a stranger: did about that much just leave the XRPL
+// side for a bridge?
+function bridgeHintForInbound(src, native, qty, ms) {
+  for(let i = bridgeScan.lSent.length - 1; i >= 0; i--) {
+    const e = bridgeScan.lSent[i];
+    if(ms - e.ms > BRIDGE_HINT_WINDOW_MS) break;
+    if(e.t === native && e.ms <= ms && qty <= e.q * 1.000001 && qty >= e.q * 0.98) { bridgeHint(src, native, qty, 'from'); return; }
+  }
+}
+
+// ── Bridge crossings (see bridgeConfig) ──────────────────────────────────
+// Leaving: the lots move, with their dates and cost, into BRIDGE_TRANSIT
+// under the Xahau asset's name, whichever chain they left from.
+function bridgeDepart(wallet, fromTicker, native, qty) {
+  let basis = 0;
+  for(const c of ledgerFIFODetailed(wallet, fromTicker, qty)) {
+    if(c.qty <= 0) continue;
+    basis += c.qty * c.unitCost;
+    ledgerAdd(BRIDGE_TRANSIT, native, c.acqDate, c.qty, c.unitCost, 'bridge');
+  }
+  ledgerTradeStats.bridgeOut++;
+  return basis;
+}
+// Arriving: take what is in transit and put it in the wallet under the
+// arriving chain's name for the asset. Three cases:
+//   * transit holds a little more than arrived (within 2%): the difference
+//     is the bridge's fee. Everything in transit is taken and its whole cost
+//     rides on the coins that arrived, so no stub is left in transit.
+//   * transit holds much more: other crossings are still on their way; take
+//     exactly what arrived, oldest first.
+//   * transit holds less (or nothing): the other side was not recorded as a
+//     send to a bridge (its address on that chain is not marked, or the
+//     sending wallet is not one of yours). The shortfall is booked at that
+//     day's price, never as income, and is counted so it can be chased.
+// Returns { basis, unmatched }.
+function bridgeArrive(wallet, toTicker, native, qty, dk, fallbackPrice) {
+  const lots = (walletLedger[BRIDGE_TRANSIT] || {})[native] || [];
+  let avail = 0;
+  for(const l of lots) if(l.remaining > 0) avail += l.remaining;
+  let basis = 0, unmatched = 0;
+  if(avail > 0) {
+    const take = (avail <= qty * 1.02) ? avail : qty;
+    const arrived = Math.min(qty, take);
+    const f = arrived / take;                       // < 1 only in the fee case
+    for(const c of ledgerFIFODetailed(BRIDGE_TRANSIT, native, take)) {
+      if(c.qty <= 0) continue;
+      basis += c.qty * c.unitCost;
+      ledgerAdd(wallet, toTicker, c.acqDate, c.qty * f, c.unitCost / f, 'bridge');
+    }
+    unmatched = qty - arrived;
+  } else {
+    unmatched = qty;
+  }
+  if(unmatched > qty * 1e-9) {
+    ledgerAdd(wallet, toTicker, dk, unmatched, fallbackPrice || 0, 'bridge_unmatched');
+    basis += unmatched * (fallbackPrice || 0);
+    ledgerTradeStats.bridgeUnmatched++;
+  } else unmatched = 0;
+  ledgerTradeStats.bridgeIn++;
+  return { basis, unmatched };
+}
+
+// What the non-LP sides of an AMM deposit or withdrawal were worth. `assets`
+// is [{ticker, qty}]. XRP and bridged XAH/EVR have a price. A pool holds its
+// two assets in equal value at its own price, and a two-asset deposit or
+// withdrawal is made in the pool's proportions, so when exactly one of two
+// sides has a price the other is worth the same. Returns null when nothing
+// can be valued (one unpriced token alone, or two unpriced tokens).
+function ammSideValues(assets, dk) {
+  const hi = assets.map(a => priceOfTicker(a.ticker, dk, 'high')), lo = assets.map(a => priceOfTicker(a.ticker, dk, 'low'));
+  const priced = hi.map((p, i) => p != null && lo[i] != null);
+  const n = priced.filter(Boolean).length;
+  if(n === 0) return null;
+  if(n < assets.length && assets.length !== 2) return null;
+  const out = assets.map((a, i) => priced[i] ? { h: a.qty * hi[i], l: a.qty * lo[i] } : null);
+  if(n < assets.length) { const k = priced[0] ? 0 : 1; out[1 - k] = { h: out[k].h, l: out[k].l }; }
+  return out;
+}
+
+// One AMM deposit or withdrawal, booked from the ledger's record of it, under
+// Treatment A. This completes that treatment for a wallet whose transactions
+// were read from the ledger:
+//   deposit     every asset put in is sold at its value; the LP tokens
+//               received take that total as their basis.
+//   withdrawal  the LP tokens handed back are sold for the value of what
+//               came out (the gain or loss on the pool position lands here);
+//               each asset received starts a lot at its value that day.
+// Before 1.10.15 only the XRP side was booked and LP tokens were not tracked,
+// so the other asset went unrecorded and a withdrawal's XRP took a new,
+// higher basis without the gain on the pool position being reported.
+function bookAmmFromLedger(row, wallet, shape, ctx) {
+  const { dk, dateStr, yr, hash, lost, note } = ctx;
+  const isLp = (t) => /^03[0-9A-F]{38}$/i.test(String(t.c || ''));
+  const lps = shape.tokens.filter(isLp), others = shape.tokens.filter(t => !isLp(t));
+  const lp = lps.length === 1 ? lps[0] : null;
+  const lpTicker = lp && ltTicker(lp.c, lp.i);
+  const assets = [];
+  if(shape.xrp) assets.push({ ticker: 'XRP', qty: Math.abs(shape.xrp), sign: Math.sign(shape.xrp) });
+  for(const t of others) { const tk = ltTicker(t.c, t.i); if(tk) assets.push({ ticker: tk, qty: Math.abs(Number(t.d)), sign: Math.sign(Number(t.d)) }); }
+  const text = assets.map(a => `${a.qty} ${ltTokenLabel(a.ticker)} ${a.sign > 0 ? 'in' : 'out'}`).join('; ');
+  const lpQty = lp ? Math.abs(Number(lp.d)) : 0;
+  const deposit = lp && Number(lp.d) > 0;
+  // Anything that is not "assets one way, LP tokens the other" is listed, with
+  // quantities kept: an LP token bid for the auction slot, a vote, and so on.
+  if(!lpTicker || !assets.length || assets.some(a => a.sign !== (deposit ? -1 : 1)) || lost) {
+    let basis = 0;
+    for(const t of shape.tokens) {
+      const tk = ltTicker(t.c, t.i), d = Number(t.d);
+      if(!tk) continue;
+      if(d > 0) ledgerAdd(wallet, tk, dk, d, 0, 'token_received'); else basis += ledgerConsumeQuiet(wallet, tk, -d);
+    }
+    if(shape.xrp < 0) { if(lost) pushLostSpend(wallet, 'XRP', -shape.xrp, dk, dateStr, yr, hash, ctx.xrpH, 'AMM pool'); else ledgerConsumeQuiet(wallet, 'XRP', -shape.xrp); }
+    if(shape.xrp > 0) ledgerAdd(wallet, 'XRP', dk, shape.xrp, ctx.xrpH || 0, 'amm_withdrawal');
+    ledgerTradeStats.complex++;
+    note(lost ? 'lost_wallet' : 'amm_other', { ticker: text || (lpTicker ? ltTokenLabel(lpTicker) : ''), qty: lpQty, basis });
+    return;
+  }
+  const vals = ammSideValues(assets, dk);
+  const xrpAsset = assets.find(a => a.ticker === 'XRP');
+
+  if(!vals) {
+    // No value can be put on it. Carry the cost across instead of guessing:
+    // nothing is reported as sold, and nothing is lost.
+    let basis = 0;
+    if(deposit) {
+      for(const a of assets) basis += ledgerConsumeQuiet(wallet, a.ticker, a.qty);
+      ledgerAdd(wallet, lpTicker, dk, lpQty, basis / lpQty, 'amm_deposit');
+    } else {
+      basis = ledgerConsumeQuiet(wallet, lpTicker, lpQty);
+      for(const a of assets) ledgerAdd(wallet, a.ticker, dk, a.qty, (basis / assets.length) / a.qty, 'amm_withdrawal');
+    }
+    ledgerTradeStats.ammCarried++;
+    note('amm_carried', { ticker: text, qty: lpQty, basis });
+    return;
+  }
+
+  const totalH = vals.reduce((n, v) => n + v.h, 0), totalL = vals.reduce((n, v) => n + v.l, 0);
+  if(deposit) {
+    assets.forEach((a, i) => pushDisposal(wallet, a.ticker, a.qty, dk, dateStr, yr, hash, vals[i].h / a.qty, vals[i].l / a.qty, ' deposited to AMM pool', ''));
+    ledgerAdd(wallet, lpTicker, dk, lpQty, totalH / lpQty, 'amm_deposit');
+    ledgerTradeStats.ammDeposits++; ledgerTradeStats.ammValueIn += totalH;
+    ammBookedDeposits++; if(xrpAsset) ammBookedDepositQty += xrpAsset.qty;
+    note('amm_deposit', { ticker: text, qty: lpQty, usd: totalH });
+  } else {
+    // What the LP tokens being handed back cost, read before they are used up.
+    const lots = (walletLedger[wallet] || {})[lpTicker] || [];
+    let lpBasis = 0, left = lpQty;
+    for(const l of lots) { if(left <= 0) break; if(l.remaining <= 0) continue; const u = Math.min(left, l.remaining); lpBasis += u * l.unitCost; left -= u; }
+    pushDisposal(wallet, lpTicker, lpQty, dk, dateStr, yr, hash, totalH / lpQty, totalL / lpQty, ' withdrawn from AMM pool', '');
+    assets.forEach((a, i) => ledgerAdd(wallet, a.ticker, dk, a.qty, vals[i].h / a.qty, 'amm_withdrawal'));
+    ledgerTradeStats.ammWithdrawals++; ledgerTradeStats.ammValueOut += totalH; ledgerTradeStats.ammLpBasisOut += lpBasis;
+    ammBookedWithdrawals++; if(xrpAsset) ammBookedWithdrawQty += xrpAsset.qty;
+    note('amm_withdraw', { ticker: text, qty: lpQty, usd: totalH, basis: lpBasis });
+  }
+}
+
 function processLedgerChangeRow(row, wallet, walletSet, helpers) {
   const ms = parseWinDbTs(row.Timestamp ?? '');
   const dk = toDK(ms), yr = new Date(ms).getUTCFullYear(), dateStr = fmtDate(ms);
@@ -5012,7 +5330,7 @@ function processLedgerChangeRow(row, wallet, walletSet, helpers) {
   const xrpL = lookupPrice(XRP_PRICES, 'XRP', dk, 'low');
   const shape = ltShape(row);
   const note = (kind, extra) => ledgerTradeLog.push(Object.assign({
-    wallet, dk, dateStr, year: yr, hash, type: String(row.LedgerType || ''), role: String(row.Role || ''), kind,
+    chain: 'XRPL', wallet, dk, dateStr, year: yr, hash, type: String(row.LedgerType || ''), role: String(row.Role || ''), kind,
     xrp: shape.xrp || 0, ticker: '', qty: 0, usd: null, basis: null, counterparty: '' }, extra || {}));
   const lost = isLostSpend(wallet, dk);
   const xrpOut = (qty) => {
@@ -5022,7 +5340,13 @@ function processLedgerChangeRow(row, wallet, walletSet, helpers) {
   const xrpIn = (qty) => ledgerAdd(wallet, 'XRP', dk, qty, xrpH || helpers.xrpBasisRate || 0, 'dex_buy');
 
   if(shape.kind === 'none') return;
-  if(shape.kind === 'amm') { ledgerTradeStats.amm++; note('amm'); return; }
+  if(shape.kind === 'amm') {
+    // Standard: AMM activity is disclosed, not booked, exactly as before. The
+    // download's AMM rows carry that disclosure; this record only counts.
+    if(ammTreatment !== 'A') { ledgerTradeStats.amm++; note('amm'); return; }
+    bookAmmFromLedger(row, wallet, shape, { dk, dateStr, yr, hash, lost, note, xrpH });
+    return;
+  }
 
   if(shape.kind === 'buy' || shape.kind === 'sell' || shape.kind === 'token_in' || shape.kind === 'token_out') {
     const ticker = ltTicker(shape.token.c, shape.token.i);
@@ -5051,8 +5375,17 @@ function processLedgerChangeRow(row, wallet, walletSet, helpers) {
       note('sell', { ticker, qty, usd });
       return;
     }
+    const native = bridgedNative(ticker);
     if(shape.kind === 'token_in') {
       const from = String(row.Account || '');
+      // The same coins arriving from Xahau through a bridge: their lots come
+      // out of transit with their dates and cost.
+      if(native && row.LedgerType === 'Payment' && row.Role === 'received' && isBridgeAddress(from)) {
+        const r = bridgeArrive(wallet, ticker, native, qty, dk, priceOfTicker(ticker, dk, 'high') || 0);
+        if(r.unmatched) bridgeHintForArrival(native, qty, ms);
+        note(r.unmatched ? 'bridge_in_unmatched' : 'bridge_in', { ticker, qty, basis: r.basis, counterparty: from });
+        return;
+      }
       // Sent by another of your wallets, and that wallet's own ledger row is
       // stored: it moves the lots across (basis and dates kept), so adding a
       // lot here as well would count the tokens twice.
@@ -5071,22 +5404,67 @@ function processLedgerChangeRow(row, wallet, walletSet, helpers) {
     }
     // token_out
     const dest = String(row.Destination || '');
-    if(row.LedgerType === 'Payment' && row.Role === 'sent' && dest && dest !== wallet && walletSet.has(dest)) {
+    const sentByMe = row.LedgerType === 'Payment' && row.Role === 'sent';
+    if(sentByMe && dest && dest !== wallet && walletSet.has(dest)) {
       ledgerTransferIn(wallet, dest, ticker, qty);
       ledgerTradeStats.transfers++;
       note('transfer_out', { ticker, qty, counterparty: dest });
       return;
     }
+    if(lost) {
+      const basis = ledgerConsumeQuiet(wallet, ticker, qty);
+      ledgerTradeStats.tokenOut++; ledgerTradeStats.lost++;
+      note('lost_wallet', { ticker, qty, basis, counterparty: dest });
+      return;
+    }
+    // The same coins leaving for Xahau through a bridge.
+    if(native && sentByMe && isBridgeAddress(dest)) {
+      const basis = bridgeDepart(wallet, ticker, native, qty);
+      bridgeScanPush(bridgeScan.lSent, { ms, t: native, q: qty });
+      note('bridge_out', { ticker, qty, basis, counterparty: dest });
+      return;
+    }
+    // A gift. Not a sale; the lots, with their dates and cost, go into the
+    // gift record. What the tokens were worth that day is the bridged
+    // asset's price if it is one, otherwise a figure only the donor can
+    // supply (giftValues), and until then the gift is marked as needing one.
+    if(sentByMe && isGiftAddress(dest)) {
+      const price = priceOfTicker(ticker, dk, 'high');
+      pushGift(wallet, ticker, qty, dk, dateStr, yr, hash, price == null ? 0 : price, (giftEntry(dest) || {}).recipient, dest,
+               price == null ? { needsValue: true } : null);
+      ledgerTradeStats.tokenGifts++;
+      note('gift', { ticker, qty, basis: allGiftRows[allGiftRows.length - 1].basis, counterparty: dest });
+      return;
+    }
     const basis = ledgerConsumeQuiet(wallet, ticker, qty);
     ledgerTradeStats.tokenOut++;
-    const sentByMe = row.LedgerType === 'Payment' && row.Role === 'sent';
-    const kind = lost ? 'lost_wallet' : !sentByMe ? 'other_out' : dest === shape.token.i ? 'to_issuer' : isGiftAddress(dest) ? 'gift_unpriced' : 'sent_unvalued';
-    note(kind, { ticker, qty, basis, counterparty: dest });
+    note(!sentByMe ? 'other_out' : dest === shape.token.i ? 'to_issuer' : 'sent_unvalued', { ticker, qty, basis, counterparty: dest });
     return;
   }
 
-  // A token for a token, or several assets at once: no single value can be
-  // put on it from the ledger alone. Keep every quantity right and list it.
+  // One token for another. If either has a price (a bridged XAH or EVR), the
+  // trade can be valued like any other: what was given is sold for what was
+  // received was worth, and that value is the basis of what was received.
+  if(shape.kind === 'token_swap' && !lost) {
+    const tIn = shape.tokens.find(t => Number(t.d) > 0), tOut = shape.tokens.find(t => Number(t.d) < 0);
+    const kIn = ltTicker(tIn.c, tIn.i), kOut = ltTicker(tOut.c, tOut.i);
+    if(kIn && kOut) {
+      const qIn = Number(tIn.d), qOut = -Number(tOut.d);
+      const pick = (f) => { const a = priceOfTicker(kIn, dk, f), b = priceOfTicker(kOut, dk, f); return a != null ? qIn * a : b != null ? qOut * b : null; };
+      const vH = pick('high'), vL = pick('low');
+      if(vH != null && vL != null) {
+        pushDisposal(wallet, kOut, qOut, dk, dateStr, yr, hash, vH / qOut, vL / qOut, ' (DEX)', 'DEX trade');
+        ledgerAdd(wallet, kIn, dk, qIn, vH / qIn, 'dex_buy');
+        ledgerTradeStats.swapsValued++;
+        note('swap_valued', { ticker: `${qOut} ${ltTokenLabel(kOut)} out; ${qIn} ${ltTokenLabel(kIn)} in`, usd: vH });
+        return;
+      }
+    }
+  }
+
+  // A token for a token with no price on either side, or several assets at
+  // once: no single value can be put on it from the ledger alone. Keep every
+  // quantity right and list it.
   let basisUsed = 0;
   const parts = [];
   if(shape.xrp < 0) { xrpOut(-shape.xrp); parts.push(`${(-shape.xrp).toFixed(6)} XRP out`); }
@@ -5105,28 +5483,52 @@ function processLedgerChangeRow(row, wallet, walletSet, helpers) {
 function exportLedgerTradesCSV() {
   if(ledgerBusy(() => exportLedgerTradesCSV(), 'XRPL ledger trades CSV')) return;   // live arrays may be mid-rebuild
   if(ledgerTradeLog.length === 0) { alert('Nothing to list. Read the XRPL trades from the ledger on the Setup tab, then rebuild.'); return; }
-  const lines = ['Date,Wallet,Ledger Transaction Type,Your Role,How It Was Booked,On Form 8949,XRP Change (fee excluded),Token,Token Quantity,Value USD,Basis Used USD,Counterparty,Transaction Hash'];
+  const lines = ['Date,Chain,Wallet,Ledger Transaction Type,Your Role,How It Was Booked,On Form 8949,XRP Change (fee excluded),Token,Token Quantity,Value USD,Basis Used USD,Counterparty,Transaction Hash'];
   for(const r of [...ledgerTradeLog].sort((a, b) => (a.dk < b.dk ? -1 : a.dk > b.dk ? 1 : 0))) {
-    lines.push([r.dateStr, r.wallet, r.type, r.role, LT_KIND_WORDS[r.kind] || r.kind, (r.kind === 'buy' || r.kind === 'sell') ? 'yes' : 'no',
+    lines.push([r.dateStr, r.chain || 'XRPL', r.wallet, r.type, r.role, LT_KIND_WORDS[r.kind] || r.kind, LT_ON_8949.has(r.kind) ? 'yes' : 'no',
       r.kind === 'buy' ? (-r.xrp).toFixed(6) : (r.xrp ? r.xrp.toFixed(6) : ''),
-      ltIsToken(r.ticker) ? r.ticker : r.ticker, r.qty ? r.qty : '', r.usd == null ? '' : r.usd.toFixed(2),
+      r.ticker, r.qty ? r.qty : '', r.usd == null ? '' : r.usd.toFixed(2),
       r.basis == null ? '' : r.basis.toFixed(2), r.counterparty || '', r.hash].map(csvField).join(','));
   }
   downloadCSV(lines, `XRPL-Ledger-Trades-${new Date().toISOString().slice(0,10)}.csv`);
 }
 
+// Gain or loss on LP tokens handed back to AMM pools, by year: the part of
+// Treatment A that 1.10.15 added. Read off the disposal rows themselves so it
+// can never disagree with Form 8949.
+function lpGainByYear() {
+  const by = {};
+  for(const r of allDisposalsHigh) {
+    if(!ltIsToken(r.ticker) || !/^03[0-9A-F]{38}\./.test(r.ticker)) continue;
+    (by[r.year] = by[r.year] || { rows: 0, proceeds: 0, basis: 0, gain: 0 });
+    by[r.year].rows++; by[r.year].proceeds += r.proceeds; by[r.year].basis += r.basis; by[r.year].gain += r.gain;
+  }
+  return by;
+}
+
 function ledgerTradesDisclosureHTML() {
   const s = ledgerTradeStats;
-  if(!s.rows && !s.offersNotFilled && !s.replaced) return '';
+  if(!s.rows && !s.offersNotFilled && !s.replaced && !s.bridgeOut && !s.bridgeIn) return '';
   const unvalued = s.tokenIn + s.tokenOut + s.swaps + s.complex;
+  const lp = lpGainByYear();
+  const lpYears = Object.keys(lp).sort();
   return `<div>
       <strong>XRPL trades booked from the ledger</strong> (since 1.10.14): ${s.rows.toLocaleString()} ledger record(s).
       ${s.buys.toLocaleString()} purchase(s) of a token with ${fmt(s.xrpSpent, 4)} XRP and ${s.sells.toLocaleString()} sale(s) of a token for ${fmt(s.xrpReceived, 4)} XRP are on Form 8949 at what actually traded.
+      ${s.swapsValued ? `${s.swapsValued.toLocaleString()} trade(s) of one token for another are on Form 8949 at the bridged asset's price.` : ''}
       ${s.offersNotFilled ? `${s.offersNotFilled.toLocaleString()} offer(s) to sell ${fmt(s.offersNotFilledXrp, 4)} XRP did not trade when placed and are no longer booked as sales.` : ''}
       ${unvalued ? `${unvalued.toLocaleString()} token movement(s) had no XRP side, so no value is known: quantities are kept (a token that arrived has a $0 basis) and they are <strong>not</strong> on Form 8949.` : ''}
       ${s.transfers ? `${s.transfers.toLocaleString()} token transfer(s) between your own wallets kept their basis and dates.` : ''}
-      ${s.amm ? `${s.amm.toLocaleString()} AMM record(s) are stored but left to the AMM treatment setting.` : ''}
+      ${s.tokenGifts ? `${s.tokenGifts.toLocaleString()} gift(s) of tokens are in the Gift Log.` : ''}
+      ${s.amm ? `${s.amm.toLocaleString()} AMM record(s) are stored but not booked (Standard treatment).` : ''}
       ${s.lost ? `${s.lost.toLocaleString()} were from a lost wallet (no gain or loss).` : ''}
+      ${(s.ammDeposits || s.ammWithdrawals || s.ammCarried) ? `<br><strong>AMM pools, Treatment A, both assets (since 1.10.15):</strong>
+        ${s.ammDeposits.toLocaleString()} deposit(s) sold assets worth $${fmt(s.ammValueIn)} for LP tokens;
+        ${s.ammWithdrawals.toLocaleString()} withdrawal(s) handed back LP tokens that cost $${fmt(s.ammLpBasisOut)} for assets worth $${fmt(s.ammValueOut)}.
+        ${lpYears.length ? `Gain or loss on LP tokens, which earlier versions did not report: ${lpYears.map(y => `<strong>${y}: ${lp[y].gain < 0 ? '-' : ''}$${fmt(Math.abs(lp[y].gain))}</strong>`).join(', ')}.` : ''}
+        ${s.ammCarried ? `${s.ammCarried.toLocaleString()} could not be valued; their cost was carried across and nothing was reported as sold.` : ''}` : ''}
+      ${(s.bridgeOut || s.bridgeIn) ? `<br><strong>Bridge (since 1.10.15):</strong> ${s.bridgeOut.toLocaleString()} transfer(s) to a bridge and ${s.bridgeIn.toLocaleString()} arrival(s) from one were treated as your own coins moving between chains: no sale, no income, cost and dates kept.
+        ${s.bridgeUnmatched ? `<strong>${s.bridgeUnmatched.toLocaleString()} arrival(s) had nothing recorded as sent on the other chain</strong> and were booked at that day's price. Usually the bridge's address on the other chain is not marked yet (Setup, XRPL trades).` : ''}` : ''}
       <button class="sml" style="margin-left:6px" onclick="exportLedgerTradesCSV()">⬇ List every one (CSV)</button>
     </div>`;
 }
@@ -5202,6 +5604,15 @@ function processOneXRPLRow(row, wallet, walletSet, mode, helpers) {
   // An AMM row under an active treatment is the exception: it IS booked, so it
   // must leave the "not on Form 8949" list. Listing a transaction as omitted
   // while also reporting it would be a worse disclosure than either alone.
+  // Under Treatment A, a wallet whose transactions were read from the ledger
+  // has every AMM deposit and withdrawal booked from the ledger's record:
+  // both assets and the LP tokens (bookAmmFromLedger). The download's row for
+  // the same transaction carries only the XRP side and has no usable hash to
+  // match on, so inside the range read it is skipped as a class.
+  if(ammTreatment === 'A' && src === wallet && /^AMM/.test(txType)) {
+    const th = ledgerTradeIndex.through.get(wallet);
+    if(th != null && ms <= th) { ledgerTradeStats.ammReplaced++; return; }
+  }
   if(!VALUED_TYPES.has(txType) && (src === wallet || dest === wallet)) {
     const qty = amountForRow(wallet, row);
     const booked = bookAmmRow(wallet, row, txType, qty, dk, dateStr, yr, txId, xrpH, xrpL);
@@ -5437,6 +5848,15 @@ async function _runFetchLocked(){
       log(`✓ XRPL data merged — ${highRows.length} total disposals for ${year}`, 'ok');
     } catch(e) {
       log(`XRPL fetch failed: ${e.message}`, 'er');
+    }
+
+    // Both chains are in the cache (or as much of them as could be fetched).
+    // Build the ledger once from both, in one chronological order: the same
+    // routine the offline rebuild uses, so both produce identical reports.
+    if(USE_LOCAL_DB) {
+      await streamAllIntoLedger(await getOwnedWalletSet());
+      applyReportingYear(year);
+      log(`✓ ${allDisposalsHigh.length} total disposal rows built across all years`, 'ok');
     }
 
     log(`\nDone: ${highRows.length} disposal rows for ${year}, ${lowRows.length} low rows`,'hd');
@@ -6165,8 +6585,7 @@ async function _buildReportFromCacheInner(opts = {}) {
   // whatever order the wallet loop happened to produce. Ties are now broken
   // deterministically instead of arbitrarily — same chronology, reproducible
   // results between runs.
-  await streamChainIntoLedger('Xahau', walletSet);
-  await streamChainIntoLedger('XRPL', walletSet);
+  await streamAllIntoLedger(walletSet);
 
   await verifyScannedRowCount();
 
@@ -6575,6 +6994,7 @@ function buildSettingsFingerprint() {
     lost: lostWallets.map(e => [e.addr, e.lostDate || '']).sort(),
     gift: giftAddresses.map(e => e.addr).sort(),
     mine: [...transferOnlyAddresses].sort(),
+    bridge: [[...bridgeConfig.addresses].sort(), Object.entries(bridgeConfig.tokens).sort()],
     xrpBasis: (document.getElementById('xrpBasis') || {}).value || '',
     xahBasis: (document.getElementById('xahAirdropBasis') || {}).value || '',
   });
@@ -8004,7 +8424,7 @@ const LEDGER_PAGE_ROWS = 25000;
 // immediately instead of presenting a $929,409 capital gain as if it were
 // arithmetic.
 // How many rows a build reads for one chain: the rows of the types the engine
-// books, exactly as streamChainIntoLedger() selects them, falling back to
+// books, exactly as openChainStream() selects them, falling back to
 // every row when the type filter is unavailable (as it does).
 //
 // The row-count check used to compare against EVERY cached row. Once the
@@ -8047,7 +8467,9 @@ async function verifyScannedRowCount() {
   }
 }
 
-async function streamChainIntoLedger(chain, walletSet) {
+// Open one chain's cached rows as a stream: what to read, how many, and a
+// fill() that fetches the next page. Returns null when the chain has no rows.
+async function openChainStream(chain, walletSet, order) {
   const processRow = chain === 'Xahau' ? processOneXahauRow : processOneXRPLRow;
   const helpers = chain === 'Xahau' ? makeXahauPriceHelpers() : makeXrplPriceHelpers();
 
@@ -8067,7 +8489,7 @@ async function streamChainIntoLedger(chain, walletSet) {
   // download's rows are booked.
   if(chain === 'XRPL') await loadLedgerTradeIndex();
   const totalAll = await window.taxDB.countForChain(chain);
-  if(totalAll === 0) return 0;
+  if(totalAll === 0) return null;
   let total = totalAll;
   // NOTE: verifyScannedRowCount() expects exactly the rows selected here, via
   // expectedRowsForChain(). Change the selection in both places or neither.
@@ -8092,15 +8514,68 @@ async function streamChainIntoLedger(chain, walletSet) {
     log(`  (type filter unavailable — reading every row: ${e.message})`, 'wa');
   }
   log(`\nBuilding ${chain} FIFO ledger from ${total.toLocaleString()} cached row(s), in true chronological order…`, 'hd');
+  const st = { chain, order, total, done: 0, buf: [], i: 0, cursor: null, ended: false, processRow, helpers };
+  st.fill = async () => {
+    if(st.ended) return;
+    const page = await window.taxDB.getChainRowsPage(chain, LEDGER_PAGE_ROWS, st.cursor, types);
+    st.buf = page.rows; st.i = 0;
+    st.cursor = page.cursor;
+    if(!page.rows.length || !page.cursor) st.ended = true;
+  };
+  return st;
+}
+
+// Build the FIFO ledger by streaming every cached row of BOTH chains through
+// the per-row engine in one chronological order.
+//
+// Until 1.10.15 this ran Xahau start to finish and then the XRP Ledger. That
+// was sound while nothing crossed between them: the two chains held different
+// assets in different lots. A bridge breaks that. Coins that leave Xahau on
+// Monday and arrive on XRPL a minute later, or the other way round, have to
+// be processed in that order for their basis to travel with them, and neither
+// "all of Xahau first" nor "all of XRPL first" gets both directions right.
+// Each chain is still read in its own (timestamp, wallet, tx_hash) order;
+// this only decides which chain's next row goes first. On a tie Xahau goes
+// first, which is the order the two used to run in.
+async function streamAllIntoLedger(walletSet) {
   // One Set for the whole stream: isFetchableOwnWallet() scans the WALLETS
   // array, and 140 entries x 6 million rows is a measurable share of a build.
   const own = new Set(WALLETS);
   const ownOrLost = (w) => own.has(w) || isLostWallet(w);
-  let cursor = null, done = 0;
+  const streams = [];
+  for(const [n, chain] of ['Xahau', 'XRPL'].entries()) {
+    const st = await openChainStream(chain, walletSet, n);
+    if(st) { await st.fill(); streams.push(st); }
+  }
+  const tsOf = (st) => String(st.buf[st.i].row.Timestamp ?? '');
+  const total = streams.reduce((n, st) => n + st.total, 0);
+  let doneAll = 0;
   for(;;) {
-    const page = await window.taxDB.getChainRowsPage(chain, LEDGER_PAGE_ROWS, cursor, types);
-    if(!page.rows.length) break;
-    for(const { wallet, row } of page.rows) {
+    // Refill any stream that ran out of buffered rows, then drop the finished.
+    for(const st of streams) {
+      if(st.i >= st.buf.length && !st.ended) {
+        st.buf.length = 0;
+        await st.fill();
+        log(`    …${st.chain}: ${st.done.toLocaleString()} / ${st.total.toLocaleString()}`, 'in');
+        progressSet('build', `Building the ${treatmentWord(ammTreatment)} report: ${st.chain} rows`, doneAll, total);
+        await new Promise(res => setTimeout(res, 0)); // yield, and let the page be collected
+      }
+    }
+    const live = streams.filter(st => st.i < st.buf.length);
+    if(!live.length) break;
+    // The stream whose next row is earliest; the other's next row is the limit.
+    let cur = live[0];
+    for(const st of live) { const a = tsOf(st), b = tsOf(cur); if(a < b || (a === b && st.order < cur.order)) cur = st; }
+    const other = live.find(st => st !== cur);
+    const limit = other ? tsOf(other) : null;
+    const { buf, processRow, helpers } = cur;
+    while(cur.i < buf.length) {
+      const { wallet, row } = buf[cur.i];
+      if(limit !== null) {
+        const ts = String(row.Timestamp ?? '');
+        if(ts > limit || (ts === limit && cur.order > other.order)) break;
+      }
+      cur.i++;
       // Every cached row is a PERSPECTIVE: "this is wallet W's view of
       // transaction T". A perspective may only be processed if W is a wallet
       // whose coins are actually the user's to dispose of — that is, one this
@@ -8122,18 +8597,13 @@ async function streamChainIntoLedger(chain, walletSet) {
       // Skipped rows are still COUNTED, so the row-count invariant that
       // catches double-processing keeps working.
       rowsStreamedThisBuild++;
-      done++;
+      cur.done++; doneAll++;
       if(!ownOrLost(wallet)) { rowsSkippedNotOwned++; continue; }
       processRow(row, wallet, walletSet, 'out', helpers);
     }
-    page.rows.length = 0;
-    cursor = page.cursor;
-    log(`    …${done.toLocaleString()} / ${total.toLocaleString()}`, 'in');
-    progressSet('build', `Building the ${treatmentWord(ammTreatment)} report: ${chain} rows`, done, total);
-    await new Promise(res => setTimeout(res, 0)); // yield, and let the page be collected
-    if(!cursor) break;
   }
-  return done;
+  for(const st of streams) log(`    …${st.chain}: ${st.done.toLocaleString()} / ${st.total.toLocaleString()}`, 'in');
+  return doneAll;
 }
 
 async function getOwnedWalletSet() {
@@ -8425,7 +8895,7 @@ async function exportCoinLedgerCSV() {
 function latestPriceFor(ticker) {
   // An XRPL token has no price series here. It used to fall through to the
   // EVR series below, which would have valued every token at EVR's price.
-  if(ltIsToken(ticker)) return { price: 0, asOf: null };
+  if(ltIsToken(ticker)) { const n = bridgedNative(ticker); return n ? latestPriceFor(n) : { price: 0, asOf: null }; }
   const series = ticker === 'XRP' ? XRP_PRICES : ticker === 'XAH' ? XAH_PRICES : EVR_PRICES;
   const keys = sortedPriceKeys(series);
   if(!keys.length) return { price: 0, asOf: null };
@@ -8758,7 +9228,8 @@ async function renderHoldings() {
       <div class="card"><div class="val" style="color:#1a4a3a">$${fmt(grandValue)}</div><div class="lv">Total value, all wallets</div></div>
       <div class="card"><div class="val" style="color:#2a2a6e">$${fmt(grandBasis)}</div><div class="lv">Remaining cost basis</div></div>
       <div class="card"><div class="val">${wallets.length}</div><div class="lv">Wallets holding a balance</div></div>
-      ${Object.entries(byTicker).map(([t, v]) => `<div class="card"><div class="val">${v.qty.toLocaleString(undefined,{maximumFractionDigits:2})}</div><div class="lv">${t} held · $${fmt(v.value)}</div></div>`).join('')}
+      ${Object.entries(byTicker).filter(([t]) => !ltIsToken(t)).map(([t, v]) => `<div class="card"><div class="val">${v.qty.toLocaleString(undefined,{maximumFractionDigits:2})}</div><div class="lv">${t} held · $${fmt(v.value)}</div></div>`).join('')}
+      ${(() => { const n = Object.keys(byTicker).filter(ltIsToken).length; return n ? `<div class="card"><div class="val">${n}</div><div class="lv">XRPL tokens held · listed below</div></div>` : ''; })()}
     </div>
     <div class="lv" style="margin-bottom:14px">Valued at the most recent embedded price: ${priceNote}</div>
 
@@ -8833,7 +9304,9 @@ async function renderHoldings() {
           <td style="text-align:center">${isDex ? '—' : `<input type="checkbox" ${marked ? 'checked' : ''} onchange="toggleTransferOnly('${d.dest}')">`}</td>
           <td style="text-align:center">${isDex ? '—' : (gift
             ? `<span title="${escapeHTML(gift.recipient)}" style="color:#4a1a6b;font-weight:700">🎁 ${escapeHTML(gift.recipient).slice(0,10)}</span><br><a href="#" style="font-size:9px" onclick="promptGift('${d.dest}');return false;">edit</a>`
-            : `<a href="#" style="font-size:9.5px" onclick="promptGift('${d.dest}');return false;">mark gift</a>`)}</td>
+            : `<a href="#" style="font-size:9.5px" onclick="promptGift('${d.dest}');return false;">mark gift</a>` +
+              (isBridgeAddress(d.dest) ? '<br><span style="font-size:9px;color:#1a3a7a">bridge</span>'
+                                       : `<br><a href="#" style="font-size:9px" title="This address is a bridge to the XRP Ledger: coins sent here were not sold" onclick="markBridgeUI('${d.dest}');return false;">mark bridge</a>`))}</td>
           <td style="font-family:monospace;font-size:9.5px">${escapeHTML(d.dest)}</td>
           <td>${escapeHTML(labelFor(d.dest) || (gift ? gift.recipient : ''))}</td>
           <td>${escapeHTML([...d.tickers].join(', '))}</td>
@@ -9087,8 +9560,9 @@ function giftsByRecipientYear() {
   for(const g of allGiftRows) {
     const key = `${g.recipient}||${g.year}`;
     let e = out.get(key);
-    if(!e) { e = { recipient: g.recipient, year: g.year, fmv: 0, basis: 0, lossBasis: 0, dual: false, count: 0, tickers: new Set() }; out.set(key, e); }
+    if(!e) { e = { recipient: g.recipient, year: g.year, fmv: 0, basis: 0, lossBasis: 0, dual: false, count: 0, unpriced: 0, tickers: new Set() }; out.set(key, e); }
     e.fmv += g.fmv; e.basis += g.basis; e.lossBasis += (g.lossBasis != null ? g.lossBasis : g.basis); e.dual = e.dual || !!g.dualBasis;
+    if(g.unpriced) e.unpriced++;
     e.count++; e.tickers.add(g.ticker);
   }
   return [...out.values()].sort((a,b) => b.year - a.year || b.fmv - a.fmv);
@@ -9116,6 +9590,7 @@ function giftSummaryHTML() {
       their basis for a gain and for a loss, and the date each lot turns long-term. Give it to them to keep — they
       need it when they sell, and you are the only one with the records.
     </div>
+    ${giftValueFormHTML()}
     <table style="font-size:10.5px;width:100%">
       <thead><tr>
         <th style="background:#f3e6ff;color:#4a1a6b">Recipient</th>
@@ -9134,13 +9609,14 @@ function giftSummaryHTML() {
           return `<tr style="${over ? 'background:#fff0f0' : ''}">
             <td>${escapeHTML(g.recipient)}</td>
             <td>${g.year}</td>
-            <td>${[...g.tickers].join(', ')}</td>
+            <td>${[...g.tickers].map(ltTokenLabel).join(', ')}</td>
             <td style="text-align:right">${g.count}</td>
-            <td style="text-align:right;font-weight:700">$${fmt(g.fmv)}</td>
+            <td style="text-align:right;font-weight:700">$${fmt(g.fmv)}${g.unpriced ? `<br><span style="font-weight:400;color:#8b0000">+ ${g.unpriced} gift(s) with no value entered</span>` : ''}</td>
             <td style="text-align:right">$${fmt(g.basis)}</td>
             <td style="text-align:right">$${fmt(g.lossBasis)}${g.dual ? ' <span class="lv" title="Some lots were worth less on the gift date than you paid. Between the two figures a sale is neither a gain nor a loss.">dual basis</span>' : ''}</td>
             <td>${limit == null ? '<span class="lv">unknown for this year</span>'
               : over ? `<strong style="color:#8b0000">OVER $${limit.toLocaleString()} — Form 709 likely required</strong>`
+              : g.unpriced ? `<span style="color:#8b0000">cannot tell until every gift has a value</span>`
                      : `<span style="color:#1a4a3a">under $${limit.toLocaleString()}</span>`}</td>
           </tr>`;
         }).join('')}
@@ -9162,8 +9638,8 @@ function exportGiftsCSV() {
   for(const g of [...allGiftRows].sort((a,b)=> (a.dk<b.dk?-1:a.dk>b.dk?1:0))) {
     lines.push([
       g.dateStr, g.recipient, g.addr, g.wallet, g.ticker,
-      g.qty.toFixed(6), g.price.toFixed(6), g.fmv.toFixed(2),
-      g.basis.toFixed(2), g.lossBasis.toFixed(2), g.dualBasis ? 'YES' : 'no',
+      g.qty.toFixed(6), g.unpriced ? '' : g.price.toFixed(6), g.unpriced ? 'not entered' : g.fmv.toFixed(2),
+      g.basis.toFixed(2), g.unpriced ? '' : g.lossBasis.toFixed(2), g.unpriced ? 'unknown' : (g.dualBasis ? 'YES' : 'no'),
       g.term, g.earliestAcq, g.txHash,
     ].map(csvField).join(','));
   }
@@ -9172,10 +9648,51 @@ function exportGiftsCSV() {
   lines.push('Recipient,Year,Transfers,Total Value When Given USD,Annual Exclusion,Form 709 Likely Required');
   for(const g of giftsByRecipientYear()) {
     const limit = GIFT_ANNUAL_EXCLUSION[g.year];
-    lines.push([g.recipient, g.year, g.count, g.fmv.toFixed(2),
-      limit == null ? 'unknown' : limit, limit != null && g.fmv > limit ? 'YES' : 'no'].map(csvField).join(','));
+    lines.push([g.recipient, g.year, g.count, g.fmv.toFixed(2) + (g.unpriced ? ` plus ${g.unpriced} gift(s) with no value entered` : ''),
+      limit == null ? 'unknown' : limit, limit != null && g.fmv > limit ? 'YES' : (g.unpriced ? 'cannot tell' : 'no')].map(csvField).join(','));
   }
   downloadCSV(lines, `Gift-Log-${new Date().toISOString().slice(0,10)}.csv`);
+}
+
+// Token gifts whose value on the gift date only the donor can supply.
+function giftsNeedingValue() {
+  return allGiftRows.filter(g => g.valueKey).sort((a, b) => (a.dk < b.dk ? -1 : a.dk > b.dk ? 1 : 0));
+}
+function giftValueFormHTML() {
+  const list = giftsNeedingValue();
+  if(!list.length) return '';
+  const missing = list.filter(g => g.unpriced).length;
+  return `<div style="margin:8px 0;padding:10px 12px;background:${missing ? '#fff4e5' : '#f3f8f3'};border:1px solid ${missing ? '#d08a00' : '#9bc59b'};border-radius:4px;font-size:11px">
+      <strong>Gifts of tokens: the value on the gift date</strong>
+      ${missing ? `<span style="color:#8b0000"> — ${missing} still need${missing === 1 ? 's' : ''} one</span>` : ''}
+      <div class="lv" style="margin:4px 0 6px">A token has no price history in this app. Enter what each transfer was worth in dollars on the day
+        (the whole transfer, not per token). It counts toward the annual exclusion and sets the recipient's basis for a loss. Your cost carries over either way.</div>
+      <table style="font-size:10.5px;width:100%">
+        ${list.map((g, i) => `<tr>
+          <td>${escapeHTML(g.dateStr)}</td><td>${escapeHTML(g.recipient)}</td>
+          <td>${g.qty.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${ltTokenLabel(g.ticker)}</td>
+          <td style="text-align:right">your cost $${fmt(g.basis)}</td>
+          <td style="white-space:nowrap">$ <input id="giftVal_${i}" style="width:90px;font-size:11px;margin:0" inputmode="decimal" placeholder="value that day" value="${g.unpriced ? '' : g.fmv.toFixed(2)}">
+            <button class="sml" onclick="saveGiftValue(${i})">Save</button></td>
+        </tr>`).join('')}
+      </table>
+    </div>`;
+}
+function saveGiftValue(i) {
+  if(ledgerBusy(() => saveGiftValue(i), 'gift value')) return;   // the gift rows may be mid-rebuild
+  const g = giftsNeedingValue()[i];
+  const el = document.getElementById('giftVal_' + i);
+  if(!g || !el) return;
+  const raw = String(el.value || '').replace(/[$,\s]/g, '');
+  if(raw === '') delete giftValues[g.valueKey];
+  else {
+    const v = Number(raw);
+    if(!Number.isFinite(v) || v < 0) { alert('Enter the value in dollars, for example 2150.00, or leave it empty to clear it.'); return; }
+    giftValues[g.valueKey] = v;
+  }
+  saveGiftValues();
+  applyGiftValues();
+  renderHoldings();
 }
 
 // ── Gift lots: the per-lot statement each recipient keeps (1.10.13) ──────
@@ -9188,6 +9705,8 @@ const GIFT_LOT_SOURCE = {
   remit_received: 'received (Remit)', reward: 'reward (income)', dex_buy: 'bought on the DEX',
   amm_withdrawal: 'AMM pool withdrawal', exchange_withdrawal: 'withdrawn from an exchange',
   transfer_in: 'moved from another of your wallets',
+  token_received: 'received, no value recorded', amm_deposit: 'LP tokens from an AMM deposit',
+  bridge: 'moved across a bridge (original cost and date)', bridge_unmatched: 'arrived from a bridge',
 };
 function giftLotSource(src) {
   if(src == null) return 'no record of acquisition ($0 basis)';
@@ -9217,7 +9736,7 @@ function giftLotRows(recipient) {
   for(const g of gifts) {
     (g.lots || []).forEach((l, i) => {
       out.push({
-        gift: g, lotNo: i + 1, qty: l.qty,
+        gift: g, lotNo: i + 1, qty: l.qty, unpriced: !!g.unpriced,
         acquired: giftDay(l.acqDate), how: giftLotSource(l.source),
         unitCost: l.unitCost, basis: l.basis, fmv: l.fmv, lossBasis: l.lossBasis, dual: l.dual,
         // Gain: your holding period tacks on. Loss on a dual-basis lot: it
@@ -9240,8 +9759,9 @@ function exportGiftLotsCSV() {
   for(const r of giftLotRows(null)) {
     const g = r.gift;
     lines.push([g.dateStr, g.recipient, g.addr, g.wallet, g.ticker, g.txHash, r.lotNo, r.qty.toFixed(6),
-      r.acquired || 'unknown', r.how, r.unitCost.toFixed(6), r.basis.toFixed(2), r.fmv.toFixed(2), r.lossBasis.toFixed(2),
-      r.dual ? 'YES' : 'no', r.ltGainAfter, r.ltLossAfter].map(csvField).join(','));
+      r.acquired || 'unknown', r.how, r.unitCost.toFixed(6), r.basis.toFixed(2),
+      r.unpriced ? 'not entered' : r.fmv.toFixed(2), r.unpriced ? '' : r.lossBasis.toFixed(2),
+      r.unpriced ? 'unknown' : (r.dual ? 'YES' : 'no'), r.ltGainAfter, r.unpriced ? '' : r.ltLossAfter].map(csvField).join(','));
   }
   downloadCSV(lines, `Gift-Lots-${new Date().toISOString().slice(0,10)}.csv`);
 }
@@ -9291,8 +9811,9 @@ function buildGiftStatementDoc(recipient) {
   for(const g of gifts) {
     if(y + 70 > pageH - margin) { doc.addPage(); y = margin; }
     doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(74,26,107);
-    doc.text(`${g.dateStr} · ${g.qty.toLocaleString(undefined,{maximumFractionDigits:6})} ${g.ticker} at $${g.price.toFixed(g.price < 1 ? 6 : 4)} · value ${money(g.fmv)}` +
-             `${g.dualBasis ? ' · dual basis' : ''}`, margin, y + 12);
+    doc.text(`${g.dateStr} · ${g.qty.toLocaleString(undefined,{maximumFractionDigits:6})} ${ltTokenLabel(g.ticker)}` +
+             (g.unpriced ? ' · value on the gift date NOT ENTERED by the giver'
+                         : ` at $${g.price.toFixed(g.price < 1 ? 6 : 4)} · value ${money(g.fmv)}${g.dualBasis ? ' · dual basis' : ''}`), margin, y + 12);
     y += 16;
     doc.setFont('helvetica','normal'); doc.setFontSize(7.5); doc.setTextColor(110,110,120);
     doc.text(`to ${g.addr || ''} · transaction ${g.txHash || ''}`, margin, y + 8);
@@ -9301,12 +9822,12 @@ function buildGiftStatementDoc(recipient) {
     const lotRows = rows.filter(r => r.gift === g).map(r => ({
       lot: String(r.lotNo), qty: r.qty.toLocaleString(undefined,{maximumFractionDigits:6}),
       acq: r.acquired || 'unknown', how: r.how, unit: '$' + r.unitCost.toFixed(r.unitCost < 1 ? 6 : 4),
-      gain: money(r.basis), fmv: money(r.fmv), loss: money(r.lossBasis) + (r.dual ? ' *' : ''),
-      ltg: r.ltGainAfter, ltl: r.ltLossAfter,
+      gain: money(r.basis), fmv: r.unpriced ? 'not entered' : money(r.fmv), loss: r.unpriced ? 'needs the value' : money(r.lossBasis) + (r.dual ? ' *' : ''),
+      ltg: r.ltGainAfter, ltl: r.unpriced ? '' : r.ltLossAfter,
     }));
     y = pdfTable(doc, { cols, rows: lotRows, x0: margin, startY: y, margin, rowH: 13, headerH: 16 });
     doc.setFont('helvetica','bold'); doc.setFontSize(8.5);
-    doc.text(`Gift total — basis for a gain ${money(g.basis)} · basis for a loss ${money(g.lossBasis)}`, margin, y + 10);
+    doc.text(`Gift total — basis for a gain ${money(g.basis)} · basis for a loss ${g.unpriced ? 'needs the value on the gift date' : money(g.lossBasis)}`, margin, y + 10);
     y += 22;
   }
   if(rows.some(r => r.dual)) {
@@ -9547,9 +10068,14 @@ function exportHoldingsCSV() {
   if(ledgerBusy(() => exportHoldingsCSV(), 'Holdings CSV')) return;   // live arrays may be mid-rebuild
   const rows = computeHoldings();
   if(rows.length === 0) { alert('No holdings to export — build the report first.'); return; }
-  const lines = ['Wallet,Description,Type,Asset,Quantity,Cost Basis USD,Unit Price USD,Price As Of,Current Value USD'];
+  // Chain is the last column so files and scripts that read the earlier ones
+  // by position are unaffected. A wallet address is the same on both chains;
+  // without this column a wallet's Xahau EVR and an XRPL token called EVR
+  // could not be told apart.
+  const lines = ['Wallet,Description,Type,Asset,Quantity,Cost Basis USD,Unit Price USD,Price As Of,Current Value USD,Chain'];
   for(const h of rows) {
-    lines.push([h.wallet, labelFor(h.wallet), walletTypeOf(h.wallet), h.ticker, h.qty.toFixed(6), h.basis.toFixed(2), h.price.toFixed(6), h.asOf || '', h.value.toFixed(2)].map(csvField).join(','));
+    const chain = h.wallet === BRIDGE_TRANSIT ? 'in transit' : (h.ticker === 'XRP' || ltIsToken(h.ticker)) ? 'XRPL' : 'Xahau';
+    lines.push([h.wallet, labelFor(h.wallet), walletTypeOf(h.wallet), h.ticker, h.qty.toFixed(6), h.basis.toFixed(2), h.price.toFixed(6), h.asOf || '', h.value.toFixed(2), chain].map(csvField).join(','));
   }
   downloadCSV(lines, `Holdings-By-Wallet-${new Date().toISOString().slice(0,10)}.csv`);
 }
@@ -9633,6 +10159,8 @@ if(location.protocol === 'file:') {
 }
 loadWalletList();
 loadTransferOnly();
+loadBridgeConfig();
+loadGiftValues();
 loadGifts();
 loadLost();
 loadLabels();

@@ -1263,3 +1263,70 @@ Limits, stated plainly:
   shows as a $0-basis, short-term sale and is flagged.
 - Xahau trades are not read this way yet.
 - The Koinly and CoinLedger exports are still built from the download.
+
+## Bridges, AMM pools in full, and gifts of tokens (1.10.15)
+
+The first live read of XRPL trades (1.10.14) matched the chain on 103 of 125
+trust lines and showed three things the books did not handle.
+
+### A bridge is not a sale
+
+A bridge takes XAH or EVR on one chain and hands the same coins back on the
+other, as a token. Unmarked, the app sees a payment to a stranger (a sale) and
+coins arriving from a stranger (no cost, or on Xahau, EVR "reward" income).
+
+**Setup → XRPL Trades → Bridge between Xahau and the XRP Ledger.** The panel
+suggests bridge addresses from what the ledger read found (a token named XAH
+or EVR moving between your wallets and one address). Marking one does two
+things: payments to that address put the coins in transit, payments from it
+take them out; and the token is treated as the same coin as the Xahau asset,
+which also gives it a price. The coins keep their cost and dates across the
+crossing, in both directions. A bridge fee (coins that never arrive) leaves
+its cost on the coins that did. An arrival with nothing recorded as sent is
+booked at that day's price, never as income, and is counted in the Data
+Summary: it usually means the bridge's address on the other chain is not
+marked yet. When that happens the panel looks for it: a Xahau payment of about
+the same amount within two hours of a crossing on the XRP Ledger, to or from
+an address that is not yours, is offered as "the other side of the bridge".
+Nothing is built in; no address ships with the app.
+
+To make this work the build now reads **both chains in one chronological
+order** instead of all of Xahau and then all of the XRP Ledger. Each chain is
+still read in its own order; the figures for anything that does not cross a
+bridge are unchanged.
+
+### AMM pools under Treatment A, both assets
+
+For a wallet whose transactions were read from the ledger, Treatment A now
+books each deposit and withdrawal from the ledger's record:
+
+- **Deposit:** every asset put in is sold at its value. The LP tokens received
+  take that total as their basis.
+- **Withdrawal:** the LP tokens handed back are sold for the value of what came
+  out. Each asset received starts a lot at its value that day.
+
+A pool holds its two assets in equal value, so in a two-asset deposit or
+withdrawal the token side is worth what the XRP side is. A bridged XAH or EVR
+has its own price. A token alone with no price cannot be valued: its cost is
+carried across and nothing is reported as sold.
+
+**This changes Treatment A's figures.** Before, only the XRP side was booked
+and LP tokens were not tracked, so a withdrawal's XRP took a new, higher basis
+without the gain on the pool position being reported. That gain is now on
+Form 8949 as "LP token ... withdrawn from AMM pool", and the Data Summary
+states it by year. Standard is unchanged: AMM activity is listed, not booked.
+
+### Gifts of tokens
+
+A token sent to a gift address is now in the Gift Log, the Gift Lots CSV and
+the recipient's statement, with the lots it used. A token has no price here,
+so the gift panel asks for the value of each transfer on the day; until it is
+entered the gift is marked as needing one and the annual-exclusion test says
+it cannot tell. A bridged XAH or EVR is priced by itself.
+
+### Smaller
+
+- A token traded for another token is on Form 8949 when either is a bridged
+  XAH or EVR.
+- The Holdings CSV has a Chain column, and `npm run trustlines` matches a
+  token's basis by code and issuer instead of by name.

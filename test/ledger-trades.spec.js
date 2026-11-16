@@ -284,7 +284,7 @@ test('AMM records are stored but not booked, and a token has no made-up price', 
   expect(out.xrp).toBe(1000);
   expect(out.price).toEqual({ price: 0, asOf: null });
   expect(out.value).toBe(0);
-  expect(out.html).toContain('left to the AMM treatment setting');
+  expect(out.html).toContain('stored but not booked (Standard treatment)');
 });
 
 // ── The sweep, end to end ──────────────────────────────────────────────

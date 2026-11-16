@@ -148,12 +148,15 @@ test('the row-count check expects the same type-filtered rows the build streams'
   assert.ok(/expectedRowsForChain\('Xahau'\)/.test(v) && /expectedRowsForChain\('XRPL'\)/.test(v),
     'expected count is not the type-filtered selection');
   const e = body('async function expectedRowsForChain(');
-  const st = body('async function streamChainIntoLedger(');
+  const st = body('async function openChainStream(');
   for (const b of [e, st]) {
     assert.ok(/FETCH_TYPES_XAHAU : FETCH_TYPES_XRPL/.test(b));
     assert.ok(/countForChain\(chain, types\)/.test(b));
   }
-  assert.ok(/getChainRowsPage\(chain, LEDGER_PAGE_ROWS, cursor, types\)/.test(st));
+  assert.ok(/getChainRowsPage\(chain, LEDGER_PAGE_ROWS, st\.cursor, types\)/.test(st));
+  // and every row streamed is counted exactly once, in the merged loop
+  const all = body('async function streamAllIntoLedger(');
+  assert.strictEqual((all.match(/rowsStreamedThisBuild\+\+/g) || []).length, 1);
 });
 
 test('every piece of state resetLedgerState clears is carried by the snapshot and the restore', () => {
