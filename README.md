@@ -1369,12 +1369,22 @@ Three limits worth knowing:
 - **The browser mode keeps the old paging.** It has no cache to absorb a row
   read twice.
 
-Row keys are unchanged. A row without a transaction hash is stored under its
-timestamp plus the wallet, and two such rows at one timestamp would overwrite
-each other. Whether that can happen depends on whether rows ever share a
-timestamp, which the cache can answer: `npm run probe:ties` (readonly; prints
-counts and timestamp forms, never an address or a hash). Changing the keys
-without that answer would risk booking every existing hashless row twice.
+Row keys are unchanged. WinDB returns a blank transaction hash, so a
+downloaded row is stored under its timestamp plus the wallet, and two
+different transactions of one wallet at one timestamp would get the same key:
+the second would be dropped. Whether that can happen depends on whether a
+timestamp is unique to a transaction. `npm run probe:ties` tests it (readonly;
+prints counts and timestamp forms, never an address, a hash or a transaction
+id).
+
+It does **not** test it by counting rows of one wallet that share a timestamp.
+Under these keys there can never be two, so that count is zero whatever the
+truth is; the first version of the probe printed that zero as proof, and it
+was not. It looks instead at the same instant under *different* wallets, where
+both rows are kept, and compares WinDB's own transaction id (CTID): the same
+id is one transaction seen from two sides, different ids are two transactions
+sharing a timestamp. Changing the keys without that answer would risk booking
+every existing row twice.
 
 ### Only an address or a timestamp goes into a query
 
